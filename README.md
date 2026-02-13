@@ -83,3 +83,27 @@ npm run dev
 - `render.yaml` included.
 - Set secret env var `API_KEY` in Render dashboard.
 - Log policy: request metadata only (method/path/status/time). OCR text body is not logged.
+
+## Architecture Boundary (Source of Truth)
+
+This API only returns **coarse extraction candidates**.  
+Final planning and layout decisions are owned by the iOS app.
+
+- iOS: OCR, constraints, `CountPlan` finalization, template slot fill, PDF generation
+- API: candidate extraction only (`/extract`)
+- Template: fixed asset for deterministic rendering
+
+See full responsibility flow:
+- [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
+
+## アーキテクチャ境界（責務の正本）
+
+このAPIは**粗い抽出候補**のみを返します。  
+最終的な設計・レイアウト判断はiOSアプリ側の責務です。
+
+- iOS: OCR、制約適用、`CountPlan` の最終確定、テンプレートスロット充填、PDF生成
+- API: 候補抽出のみ（`/extract`）
+- Template: 決定論的レンダリングのための固定アセット
+
+責務フローの全体像:
+- [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
