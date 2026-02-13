@@ -24,6 +24,7 @@ Response:
 
 Requires header `x-api-key: <API_KEY>`.
 Rate limit: 30 requests per minute per IP.
+Uses Gemini (`GEMINI_API_KEY`) for extraction.
 
 Request:
 
@@ -49,6 +50,8 @@ Response (dummy):
 }
 ```
 
+If Gemini times out/errors, API returns the fallback JSON above (HTTP 200).
+
 ## Local run
 
 1. Install dependencies:
@@ -62,6 +65,12 @@ npm install
 ```bash
 cp .env.example .env
 ```
+
+Required env vars:
+- `API_KEY`: request auth key (`x-api-key`)
+- `GEMINI_API_KEY`: Gemini API key
+- optional: `GEMINI_MODEL` (default `gemini-2.0-flash`)
+- optional: `GEMINI_TIMEOUT_MS` (default `8000`)
 
 3. Start dev server:
 
