@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ruidaichan-api
+    env: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: API_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        value: "*"
