@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import { extractRouter } from "./routes/extract.js";
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
