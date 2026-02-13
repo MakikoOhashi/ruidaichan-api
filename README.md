@@ -10,19 +10,20 @@ Extract-only stateless API for ruidaichan.
 
 ## Endpoints
 
-### POST /health
+### GET /health
 
 Returns health status.
 
 Response:
 
 ```json
-{ "ok": true, "service": "ruidaichan-api" }
+{ "ok": true }
 ```
 
 ### POST /extract
 
 Requires header `x-api-key: <API_KEY>`.
+Rate limit: 30 requests per minute per IP.
 
 Request:
 
@@ -72,4 +73,4 @@ npm run dev
 
 - `render.yaml` included.
 - Set secret env var `API_KEY` in Render dashboard.
-- Optionally set `CORS_ORIGIN` to your iOS app backend origin/proxy.
+- Log policy: request metadata only (method/path/status/time). OCR text body is not logged.
