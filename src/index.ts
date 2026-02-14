@@ -45,6 +45,23 @@ app.use("/extract", extractLimiter, (req, res, next) => {
 
 app.use("/extract", extractRouter);
 
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "type" in err &&
+    (err as { type?: string }).type === "entity.too.large"
+  ) {
+    return res.status(413).json({ error: "payload_too_large", reason: "body_too_large" });
+  }
+
+  if (err instanceof SyntaxError) {
+    return res.status(400).json({ error: "invalid_json" });
+  }
+
+  return next(err);
+});
+
 const port = process.env.PORT ?? 3000;
 app.listen(port, () => {
   console.log(`ruidaichan-api listening on :${port}`);

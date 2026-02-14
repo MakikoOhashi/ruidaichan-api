@@ -41,16 +41,25 @@ Response (dummy):
 ```json
 {
   "template_id": "nencho_count_multi_v1",
-  "subquestion_count": 3,
-  "items_hint": [
-    { "category": "fruit", "object_hint": "apple", "count_range": [3, 10] },
-    { "category": "stationery", "object_hint": "ruler", "count_range": [3, 10] }
+  "confidence": 0.82,
+  "items": [
+    { "slot": "slot_1", "category": "fruit", "count_range": [3, 10] },
+    { "slot": "slot_2", "category": "stationery", "count_range": [3, 10] }
   ],
-  "confidence": 0.82
+  "scene": {
+    "categories": ["fruit", "stationery"],
+    "total_count_range": [6, 20]
+  },
+  "debug": {
+    "raw_ocr_hash": "sha256 hex",
+    "normalized_text_hash": "sha256 hex",
+    "model": "gemini-2.0-flash",
+    "prompt_version": "extract_v1_2026-02-15"
+  }
 }
 ```
 
-If Gemini times out/errors, API returns the fallback JSON above (HTTP 200).
+If Gemini times out/errors/decode fails, API returns `502` with `request_id`.
 
 ## Local run
 
@@ -71,6 +80,7 @@ Required env vars:
 - `GEMINI_API_KEY`: Gemini API key
 - optional: `GEMINI_MODEL` (default `gemini-2.0-flash`)
 - optional: `GEMINI_TIMEOUT_MS` (default `8000`)
+- optional: `GEMINI_TEMPERATURE` (default `0.1`)
 
 3. Start dev server:
 
@@ -82,7 +92,8 @@ npm run dev
 
 - `render.yaml` included.
 - Set secret env var `API_KEY` in Render dashboard.
-- Log policy: request metadata only (method/path/status/time). OCR text body is not logged.
+- Log policy: structured logs with `request_id`, `ocr_text_hash`, `template_id`, `confidence`, `latency_ms`, `error` classification.
+- OCR raw text is not logged.
 
 ## Architecture Boundary (Source of Truth)
 
