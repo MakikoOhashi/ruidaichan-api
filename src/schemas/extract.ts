@@ -51,7 +51,10 @@ export const extractResponseSchema = z.object({
       raw_ocr_hash: z.string().length(64),
       normalized_text_hash: z.string().length(64),
       model: z.string(),
-      prompt_version: z.string()
+      prompt_version: z.string(),
+      raw_template_id: z.string(),
+      normalized_template_id: z.string(),
+      normalization_reason: z.enum(["allowed", "not_allowed_fallback", "alias_map"])
     })
     .strict()
 }).strict();

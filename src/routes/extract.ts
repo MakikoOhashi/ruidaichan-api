@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Router } from "express";
-import { TEMPLATE_CONTRACT, normalizeTemplateId } from "../config/template-contract.js";
 import { extractWithGemini, GeminiError } from "../providers/gemini.js";
+import { buildStableExtractResponse } from "../services/extract-response.js";
 import {
   MAX_OCR_TEXT_LENGTH,
   extractRequestSchema,
@@ -24,39 +24,6 @@ function classifyError(error: unknown): "timeout" | "model" | "decode" | "intern
     return error.kind;
   }
   return "internal";
-}
-
-function buildStableResponse(
-  raw: Awaited<ReturnType<typeof extractWithGemini>>,
-  rawHash: string,
-  normalizedHash: string
-): ExtractResponse {
-  const items = raw.candidate.items.map((item, index) => ({
-    slot: item.slot ?? `slot_${index + 1}`,
-    category: item.category,
-    count_range: item.count_range
-  }));
-
-  const scene = raw.candidate.scene ?? {
-    categories: Array.from(new Set(items.map((item) => item.category))),
-    total_count_range: items.reduce<[number, number]>(
-      (acc, item) => [acc[0] + item.count_range[0], acc[1] + item.count_range[1]],
-      [0, 0]
-    )
-  };
-
-  return {
-    template_id: normalizeTemplateId(raw.candidate.template_id),
-    confidence: raw.candidate.confidence,
-    items,
-    scene,
-    debug: {
-      raw_ocr_hash: rawHash,
-      normalized_text_hash: normalizedHash,
-      model: raw.model,
-      prompt_version: TEMPLATE_CONTRACT.prompt_version
-    }
-  };
 }
 
 extractRouter.post("/", async (req, res) => {
@@ -115,7 +82,12 @@ extractRouter.post("/", async (req, res) => {
       normalizedTextHash
     );
 
-    const responseCandidate = buildStableResponse(extracted, rawOcrHash, normalizedTextHash);
+    const responseCandidate: ExtractResponse = buildStableExtractResponse({
+      candidate: extracted.candidate,
+      model: extracted.model,
+      rawOcrHash,
+      normalizedTextHash
+    });
     const validated = extractResponseSchema.safeParse(responseCandidate);
 
     if (!validated.success) {

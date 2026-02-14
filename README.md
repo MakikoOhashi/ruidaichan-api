@@ -54,7 +54,10 @@ Response (dummy):
     "raw_ocr_hash": "sha256 hex",
     "normalized_text_hash": "sha256 hex",
     "model": "gemini-2.0-flash",
-    "prompt_version": "extract_v1_2026-02-15"
+    "prompt_version": "v1",
+    "raw_template_id": "count_worksheets",
+    "normalized_template_id": "nencho_count_multi_v1",
+    "normalization_reason": "not_allowed_fallback"
   }
 }
 ```

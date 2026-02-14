@@ -8,7 +8,11 @@ const templateContractSchema = z
     allowed_template_ids: z.array(z.string().min(1)).min(1),
     prompt_version: z.string().min(1)
   })
-  .strict();
+  .strict()
+  .refine(
+    (data) => data.allowed_template_ids.includes(data.default_template_id),
+    "default_template_id_must_be_in_allowed_template_ids"
+  );
 
 type TemplateContract = z.infer<typeof templateContractSchema>;
 
@@ -21,9 +25,23 @@ function loadTemplateContract(): TemplateContract {
 
 export const TEMPLATE_CONTRACT = loadTemplateContract();
 
-export function normalizeTemplateId(templateId: string): string {
+export type TemplateNormalizationReason = "allowed" | "not_allowed_fallback" | "alias_map";
+
+export function normalizeTemplateId(templateId: string): {
+  raw_template_id: string;
+  normalized_template_id: string;
+  normalization_reason: TemplateNormalizationReason;
+} {
   if (TEMPLATE_CONTRACT.allowed_template_ids.includes(templateId)) {
-    return templateId;
+    return {
+      raw_template_id: templateId,
+      normalized_template_id: templateId,
+      normalization_reason: "allowed"
+    };
   }
-  return TEMPLATE_CONTRACT.default_template_id;
+  return {
+    raw_template_id: templateId,
+    normalized_template_id: TEMPLATE_CONTRACT.default_template_id,
+    normalization_reason: "not_allowed_fallback"
+  };
 }
