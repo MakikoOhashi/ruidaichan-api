@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Router } from "express";
+import { TEMPLATE_CONTRACT, normalizeTemplateId } from "../config/template-contract.js";
 import { extractWithGemini, GeminiError } from "../providers/gemini.js";
 import {
   MAX_OCR_TEXT_LENGTH,
@@ -45,7 +46,7 @@ function buildStableResponse(
   };
 
   return {
-    template_id: raw.candidate.template_id,
+    template_id: normalizeTemplateId(raw.candidate.template_id),
     confidence: raw.candidate.confidence,
     items,
     scene,
@@ -53,7 +54,7 @@ function buildStableResponse(
       raw_ocr_hash: rawHash,
       normalized_text_hash: normalizedHash,
       model: raw.model,
-      prompt_version: raw.promptVersion
+      prompt_version: TEMPLATE_CONTRACT.prompt_version
     }
   };
 }

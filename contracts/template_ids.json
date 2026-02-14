@@ -1,0 +1,5 @@
+{
+  "default_template_id": "nencho_count_multi_v1",
+  "allowed_template_ids": ["nencho_count_multi_v1"],
+  "prompt_version": "v1"
+}

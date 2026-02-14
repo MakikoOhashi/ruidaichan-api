@@ -118,3 +118,11 @@ See full responsibility flow:
 
 責務フローの全体像:
 - [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
+
+## Shared Contract
+
+- `contracts/template_ids.json` is the source of truth for:
+  - `default_template_id`
+  - `allowed_template_ids`
+  - `prompt_version`
+- API normalizes model output template IDs before returning `/extract` response.
