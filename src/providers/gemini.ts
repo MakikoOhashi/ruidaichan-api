@@ -71,13 +71,9 @@ function getTextFromGeminiResponse(data: unknown): string {
   return text;
 }
 
-function seedFromHash(hash: string): number {
-  return Number.parseInt(hash.slice(0, 8), 16);
-}
-
 export async function extractWithGemini(
   input: ExtractRequest,
-  ocrHash: string
+  _ocrHash: string
 ): Promise<{ candidate: GeminiCandidate; model: string; promptVersion: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -97,7 +93,6 @@ export async function extractWithGemini(
           contents: [{ role: "user", parts: [{ text: buildPrompt(input) }] }],
           generationConfig: {
             temperature: DEFAULT_TEMPERATURE,
-            seed: seedFromHash(ocrHash),
             responseMimeType: "application/json"
           }
         }),
@@ -106,7 +101,9 @@ export async function extractWithGemini(
     );
 
     if (!response.ok) {
-      throw new GeminiError("model", `gemini_http_${response.status}`);
+      const errorBody = await response.text();
+      const compact = errorBody.replace(/\s+/g, " ").slice(0, 500);
+      throw new GeminiError("model", `gemini_http_${response.status}:${compact}`);
     }
 
     const json = (await response.json()) as unknown;
