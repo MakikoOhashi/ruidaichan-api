@@ -73,6 +73,24 @@ extractRouter.post("/", async (req, res) => {
   const rawOcrHash = sha256(parsed.data.ocr_text);
   const normalizedTextHash = sha256(normalizedText);
 
+  const hasMeaningfulChars = /[0-9A-Za-z\u3040-\u30FF\u4E00-\u9FFF]/.test(normalizedText);
+  if (!hasMeaningfulChars) {
+    console.log(
+      JSON.stringify({
+        event: "extract_error",
+        request_id: requestId,
+        ocr_text_hash: rawOcrHash,
+        error: "invalid_request_noise_only",
+        latency_ms: Date.now() - startedAt
+      })
+    );
+    return res.status(400).json({
+      error: "invalid_request",
+      reason: "ocr_text_noise_only",
+      request_id: requestId
+    });
+  }
+
   try {
     const extracted = await extractWithGemini(
       {

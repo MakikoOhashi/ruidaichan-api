@@ -2,8 +2,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 
+export const CONTRACT_VERSION = "extract_contract_v1_2026-02-15";
+
 const templateContractSchema = z
   .object({
+    contract_version: z.string().min(1),
     default_template_id: z.string().min(1),
     allowed_template_ids: z.array(z.string().min(1)).min(1),
     prompt_version: z.string().min(1)

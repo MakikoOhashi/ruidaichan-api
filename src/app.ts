@@ -1,0 +1,70 @@
+import cors from "cors";
+import express from "express";
+import rateLimit from "express-rate-limit";
+import { assertVersionSync } from "./config/version-sync.js";
+import { extractRouter } from "./routes/extract.js";
+
+export function createApp(): express.Express {
+  assertVersionSync();
+
+  const app = express();
+  app.set("trust proxy", 1);
+  app.use(cors());
+  app.use(express.json({ limit: "1mb" }));
+
+  const apiKey = process.env.API_KEY;
+
+  app.use((req, res, next) => {
+    const startedAt = Date.now();
+    res.on("finish", () => {
+      const durationMs = Date.now() - startedAt;
+      console.log(
+        `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${durationMs}ms`
+      );
+    });
+    next();
+  });
+
+  app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  const extractLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "rate_limited" }
+  });
+
+  app.use("/extract", extractLimiter, (req, res, next) => {
+    if (!apiKey) {
+      return res.status(500).json({ error: "server_misconfigured" });
+    }
+
+    if (req.header("x-api-key") !== apiKey) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    return next();
+  });
+
+  app.use("/extract", extractRouter);
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "type" in err &&
+      (err as { type?: string }).type === "entity.too.large"
+    ) {
+      return res.status(413).json({ error: "payload_too_large", reason: "body_too_large" });
+    }
+
+    if (err instanceof SyntaxError) {
+      return res.status(400).json({ error: "invalid_json" });
+    }
+
+    return next(err);
+  });
+
+  return app;
+}

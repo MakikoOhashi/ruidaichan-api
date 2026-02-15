@@ -54,7 +54,7 @@ Response (dummy):
     "raw_ocr_hash": "sha256 hex",
     "normalized_text_hash": "sha256 hex",
     "model": "gemini-2.0-flash",
-    "prompt_version": "v1",
+    "prompt_version": "extract_v1_2026-02-15",
     "raw_template_id": "count_worksheets",
     "normalized_template_id": "nencho_count_multi_v1",
     "normalization_reason": "not_allowed_fallback"
@@ -125,7 +125,9 @@ See full responsibility flow:
 ## Shared Contract
 
 - `contracts/template_ids.json` is the source of truth for:
+  - `contract_version`
   - `default_template_id`
   - `allowed_template_ids`
   - `prompt_version`
 - API normalizes model output template IDs before returning `/extract` response.
+- Startup fails fast if `contract_version` or `prompt_version` is out of sync with server constants.

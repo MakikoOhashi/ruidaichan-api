@@ -1,5 +1,6 @@
 {
+  "contract_version": "extract_contract_v1_2026-02-15",
   "default_template_id": "nencho_count_multi_v1",
   "allowed_template_ids": ["nencho_count_multi_v1"],
-  "prompt_version": "v1"
+  "prompt_version": "extract_v1_2026-02-15"
 }
