@@ -5,6 +5,8 @@ import { worksheetDslSchema, type WorksheetDsl } from "../schemas/layout.js";
 
 export const extractLayoutRouter = Router();
 
+type LayoutMode = "mc_blank_arithmetic" | "scene_counting" | "unknown";
+
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -13,14 +15,27 @@ function normalizeText(text: string): string {
   return text.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
-function buildFixedLayoutDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+function classifyLayoutMode(normalized: string): LayoutMode {
+  const unknownSignals = ["点図", "点グ", "長方形", "平行", "直線", "方眼", "図形"];
+  if (unknownSignals.some((w) => normalized.includes(w))) {
+    return "unknown";
+  }
+
+  const sceneSignals = ["えのなか", "絵の中", "なんこ", "なんぼん", "ぬりましょう", "かずだけ"];
+  if (sceneSignals.some((w) => normalized.includes(w))) {
+    return "scene_counting";
+  }
+
+  return "mc_blank_arithmetic";
+}
+
+function baseDocument(rawOcr: string) {
   return {
-    spec_version: "worksheet_dsl_v1",
     document: {
       doc_id: randomUUID(),
       source: {
         input_type: "text",
-        source_hash: sha256(input.rawOcr),
+        source_hash: sha256(rawOcr),
         pages: 1,
         language: "ja"
       },
@@ -49,6 +64,24 @@ function buildFixedLayoutDsl(input: { rawOcr: string; normalized: string }): Wor
         { id: "answers", role: "answers", node: { node_type: "Stack", params: { axis: "vertical" }, children: [] }, style: {} }
       ]
     },
+    constraints: {
+      learner_level: {
+        grade_hint: "lower_elementary",
+        language_level: "mixed"
+      },
+      generation: {
+        reuse_original_text: false,
+        allow_new_theme: true,
+        difficulty_control: "client_logic"
+      }
+    }
+  };
+}
+
+function buildMcBlankDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+  return {
+    spec_version: "worksheet_dsl_v1",
+    ...baseDocument(input.rawOcr),
     content: {
       header: {
         exists: true,
@@ -94,17 +127,6 @@ function buildFixedLayoutDsl(input: { rawOcr: string; normalized: string }): Wor
         }
       ]
     },
-    constraints: {
-      learner_level: {
-        grade_hint: "lower_elementary",
-        language_level: "mixed"
-      },
-      generation: {
-        reuse_original_text: false,
-        allow_new_theme: true,
-        difficulty_control: "client_logic"
-      }
-    },
     undefineds: [],
     extensions: {
       raw_ocr: input.normalized,
@@ -117,6 +139,85 @@ function buildFixedLayoutDsl(input: { rawOcr: string; normalized: string }): Wor
       confidence: 0.65
     }
   };
+}
+
+function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+  return {
+    spec_version: "worksheet_dsl_v1",
+    ...baseDocument(input.rawOcr),
+    content: {
+      header: {
+        exists: true,
+        elements: {
+          page_label: "undefined",
+          title: "undefined",
+          name_field: { exists: true, label: "なまえ" },
+          score_field: { exists: false, label: "undefined" },
+          notes: [{ text: "えの なかを みて こたえましょう。", emphasis: "none", ruby: false }]
+        }
+      },
+      sections: [
+        {
+          section_id: "sec1",
+          label: "1",
+          type: "scene_counting",
+          instruction: { text: "えのなかに ある ものの かずを こたえましょう。", position_hint: "top" },
+          task: { task_type: "count", answer_submission: "in_sheet" }
+        }
+      ]
+    },
+    undefineds: [],
+    extensions: {
+      raw_ocr: input.normalized,
+      raw_layout_detection: "optional",
+      vendor_specific: {}
+    },
+    debug: {
+      model: "fixed_layout_stub",
+      prompt_version: "layout_v1_stub_2026-02-16",
+      confidence: 0.72
+    }
+  };
+}
+
+function buildUnknownDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+  return {
+    spec_version: "worksheet_dsl_v1",
+    ...baseDocument(input.rawOcr),
+    content: {
+      sections: [
+        {
+          section_id: "sec1",
+          type: "unknown"
+        }
+      ]
+    },
+    undefineds: [
+      {
+        path: "content.sections[0].type",
+        reason: "v1 renderer does not support geometry/dotgrid tasks",
+        severity: "blocking",
+        fallback: "manual_select_type"
+      }
+    ],
+    extensions: {
+      raw_ocr: input.normalized,
+      raw_layout_detection: "optional",
+      vendor_specific: {}
+    },
+    debug: {
+      model: "fixed_layout_stub",
+      prompt_version: "layout_v1_stub_2026-02-16",
+      confidence: 0.5
+    }
+  };
+}
+
+function buildLayoutDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+  const mode = classifyLayoutMode(input.normalized);
+  if (mode === "unknown") return buildUnknownDsl(input);
+  if (mode === "scene_counting") return buildSceneCountingDsl(input);
+  return buildMcBlankDsl(input);
 }
 
 extractLayoutRouter.post("/", async (req, res) => {
@@ -133,7 +234,7 @@ extractLayoutRouter.post("/", async (req, res) => {
   }
 
   const normalizedText = normalizeText(parsed.data.ocr_text);
-  const candidate = buildFixedLayoutDsl({ rawOcr: parsed.data.ocr_text, normalized: normalizedText });
+  const candidate = buildLayoutDsl({ rawOcr: parsed.data.ocr_text, normalized: normalizedText });
   const validated = worksheetDslSchema.safeParse(candidate);
 
   if (!validated.success) {
@@ -150,6 +251,7 @@ extractLayoutRouter.post("/", async (req, res) => {
       ocr_text_hash: sha256(parsed.data.ocr_text),
       spec_version: validated.data.spec_version,
       section_types: (validated.data.content?.sections ?? []).map((s) => s.type ?? "unknown"),
+      undefined_count: (validated.data.undefineds ?? []).length,
       latency_ms: Date.now() - startedAt
     })
   );
