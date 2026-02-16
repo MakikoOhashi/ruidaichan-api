@@ -8,6 +8,19 @@ export const extractLayoutRouter = Router();
 type LayoutMode = "mc_blank_arithmetic" | "scene_counting" | "unknown";
 type UnknownReason = "none" | "not_supported_in_v1" | "low_confidence" | "ambiguous";
 
+type KeywordHits = {
+  geometry_or_dotgrid: boolean;
+  word_problem: boolean;
+  scene_counting: boolean;
+  mc_blank_arithmetic: boolean;
+};
+
+type ClassificationResult = {
+  mode: LayoutMode;
+  unknownReason: UnknownReason;
+  keywordHits: KeywordHits;
+};
+
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
@@ -22,9 +35,7 @@ function looksLikeSceneCounting(normalized: string): boolean {
 }
 
 function looksLikeUnsupportedWordProblem(normalized: string): boolean {
-  const wordProblemSignals = [
-    "バケツ", "水", "何l", "l。", "l,", "リットル", "式", "答え", "あわせて", "文章題"
-  ];
+  const wordProblemSignals = ["バケツ", "水", "何l", "l。", "l,", "リットル", "式", "答え", "あわせて", "文章題"];
   return wordProblemSignals.some((w) => normalized.toLowerCase().includes(w));
 }
 
@@ -40,25 +51,27 @@ function looksLikeMcBlankArithmetic(normalized: string): boolean {
   return hasOperator && (hasBlank || hasChoiceCue);
 }
 
-function classifyLayoutMode(normalized: string): { mode: LayoutMode; unknownReason: UnknownReason } {
-  const geometry = looksLikeGeometryOrDotgrid(normalized);
-  const unsupportedWordProblem = looksLikeUnsupportedWordProblem(normalized);
-  const scene = looksLikeSceneCounting(normalized);
-  const arithmetic = looksLikeMcBlankArithmetic(normalized);
+function classifyLayoutMode(normalized: string): ClassificationResult {
+  const keywordHits: KeywordHits = {
+    geometry_or_dotgrid: looksLikeGeometryOrDotgrid(normalized),
+    word_problem: looksLikeUnsupportedWordProblem(normalized),
+    scene_counting: looksLikeSceneCounting(normalized),
+    mc_blank_arithmetic: looksLikeMcBlankArithmetic(normalized)
+  };
 
-  if (geometry || unsupportedWordProblem) {
-    return { mode: "unknown", unknownReason: "not_supported_in_v1" };
+  if (keywordHits.geometry_or_dotgrid || keywordHits.word_problem) {
+    return { mode: "unknown", unknownReason: "not_supported_in_v1", keywordHits };
   }
-  if (scene && arithmetic) {
-    return { mode: "unknown", unknownReason: "ambiguous" };
+  if (keywordHits.scene_counting && keywordHits.mc_blank_arithmetic) {
+    return { mode: "unknown", unknownReason: "ambiguous", keywordHits };
   }
-  if (scene) {
-    return { mode: "scene_counting", unknownReason: "none" };
+  if (keywordHits.scene_counting) {
+    return { mode: "scene_counting", unknownReason: "none", keywordHits };
   }
-  if (arithmetic) {
-    return { mode: "mc_blank_arithmetic", unknownReason: "none" };
+  if (keywordHits.mc_blank_arithmetic) {
+    return { mode: "mc_blank_arithmetic", unknownReason: "none", keywordHits };
   }
-  return { mode: "unknown", unknownReason: "low_confidence" };
+  return { mode: "unknown", unknownReason: "low_confidence", keywordHits };
 }
 
 function baseDocument(rawOcr: string) {
@@ -110,7 +123,7 @@ function baseDocument(rawOcr: string) {
   };
 }
 
-function buildMcBlankDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+function buildMcBlankDsl(input: { rawOcr: string; normalized: string }, keywordHits: KeywordHits): WorksheetDsl {
   return {
     spec_version: "worksheet_dsl_v1",
     unknown_reason: "none",
@@ -169,12 +182,13 @@ function buildMcBlankDsl(input: { rawOcr: string; normalized: string }): Workshe
     debug: {
       model: "fixed_layout_stub",
       prompt_version: "layout_v1_stub_2026-02-16",
-      confidence: 0.65
+      confidence: 0.65,
+      keyword_hits: keywordHits
     }
   };
 }
 
-function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }, keywordHits: KeywordHits): WorksheetDsl {
   return {
     spec_version: "worksheet_dsl_v1",
     unknown_reason: "none",
@@ -196,7 +210,25 @@ function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): W
           label: "1",
           type: "scene_counting",
           instruction: { text: "えのなかに ある ものの かずを こたえましょう。", position_hint: "top" },
-          task: { task_type: "count", answer_submission: "in_sheet" }
+          task: { task_type: "count", answer_submission: "in_sheet" },
+          items: [
+            { item_id: "1", object_key: "apple", count_range: [3, 6] },
+            { item_id: "2", object_key: "carrot", count_range: [3, 6] },
+            { item_id: "3", object_key: "tomato", count_range: [3, 6] }
+          ],
+          scene: {
+            assets: {
+              categories: ["food"],
+              object_keys: ["apple", "carrot", "tomato"],
+              total_count_range: [9, 18]
+            },
+            layout_policy: {
+              distribution: "scatter",
+              rotation: "light",
+              scale_variation: "light",
+              coverage: "uniform"
+            }
+          }
         }
       ]
     },
@@ -209,14 +241,16 @@ function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): W
     debug: {
       model: "fixed_layout_stub",
       prompt_version: "layout_v1_stub_2026-02-16",
-      confidence: 0.72
+      confidence: 0.72,
+      keyword_hits: keywordHits
     }
   };
 }
 
 function buildUnknownDsl(
   input: { rawOcr: string; normalized: string },
-  unknownReason: Exclude<UnknownReason, "none">
+  unknownReason: Exclude<UnknownReason, "none">,
+  keywordHits: KeywordHits
 ): WorksheetDsl {
   const reasonText =
     unknownReason === "not_supported_in_v1"
@@ -224,6 +258,7 @@ function buildUnknownDsl(
       : unknownReason === "ambiguous"
       ? "multiple worksheet types matched at the same time"
       : "layout clues are insufficient to classify safely";
+
   return {
     spec_version: "worksheet_dsl_v1",
     unknown_reason: unknownReason,
@@ -252,16 +287,21 @@ function buildUnknownDsl(
     debug: {
       model: "fixed_layout_stub",
       prompt_version: "layout_v1_stub_2026-02-16",
-      confidence: 0.5
+      confidence: 0.5,
+      keyword_hits: keywordHits
     }
   };
 }
 
 function buildLayoutDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
-  const { mode, unknownReason } = classifyLayoutMode(input.normalized);
-  if (mode === "unknown") return buildUnknownDsl(input, unknownReason as Exclude<UnknownReason, "none">);
-  if (mode === "scene_counting") return buildSceneCountingDsl(input);
-  return buildMcBlankDsl(input);
+  const result = classifyLayoutMode(input.normalized);
+  if (result.mode === "unknown") {
+    return buildUnknownDsl(input, result.unknownReason as Exclude<UnknownReason, "none">, result.keywordHits);
+  }
+  if (result.mode === "scene_counting") {
+    return buildSceneCountingDsl(input, result.keywordHits);
+  }
+  return buildMcBlankDsl(input, result.keywordHits);
 }
 
 extractLayoutRouter.post("/", async (req, res) => {
