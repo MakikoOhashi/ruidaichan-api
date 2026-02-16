@@ -3,6 +3,7 @@ import express from "express";
 import rateLimit from "express-rate-limit";
 import { assertVersionSync } from "./config/version-sync.js";
 import { extractRouter } from "./routes/extract.js";
+import { extractLayoutRouter } from "./routes/extract-layout.js";
 
 export function createApp(): express.Express {
   assertVersionSync();
@@ -35,7 +36,7 @@ export function createApp(): express.Express {
     message: { error: "rate_limited" }
   });
 
-  app.use("/extract", extractLimiter, (req, res, next) => {
+  const requireApiKey: express.RequestHandler = (req, res, next) => {
     if (!apiKey) {
       return res.status(500).json({ error: "server_misconfigured" });
     }
@@ -45,9 +46,13 @@ export function createApp(): express.Express {
     }
 
     return next();
-  });
+  };
+
+  app.use("/extract", extractLimiter, requireApiKey);
+  app.use("/extract_layout", extractLimiter, requireApiKey);
 
   app.use("/extract", extractRouter);
+  app.use("/extract_layout", extractLayoutRouter);
 
   app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (

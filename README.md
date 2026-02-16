@@ -2,6 +2,17 @@
 
 Extract-only stateless API for ruidaichan.
 
+## Design Reset (Layer Promotion)
+
+ruidaichan ecosystem is moving from fixed-template generation to a
+**layout-DSL–driven worksheet synthesis engine**.
+
+This API keeps its role as a stable extraction layer:
+- Legacy(v0): count-based fixed-template flow is kept for regression/reference.
+- New core(v1+): layout DSL is owned by the app-side planning/rendering layer.
+
+This is a layer promotion, not a discard of existing assets.
+
 ## Responsibilities
 
 - Server: OCR text -> CountExtract (coarse)
@@ -109,6 +120,15 @@ Final planning and layout decisions are owned by the iOS app.
 
 See full responsibility flow:
 - [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
+
+## Legacy / New Core Status
+
+- `count`-based extraction contract is **legacy (v0)** and maintained.
+- API remains coarse-candidate output only; it does not finalize worksheet layout.
+- Layout DSL design/finalization is handled outside this API boundary.
+
+Related core issue in app repo:
+- **Define minimal Layout DSL (v1)**
 
 ## アーキテクチャ境界（責務の正本）
 
