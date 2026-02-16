@@ -15,18 +15,44 @@ function normalizeText(text: string): string {
   return text.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
-function classifyLayoutMode(normalized: string): LayoutMode {
+function looksLikeSceneCounting(normalized: string): boolean {
+  const sceneSignals = ["えのなか", "絵の中", "なんこ", "なんぼん", "ぬりましょう", "かずだけ"];
+  return sceneSignals.some((w) => normalized.includes(w));
+}
+
+function looksLikeUnsupportedWordProblem(normalized: string): boolean {
+  const wordProblemSignals = [
+    "バケツ", "水", "何l", "l。", "l,", "リットル", "式", "答え", "あわせて", "文章題"
+  ];
+  return wordProblemSignals.some((w) => normalized.toLowerCase().includes(w));
+}
+
+function looksLikeGeometryOrDotgrid(normalized: string): boolean {
   const unknownSignals = ["点図", "点グ", "長方形", "平行", "直線", "方眼", "図形"];
-  if (unknownSignals.some((w) => normalized.includes(w))) {
+  return unknownSignals.some((w) => normalized.includes(w));
+}
+
+function looksLikeMcBlankArithmetic(normalized: string): boolean {
+  const hasOperator = /[+\-×÷=＋－]/.test(normalized);
+  const hasBlank = /[□_＿]/.test(normalized);
+  const hasChoiceCue = /[①②③④⑤]|えらびましょう|あてはま/.test(normalized);
+  return hasOperator && (hasBlank || hasChoiceCue);
+}
+
+function classifyLayoutMode(normalized: string): LayoutMode {
+  if (looksLikeGeometryOrDotgrid(normalized)) {
     return "unknown";
   }
-
-  const sceneSignals = ["えのなか", "絵の中", "なんこ", "なんぼん", "ぬりましょう", "かずだけ"];
-  if (sceneSignals.some((w) => normalized.includes(w))) {
+  if (looksLikeUnsupportedWordProblem(normalized)) {
+    return "unknown";
+  }
+  if (looksLikeSceneCounting(normalized)) {
     return "scene_counting";
   }
-
-  return "mc_blank_arithmetic";
+  if (looksLikeMcBlankArithmetic(normalized)) {
+    return "mc_blank_arithmetic";
+  }
+  return "unknown";
 }
 
 function baseDocument(rawOcr: string) {
@@ -195,7 +221,7 @@ function buildUnknownDsl(input: { rawOcr: string; normalized: string }): Workshe
     undefineds: [
       {
         path: "content.sections[0].type",
-        reason: "v1 renderer does not support geometry/dotgrid tasks",
+        reason: "v1 renderer does not support this worksheet type yet",
         severity: "blocking",
         fallback: "manual_select_type"
       }
