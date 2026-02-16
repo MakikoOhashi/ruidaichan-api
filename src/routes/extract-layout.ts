@@ -6,6 +6,7 @@ import { worksheetDslSchema, type WorksheetDsl } from "../schemas/layout.js";
 export const extractLayoutRouter = Router();
 
 type LayoutMode = "mc_blank_arithmetic" | "scene_counting" | "unknown";
+type UnknownReason = "none" | "not_supported_in_v1" | "low_confidence" | "ambiguous";
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -39,20 +40,25 @@ function looksLikeMcBlankArithmetic(normalized: string): boolean {
   return hasOperator && (hasBlank || hasChoiceCue);
 }
 
-function classifyLayoutMode(normalized: string): LayoutMode {
-  if (looksLikeGeometryOrDotgrid(normalized)) {
-    return "unknown";
+function classifyLayoutMode(normalized: string): { mode: LayoutMode; unknownReason: UnknownReason } {
+  const geometry = looksLikeGeometryOrDotgrid(normalized);
+  const unsupportedWordProblem = looksLikeUnsupportedWordProblem(normalized);
+  const scene = looksLikeSceneCounting(normalized);
+  const arithmetic = looksLikeMcBlankArithmetic(normalized);
+
+  if (geometry || unsupportedWordProblem) {
+    return { mode: "unknown", unknownReason: "not_supported_in_v1" };
   }
-  if (looksLikeUnsupportedWordProblem(normalized)) {
-    return "unknown";
+  if (scene && arithmetic) {
+    return { mode: "unknown", unknownReason: "ambiguous" };
   }
-  if (looksLikeSceneCounting(normalized)) {
-    return "scene_counting";
+  if (scene) {
+    return { mode: "scene_counting", unknownReason: "none" };
   }
-  if (looksLikeMcBlankArithmetic(normalized)) {
-    return "mc_blank_arithmetic";
+  if (arithmetic) {
+    return { mode: "mc_blank_arithmetic", unknownReason: "none" };
   }
-  return "unknown";
+  return { mode: "unknown", unknownReason: "low_confidence" };
 }
 
 function baseDocument(rawOcr: string) {
@@ -107,6 +113,7 @@ function baseDocument(rawOcr: string) {
 function buildMcBlankDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
   return {
     spec_version: "worksheet_dsl_v1",
+    unknown_reason: "none",
     ...baseDocument(input.rawOcr),
     content: {
       header: {
@@ -170,6 +177,7 @@ function buildMcBlankDsl(input: { rawOcr: string; normalized: string }): Workshe
 function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
   return {
     spec_version: "worksheet_dsl_v1",
+    unknown_reason: "none",
     ...baseDocument(input.rawOcr),
     content: {
       header: {
@@ -206,9 +214,19 @@ function buildSceneCountingDsl(input: { rawOcr: string; normalized: string }): W
   };
 }
 
-function buildUnknownDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
+function buildUnknownDsl(
+  input: { rawOcr: string; normalized: string },
+  unknownReason: Exclude<UnknownReason, "none">
+): WorksheetDsl {
+  const reasonText =
+    unknownReason === "not_supported_in_v1"
+      ? "v1 renderer does not support this worksheet type yet"
+      : unknownReason === "ambiguous"
+      ? "multiple worksheet types matched at the same time"
+      : "layout clues are insufficient to classify safely";
   return {
     spec_version: "worksheet_dsl_v1",
+    unknown_reason: unknownReason,
     ...baseDocument(input.rawOcr),
     content: {
       sections: [
@@ -221,7 +239,7 @@ function buildUnknownDsl(input: { rawOcr: string; normalized: string }): Workshe
     undefineds: [
       {
         path: "content.sections[0].type",
-        reason: "v1 renderer does not support this worksheet type yet",
+        reason: reasonText,
         severity: "blocking",
         fallback: "manual_select_type"
       }
@@ -240,8 +258,8 @@ function buildUnknownDsl(input: { rawOcr: string; normalized: string }): Workshe
 }
 
 function buildLayoutDsl(input: { rawOcr: string; normalized: string }): WorksheetDsl {
-  const mode = classifyLayoutMode(input.normalized);
-  if (mode === "unknown") return buildUnknownDsl(input);
+  const { mode, unknownReason } = classifyLayoutMode(input.normalized);
+  if (mode === "unknown") return buildUnknownDsl(input, unknownReason as Exclude<UnknownReason, "none">);
   if (mode === "scene_counting") return buildSceneCountingDsl(input);
   return buildMcBlankDsl(input);
 }
@@ -276,6 +294,7 @@ extractLayoutRouter.post("/", async (req, res) => {
       request_id: requestId,
       ocr_text_hash: sha256(parsed.data.ocr_text),
       spec_version: validated.data.spec_version,
+      unknown_reason: validated.data.unknown_reason,
       section_types: (validated.data.content?.sections ?? []).map((s) => s.type ?? "unknown"),
       undefined_count: (validated.data.undefineds ?? []).length,
       latency_ms: Date.now() - startedAt

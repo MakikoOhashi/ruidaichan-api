@@ -14,6 +14,7 @@ const sectionSchema = z.object({
 
 export const worksheetDslSchema = z.object({
   spec_version: z.literal("worksheet_dsl_v1"),
+  unknown_reason: z.enum(["none", "not_supported_in_v1", "low_confidence", "ambiguous"]),
   content: z.object({
     sections: z.array(sectionSchema).default([])
   }).passthrough(),
