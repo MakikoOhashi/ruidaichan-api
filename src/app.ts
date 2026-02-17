@@ -9,6 +9,8 @@ import { microGenerateRouter } from "./routes/micro-generate.js";
 
 export function createApp(): express.Express {
   assertVersionSync();
+  const deployCommit = process.env.RENDER_GIT_COMMIT ?? process.env.GIT_COMMIT_SHA ?? "unknown";
+  const buildTimestamp = process.env.BUILD_TIMESTAMP ?? new Date().toISOString();
 
   const app = express();
   app.set("trust proxy", 1);
@@ -28,7 +30,7 @@ export function createApp(): express.Express {
     next();
   });
 
-  app.get("/health", (_req, res) => res.json({ ok: true }));
+  app.get("/health", (_req, res) => res.json({ ok: true, deploy_commit: deployCommit, build_timestamp: buildTimestamp }));
 
   const extractLimiter = rateLimit({
     windowMs: 60 * 1000,

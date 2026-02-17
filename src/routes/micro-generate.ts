@@ -15,11 +15,24 @@ export const microGenerateRouter = Router();
 
 const DETECT_CONFIDENCE_THRESHOLD = 0.75;
 const MAX_REGEN_TRIES = 200;
+const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL ?? "gemini-2.0-flash";
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS ?? 8000);
+const DEPLOY_COMMIT = process.env.RENDER_GIT_COMMIT ?? process.env.GIT_COMMIT_SHA ?? "unknown";
+const BUILD_TIMESTAMP = process.env.BUILD_TIMESTAMP ?? new Date().toISOString();
 
 type DetectResult = {
   family: ProblemFamily | "unknown";
   confidence: number;
   parsed_example: MicroProblemDsl | null;
+};
+
+type CompareSignals = {
+  color_hits: number;
+  two_actor_hits: number;
+  compare_word_hits: number;
+  total_word_hits: number;
+  number_count: number;
+  compare_score: number;
 };
 
 function normalizeText(text: string): string {
@@ -35,6 +48,11 @@ function decodeBase64Text(base64: string): string {
   } catch {
     return "";
   }
+}
+
+function mimeFromInput(base64: string): string {
+  const m = base64.match(/^data:([^;,]+)[;,]/);
+  return m?.[1] ?? "image/png";
 }
 
 function hashToSeed(input: string): number {
@@ -137,52 +155,189 @@ function parseCompareTotals(text: string): MicroProblemDsl | null {
   };
 }
 
-function detectCompareTotalsSignals(text: string): { hit: boolean; confidence: number } {
+function detectCompareTotalsSignals(text: string): CompareSignals {
   const normalized = normalizeText(text);
   const numberCount = [...normalized.matchAll(/\d+/g)].length;
 
   const colorTokens = ["あか", "赤", "きいろ", "黄", "しろ", "白", "くろ", "黒", "あお", "青"];
-  const categoryHits = new Set(colorTokens.filter((t) => normalized.includes(t))).size;
-  const groupHits = [...normalized.matchAll(/[^。．\s]{1,8}は/g)].length;
-  const hasCompareWord = /(どちら|どっち|何こ多い|なんこおおい|何個多い|多い)/.test(normalized);
-  const hasSumWord = /(合わせ|あわせ|合計|ぜんぶ|全部)/.test(normalized);
+  const color_hits = new Set(colorTokens.filter((t) => normalized.includes(t))).size;
+  const two_actor_hits = [...normalized.matchAll(/[^。．\s]{1,8}は/g)].length;
+  const compare_word_hits = [...normalized.matchAll(/どちら|どっち|何こ多い|なんこおおい|何個多い|多い/g)].length;
+  const total_word_hits = [...normalized.matchAll(/合わせ|あわせ|合計|ぜんぶ|全部/g)].length;
 
-  const score =
-    (categoryHits >= 2 ? 1 : 0) +
-    (groupHits >= 2 ? 1 : 0) +
-    (hasCompareWord ? 1 : 0) +
-    (hasSumWord ? 1 : 0) +
+  const compare_score =
+    (color_hits >= 2 ? 1 : 0) +
+    (two_actor_hits >= 2 ? 1 : 0) +
+    (compare_word_hits > 0 ? 1 : 0) +
+    (total_word_hits > 0 ? 1 : 0) +
     (numberCount >= 4 ? 1 : 0);
 
-  if (score >= 4) return { hit: true, confidence: 0.9 };
-  if (score === 3) return { hit: true, confidence: 0.78 };
-  return { hit: false, confidence: 0 };
+  return {
+    color_hits,
+    two_actor_hits,
+    compare_word_hits,
+    total_word_hits,
+    number_count: numberCount,
+    compare_score
+  };
 }
 
-function detectFamily(text: string): DetectResult {
-  const compareSignal = detectCompareTotalsSignals(text);
-  if (compareSignal.hit) {
+function detectFamily(text: string): { detected: DetectResult; signals: CompareSignals } {
+  const signals = detectCompareTotalsSignals(text);
+  if (signals.compare_score >= 4) {
     const parsedCompare = parseCompareTotals(text);
     if (parsedCompare) {
+      const confidence = signals.compare_score >= 5 ? 0.92 : 0.82;
       return {
-        family: "compare_totals_diff_mc",
-        confidence: compareSignal.confidence,
-        parsed_example: parsedCompare
+        detected: {
+          family: "compare_totals_diff_mc",
+          confidence,
+          parsed_example: parsedCompare
+        },
+        signals
       };
     }
   }
 
   const parsed = parseByFamily(text);
   if (parsed) {
-    return { family: parsed.family, confidence: 0.92, parsed_example: parsed };
+    return { detected: { family: parsed.family, confidence: 0.92, parsed_example: parsed }, signals };
   }
 
   const hasMathSignal = /[+＋=＝\-－□?_？]/.test(text);
   if (hasMathSignal) {
-    return { family: "unknown", confidence: 0.6, parsed_example: null };
+    return { detected: { family: "unknown", confidence: 0.6, parsed_example: null }, signals };
   }
 
-  return { family: "unknown", confidence: 0.35, parsed_example: null };
+  return { detected: { family: "unknown", confidence: 0.35, parsed_example: null }, signals };
+}
+
+async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: DetectResult; signals: CompareSignals } | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const payload = imageBase64.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+  if (!payload) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+  try {
+    const prompt = [
+      "Classify a single elementary math sub-problem.",
+      "Target family names:",
+      "- compare_totals_diff_mc (two groups, compare totals, ask which/how many more)",
+      "- a_plus_blank_eq_b",
+      "- blank_plus_a_eq_b",
+      "- a_plus_b_eq_blank",
+      "- b_minus_a_eq_blank",
+      "- unknown",
+      "Return ONLY JSON with this exact shape:",
+      '{"family":"compare_totals_diff_mc","confidence":0.0,"params":{"a":18,"b":23,"c":27,"d":12,"blank":10}}'
+    ].join("\n");
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: prompt },
+                {
+                  inline_data: {
+                    mime_type: mimeFromInput(imageBase64),
+                    data: payload
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json"
+          }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) return null;
+    const json = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return null;
+
+    const parsed = JSON.parse(text) as {
+      family?: string;
+      confidence?: number;
+      params?: Record<string, number>;
+    };
+
+    const family = parsed.family;
+    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence ?? 0)));
+    if (!family) return null;
+
+    if (family === "compare_totals_diff_mc" && parsed.params) {
+      const a = Math.trunc(parsed.params.a ?? 0);
+      const b = Math.trunc(parsed.params.b ?? 0);
+      const c = Math.trunc(parsed.params.c ?? 0);
+      const d = Math.trunc(parsed.params.d ?? 0);
+      const blank = Math.abs(a + c - (b + d));
+      const parsed_example: MicroProblemDsl = {
+        spec_version: "micro_problem_dsl_v1",
+        family: "compare_totals_diff_mc",
+        params: { a, b, c, d, blank },
+        render_text: `あかは${a}こ、きいろは${b}こ。さらに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。`,
+        answer: blank
+      };
+      return {
+        detected: { family: "compare_totals_diff_mc", confidence: Math.max(confidence, 0.8), parsed_example },
+        signals: {
+          color_hits: 2,
+          two_actor_hits: 2,
+          compare_word_hits: 1,
+          total_word_hits: 1,
+          number_count: 4,
+          compare_score: 5
+        }
+      };
+    }
+
+    if (problemFamilySchema.options.includes(family as ProblemFamily)) {
+      return {
+        detected: { family: family as ProblemFamily, confidence, parsed_example: null },
+        signals: {
+          color_hits: 0,
+          two_actor_hits: 0,
+          compare_word_hits: 0,
+          total_word_hits: 0,
+          number_count: 0,
+          compare_score: 0
+        }
+      };
+    }
+
+    return {
+      detected: { family: "unknown", confidence: Math.min(confidence, 0.6), parsed_example: null },
+      signals: {
+        color_hits: 0,
+        two_actor_hits: 0,
+        compare_word_hits: 0,
+        total_word_hits: 0,
+        number_count: 0,
+        compare_score: 0
+      }
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | null): { min: number; max: number } {
@@ -318,6 +473,8 @@ function bumpReason(reasons: Record<string, number>, key: string): void {
 
 microGenerateRouter.post("/", async (req, res) => {
   const requestId = randomUUID();
+  const hasImageBase64 = typeof req.body?.image_base64 === "string" && req.body.image_base64.length > 0;
+  const textPresent = typeof req.body?.text === "string" && req.body.text.length > 0;
 
   const parsedReq = microGenerateRequestSchema.safeParse(req.body);
   if (!parsedReq.success) {
@@ -328,16 +485,70 @@ microGenerateRouter.post("/", async (req, res) => {
     });
   }
 
-  const inputText = parsedReq.data.text ? normalizeText(parsedReq.data.text) : decodeBase64Text(parsedReq.data.image_base64 ?? "");
-  const detected = detectFamily(inputText);
+  let selectedDetectorPath = "text_detector";
+  let detected: DetectResult;
+  let signalCounts: CompareSignals = {
+    color_hits: 0,
+    two_actor_hits: 0,
+    compare_word_hits: 0,
+    total_word_hits: 0,
+    number_count: 0,
+    compare_score: 0
+  };
+
+  console.log(
+    JSON.stringify({
+      event: "micro_generate_input",
+      request_id: requestId,
+      has_image_base64: hasImageBase64,
+      text_present: textPresent,
+      selected_detector_path: textPresent ? "text_detector" : "image_detector"
+    })
+  );
+
+  if (parsedReq.data.text) {
+    const text = normalizeText(parsedReq.data.text);
+    const resByText = detectFamily(text);
+    detected = resByText.detected;
+    signalCounts = resByText.signals;
+    selectedDetectorPath = "text_detector";
+  } else {
+    const imageBase64 = parsedReq.data.image_base64 ?? "";
+    const visionResult = await detectFamilyFromImage(imageBase64);
+    if (visionResult) {
+      detected = visionResult.detected;
+      signalCounts = visionResult.signals;
+      selectedDetectorPath = "image_gemini_detector";
+    } else {
+      const decodedText = decodeBase64Text(imageBase64);
+      const resByDecoded = detectFamily(decodedText);
+      detected = resByDecoded.detected;
+      signalCounts = resByDecoded.signals;
+      selectedDetectorPath = "image_base64_decode_text_detector";
+    }
+  }
+
+  const detectedFamilyBeforeFallback = detected.family;
 
   const needConfirm = detected.confidence < DETECT_CONFIDENCE_THRESHOLD || detected.family === "unknown";
   const candidateFamilies = problemFamilySchema.options;
   const generationFamily: ProblemFamily = detected.family === "unknown" ? "a_plus_blank_eq_b" : detected.family;
+  const detectedFamilyAfterFallback = generationFamily;
+
+  console.log(
+    JSON.stringify({
+      event: "micro_generate_detection",
+      request_id: requestId,
+      signal_counts: signalCounts,
+      compare_score: signalCounts.compare_score,
+      detected_family_before_fallback: detectedFamilyBeforeFallback,
+      detected_family_after_fallback: detectedFamilyAfterFallback
+    })
+  );
 
   const rngSeed = hashToSeed(
     JSON.stringify({
-      input: inputText,
+      input: parsedReq.data.text ? normalizeText(parsedReq.data.text) : parsedReq.data.image_base64 ?? "",
       N: parsedReq.data.N,
       difficulty: parsedReq.data.difficulty,
       seed: String(parsedReq.data.seed),
@@ -380,7 +591,12 @@ microGenerateRouter.post("/", async (req, res) => {
     rejected_count: rejectedCount,
     reasons,
     need_confirm: needConfirm,
-    ...(needConfirm ? { confirm_choices: [...candidateFamilies] } : {})
+    ...(needConfirm ? { confirm_choices: [...candidateFamilies] } : {}),
+    debug: {
+      deploy_commit: DEPLOY_COMMIT,
+      build_timestamp: BUILD_TIMESTAMP,
+      selected_detector_path: selectedDetectorPath
+    }
   };
 
   const validated = microGenerateResponseSchema.safeParse(response);
@@ -399,7 +615,10 @@ microGenerateRouter.post("/", async (req, res) => {
       confidence: validated.data.detected.confidence,
       generated: validated.data.problems.length,
       rejected_count: validated.data.rejected_count,
-      need_confirm: validated.data.need_confirm
+      need_confirm: validated.data.need_confirm,
+      response_detected_family: validated.data.detected.family,
+      response_need_confirm: validated.data.need_confirm,
+      response_problem_families: [...new Set(validated.data.problems.map((p) => p.family))]
     })
   );
 

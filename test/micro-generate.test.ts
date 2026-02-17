@@ -127,6 +127,33 @@ test("compare_totals_diff_mc detection has priority and no confirm", async () =>
   });
 });
 
+test("compare detection works on image_base64 path (decoded text route)", async () => {
+  await withServer(async (baseUrl) => {
+    const text =
+      "あかは18こ、きいろは23こです。Aさんはあかを27こ、Bさんはきいろを12こふやしました。どちらが何こ多いですか。あわせて考えましょう。";
+    const imageBase64 = Buffer.from(text, "utf8").toString("base64");
+
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ image_base64: imageBase64, N: 4, difficulty: "same", seed: "img-route" })
+    });
+
+    const body = (await res.json()) as {
+      detected: { family: string; confidence: number };
+      need_confirm: boolean;
+      problems: Array<{ family: string }>;
+      debug?: { selected_detector_path?: string };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected.family, "compare_totals_diff_mc");
+    assert.equal(body.need_confirm, false);
+    assert.equal(body.problems.every((p) => p.family === "compare_totals_diff_mc"), true);
+    assert.equal(typeof body.debug?.selected_detector_path, "string");
+  });
+});
+
 test("compare_totals_diff_mc deterministic with same seed", async () => {
   await withServer(async (baseUrl) => {
     const payload = {

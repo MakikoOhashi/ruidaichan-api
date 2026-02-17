@@ -55,7 +55,15 @@ export const microGenerateResponseSchema = z
     rejected_count: z.number().int().nonnegative(),
     reasons: z.record(z.number().int().nonnegative()),
     need_confirm: z.boolean(),
-    confirm_choices: z.array(problemFamilySchema).optional()
+    confirm_choices: z.array(problemFamilySchema).optional(),
+    debug: z
+      .object({
+        deploy_commit: z.string(),
+        build_timestamp: z.string(),
+        selected_detector_path: z.string()
+      })
+      .strict()
+      .optional()
   })
   .strict()
   .superRefine((value, ctx) => {
