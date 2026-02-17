@@ -4,7 +4,8 @@ export const problemFamilySchema = z.enum([
   "a_plus_blank_eq_b",
   "blank_plus_a_eq_b",
   "a_plus_b_eq_blank",
-  "b_minus_a_eq_blank"
+  "b_minus_a_eq_blank",
+  "compare_totals_diff_mc"
 ]);
 
 export const difficultySchema = z.enum(["easy", "same", "hard"]);

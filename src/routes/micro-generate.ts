@@ -114,7 +114,64 @@ function parseByFamily(text: string): MicroProblemDsl | null {
   return null;
 }
 
+function parseCompareTotals(text: string): MicroProblemDsl | null {
+  const normalized = normalizeText(text);
+  const numbers = [...normalized.matchAll(/\d+/g)].map((m) => Number(m[0]));
+  if (numbers.length < 4) return null;
+
+  const a = numbers[0];
+  const b = numbers[1];
+  const c = numbers[2];
+  const d = numbers[3];
+  const redTotal = a + c;
+  const yellowTotal = b + d;
+  const blank = Math.abs(redTotal - yellowTotal);
+  const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
+
+  return {
+    spec_version: "micro_problem_dsl_v1",
+    family: "compare_totals_diff_mc",
+    params: { a, b, c, d, blank },
+    render_text: `あかは${a}こ、きいろは${b}こ。さらに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。(${winner})`,
+    answer: blank
+  };
+}
+
+function detectCompareTotalsSignals(text: string): { hit: boolean; confidence: number } {
+  const normalized = normalizeText(text);
+  const numberCount = [...normalized.matchAll(/\d+/g)].length;
+
+  const colorTokens = ["あか", "赤", "きいろ", "黄", "しろ", "白", "くろ", "黒", "あお", "青"];
+  const categoryHits = new Set(colorTokens.filter((t) => normalized.includes(t))).size;
+  const groupHits = [...normalized.matchAll(/[^。．\s]{1,8}は/g)].length;
+  const hasCompareWord = /(どちら|どっち|何こ多い|なんこおおい|何個多い|多い)/.test(normalized);
+  const hasSumWord = /(合わせ|あわせ|合計|ぜんぶ|全部)/.test(normalized);
+
+  const score =
+    (categoryHits >= 2 ? 1 : 0) +
+    (groupHits >= 2 ? 1 : 0) +
+    (hasCompareWord ? 1 : 0) +
+    (hasSumWord ? 1 : 0) +
+    (numberCount >= 4 ? 1 : 0);
+
+  if (score >= 4) return { hit: true, confidence: 0.9 };
+  if (score === 3) return { hit: true, confidence: 0.78 };
+  return { hit: false, confidence: 0 };
+}
+
 function detectFamily(text: string): DetectResult {
+  const compareSignal = detectCompareTotalsSignals(text);
+  if (compareSignal.hit) {
+    const parsedCompare = parseCompareTotals(text);
+    if (parsedCompare) {
+      return {
+        family: "compare_totals_diff_mc",
+        confidence: compareSignal.confidence,
+        parsed_example: parsedCompare
+      };
+    }
+  }
+
   const parsed = parseByFamily(text);
   if (parsed) {
     return { family: parsed.family, confidence: 0.92, parsed_example: parsed };
@@ -140,6 +197,27 @@ function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | nu
 
 function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Difficulty, example: MicroProblemDsl | null): MicroProblemDsl {
   const range = rangeByDifficulty(difficulty, example);
+
+  if (family === "compare_totals_diff_mc") {
+    const min = difficulty === "easy" ? 1 : difficulty === "hard" ? 10 : 3;
+    const max = difficulty === "easy" ? 20 : difficulty === "hard" ? 50 : 30;
+    const a = randInt(rng, min, max);
+    const b = randInt(rng, min, max);
+    const c = randInt(rng, min, max);
+    const d = randInt(rng, min, max);
+    const redTotal = a + c;
+    const yellowTotal = b + d;
+    const blank = Math.abs(redTotal - yellowTotal);
+    const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
+
+    return {
+      spec_version: "micro_problem_dsl_v1",
+      family,
+      params: { a, b, c, d, blank },
+      render_text: `あかは${a}こ、きいろは${b}こ。つぎに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。(${winner})`,
+      answer: blank
+    };
+  }
 
   if (family === "a_plus_blank_eq_b") {
     const a = randInt(rng, range.min, range.max);
@@ -202,6 +280,8 @@ function solve(problem: MicroProblemDsl): number {
       return p.a + p.b;
     case "b_minus_a_eq_blank":
       return p.b - p.a;
+    case "compare_totals_diff_mc":
+      return Math.abs((p.a + p.c) - (p.b + p.d));
   }
 }
 
@@ -215,6 +295,15 @@ function isInRangeForDifficulty(problem: MicroProblemDsl, difficulty: Difficulty
 function validateProblem(problem: MicroProblemDsl, difficulty: Difficulty): string | null {
   const parsed = microProblemDslSchema.safeParse(problem);
   if (!parsed.success) return "schema_invalid";
+
+  if (problem.family === "compare_totals_diff_mc") {
+    const p = problem.params;
+    const needed = ["a", "b", "c", "d", "blank"] as const;
+    if (!needed.every((k) => Number.isInteger(p[k]))) return "missing_compare_params";
+    const computed = Math.abs((p.a + p.c) - (p.b + p.d));
+    if (p.blank !== computed) return "compare_blank_mismatch";
+    if (p.blank < 0) return "negative_answer";
+  }
 
   if (solve(problem) !== problem.answer) return "solver_mismatch";
   if (problem.answer < 0) return "negative_answer";
