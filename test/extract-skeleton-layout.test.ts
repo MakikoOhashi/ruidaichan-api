@@ -21,7 +21,11 @@ async function withServer(fn: (baseUrl: string) => Promise<void>) {
   }
 }
 
-test("extract_skeleton_layout normal case returns two_column_rows", async () => {
+function b64(text: string): string {
+  return Buffer.from(text, "utf8").toString("base64");
+}
+
+test("panel normal: returns two_column_rows", async () => {
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/extract_skeleton_layout`, {
       method: "POST",
@@ -30,7 +34,7 @@ test("extract_skeleton_layout normal case returns two_column_rows", async () => 
         "x-api-key": "test-key"
       },
       body: JSON.stringify({
-        image_base64: "a".repeat(128),
+        image_base64: b64("r1c1 r1c2 r2c1 r2c2 ○をかこう"),
         locale: "ja-JP"
       })
     });
@@ -39,43 +43,44 @@ test("extract_skeleton_layout normal case returns two_column_rows", async () => 
     const body = (await res.json()) as {
       spec_version: string;
       layout_family: string;
+      unknown_reason?: string;
       slot_schema: { rows: number; cols: number };
     };
 
     assert.equal(body.spec_version, "layout_skeleton_v1");
     assert.equal(body.layout_family, "two_column_rows");
-    assert.equal(body.slot_schema.rows >= 1, true);
-    assert.equal(body.slot_schema.cols >= 1, true);
+    assert.equal("unknown_reason" in body, false);
+    assert.equal(body.slot_schema.rows >= 2, true);
+    assert.equal(body.slot_schema.cols, 2);
   });
 });
 
-test("extract_skeleton_layout unknown case returns blocking undefined", async () => {
+test("word problem + choices: returns unknown and blocking", async () => {
   await withServer(async (baseUrl) => {
+    const text = "（1）つぎから1つ選びなさい ① ② ③ ④ （2）つぎから1つ選びなさい ① ② ③";
     const res = await fetch(`${baseUrl}/extract_skeleton_layout`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-api-key": "test-key"
       },
-      body: JSON.stringify({
-        image_base64: "%%%",
-        locale: "ja-JP"
-      })
+      body: JSON.stringify({ image_base64: b64(text), locale: "ja-JP" })
     });
 
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
       layout_family: string;
+      unknown_reason?: string;
       undefineds: Array<{ severity: string }>;
     };
 
     assert.equal(body.layout_family, "unknown");
-    assert.equal(body.undefineds.length > 0, true);
-    assert.equal(body.undefineds[0]?.severity, "blocking");
+    assert.equal(["not_supported_in_v1", "ambiguous"].includes(body.unknown_reason ?? ""), true);
+    assert.equal(body.undefineds.some((u) => u.severity === "blocking"), true);
   });
 });
 
-test("extract_skeleton_layout invalid schema input still returns unknown with 200", async () => {
+test("insufficient signals: returns unknown with insufficient_signals", async () => {
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/extract_skeleton_layout`, {
       method: "POST",
@@ -83,17 +88,58 @@ test("extract_skeleton_layout invalid schema input still returns unknown with 20
         "Content-Type": "application/json",
         "x-api-key": "test-key"
       },
-      body: JSON.stringify({ locale: "ja-JP" })
+      body: JSON.stringify({ image_base64: b64("hello world"), locale: "ja-JP" })
     });
 
-    assert.equal(res.status, 200);
+    const body = (await res.json()) as { layout_family: string; unknown_reason?: string };
+    assert.equal(body.layout_family, "unknown");
+    assert.equal(body.unknown_reason, "insufficient_signals");
+  });
+});
+
+test("low confidence: returns unknown with low_confidence", async () => {
+  await withServer(async (baseUrl) => {
+    const text = "r1c1 r1c2 r2c1 r2c2 ○をかこう LOW_CONFIDENCE";
+    const res = await fetch(`${baseUrl}/extract_skeleton_layout`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": "test-key"
+      },
+      body: JSON.stringify({ image_base64: b64(text), locale: "ja-JP" })
+    });
+
+    const body = (await res.json()) as { layout_family: string; unknown_reason?: string };
+    assert.equal(body.layout_family, "unknown");
+    assert.equal(body.unknown_reason, "low_confidence");
+  });
+});
+
+test("backward compatibility: spec_version fixed and contract shape preserved", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/extract_skeleton_layout`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": "test-key"
+      },
+      body: JSON.stringify({ image_base64: b64("x"), locale: "ja-JP" })
+    });
+
     const body = (await res.json()) as {
+      spec_version: string;
       layout_family: string;
-      undefineds: Array<{ reason: string; severity: string }>;
+      slot_schema: unknown;
+      body_regions: unknown;
+      undefineds: unknown;
+      debug: unknown;
     };
 
-    assert.equal(body.layout_family, "unknown");
-    assert.equal(body.undefineds.some((u) => u.reason === "invalid_request_schema"), true);
-    assert.equal(body.undefineds.some((u) => u.severity === "blocking"), true);
+    assert.equal(body.spec_version, "layout_skeleton_v1");
+    assert.equal(typeof body.layout_family, "string");
+    assert.equal(typeof body.slot_schema, "object");
+    assert.equal(Array.isArray(body.body_regions), true);
+    assert.equal(Array.isArray(body.undefineds), true);
+    assert.equal(typeof body.debug, "object");
   });
 });
