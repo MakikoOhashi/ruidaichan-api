@@ -5,6 +5,7 @@ export const problemFamilySchema = z.enum([
   "blank_plus_a_eq_b",
   "a_plus_b_eq_blank",
   "b_minus_a_eq_blank",
+  "a_plus_b_minus_c_eq_blank",
   "compare_totals_diff_mc",
   "times_scale_mc"
 ]);
@@ -116,7 +117,11 @@ export const microGenerateResponseSchema = z
         parse_candidates_count: z.number().int().nonnegative(),
         prompt_verb: z.string().nullable(),
         prompt_unit: z.string().nullable(),
-        lexicon_version: z.string()
+        lexicon_version: z.string(),
+        parse_stage_selected: z.enum(["image", "ocr", "equation_regex_fallback"]),
+        equation_regex_hit: z.boolean(),
+        equation_normalized_text: z.string(),
+        unknown_reason: z.string().nullable()
       })
       .strict()
       .optional(),

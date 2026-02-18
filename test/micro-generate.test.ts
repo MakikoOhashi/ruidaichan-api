@@ -64,6 +64,61 @@ test("equation mode returns expression items", async () => {
   });
 });
 
+test("image/ocr equation fallback detects 7 + 9 - 6 = □ as equation", async () => {
+  delete process.env.GEMINI_API_KEY;
+
+  await withServer(async (baseUrl) => {
+    const expr = Buffer.from("7 + 9 - 6 = □", "utf8").toString("base64");
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ image_base64: `data:text/plain;base64,${expr}`, N: 4, difficulty: "same", seed: "eq-img" })
+    });
+
+    const body = (await res.json()) as {
+      detected_mode: string;
+      intent: string;
+      required_items: string[];
+      items: Array<{ type: string; text?: string }>;
+      debug: { parse_stage_selected: string; equation_regex_hit: boolean };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.intent, "equation_add_sub_blank");
+    assert.deepEqual(body.required_items, ["expression"]);
+    assert.equal(body.items[0]?.type, "expression");
+    assert.equal(body.debug.parse_stage_selected, "equation_regex_fallback");
+    assert.equal(body.debug.equation_regex_hit, true);
+  });
+});
+
+test("equation fallback handles OCR variants: 7+9-6=口 and full-width symbols", async () => {
+  await withServer(async (baseUrl) => {
+    const headers = { "Content-Type": "application/json", "x-api-key": "test-key" };
+    const r1 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "7+9-6=口", N: 4, difficulty: "same", seed: "eq-v1" })
+    });
+    const r2 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "７＋９－６＝□", N: 4, difficulty: "same", seed: "eq-v2" })
+    });
+
+    const b1 = (await r1.json()) as { detected_mode: string; detected: { family: string } };
+    const b2 = (await r2.json()) as { detected_mode: string; detected: { family: string } };
+
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(b1.detected_mode, "equation");
+    assert.equal(b2.detected_mode, "equation");
+    assert.equal(b1.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.equal(b2.detected.family, "a_plus_b_minus_c_eq_blank");
+  });
+});
+
 test("word_problem(compare) returns prompt+choices with correct_index", async () => {
   await withServer(async (baseUrl) => {
     const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
@@ -138,6 +193,40 @@ test("fail-closed: mode/items mismatch returns unknown with empty problems", asy
     assert.equal(body.problems.length, 0);
     assert.equal(body.need_confirm, true);
     assert.equal(body.meta.note, "insufficient_signals");
+  });
+});
+
+test("true unknown remains unknown for plain narrative without equation", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text: "きょうは いいてんきです。", N: 4, difficulty: "same", seed: "unknown-text" })
+    });
+
+    const body = (await res.json()) as { detected_mode: string; need_confirm: boolean };
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.need_confirm, true);
+  });
+});
+
+test("word_problem detection still works (no regression)", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。",
+        N: 4,
+        difficulty: "same",
+        seed: "cmp-regression"
+      })
+    });
+    const body = (await res.json()) as { detected_mode: string; detected: { family: string } };
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "word_problem");
+    assert.equal(body.detected.family, "compare_totals_diff_mc");
   });
 });
 

@@ -46,6 +46,7 @@ type TimesSignals = {
 };
 
 type DetectorPath = "text_detector" | "image_gemini_detector" | "image_base64_decode_text_detector";
+type ParseStage = "image" | "ocr" | "equation_regex_fallback";
 
 type FallbackReason =
   | "gemini_api_key_missing"
@@ -173,8 +174,9 @@ function modeFromFamily(family: ProblemFamily | "unknown"): "equation" | "word_p
 function intentFromFamily(family: ProblemFamily | "unknown"): string {
   if (family === "compare_totals_diff_mc") return "compare_totals_difference";
   if (family === "times_scale_mc") return "times_scale_question";
+  if (family === "a_plus_b_minus_c_eq_blank") return "equation_add_sub_blank";
   if (family === "unknown") return "unknown_intent";
-  return "equation_fill_blank";
+  return "solve_blank_equation";
 }
 
 function requiredItemsFromMode(mode: "equation" | "word_problem" | "unknown"): Array<"prompt" | "choices" | "expression"> {
@@ -263,35 +265,67 @@ function buildComparePrompt(theme: Theme, a: number, b: number, c: number, d: nu
 
 function parseByFamily(text: string): MicroProblemDsl | null {
   const normalized = normalizeText(text);
+  const eqNormalized = normalizeEquationCandidate(normalized);
 
-  const p1 = normalized.match(/^(\d+)\s*[+＋]\s*[□?_？]\s*[=＝]\s*(\d+)$/);
+  const p5 = eqNormalized.match(/^(\d+)\s*\+\s*(\d+)\s*-\s*(\d+)\s*=\s*[□?_？]$/);
+  if (p5) {
+    const a = Number(p5[1]);
+    const b = Number(p5[2]);
+    const c = Number(p5[3]);
+    return buildProblemBase("a_plus_b_minus_c_eq_blank", { a, b, c }, `${a} + ${b} - ${c} = □`, a + b - c);
+  }
+
+  const p1 = eqNormalized.match(/^(\d+)\s*\+\s*[□?_？]\s*=\s*(\d+)$/);
   if (p1) {
     const a = Number(p1[1]);
     const b = Number(p1[2]);
     return buildProblemBase("a_plus_blank_eq_b", { a, b }, `${a} + □ = ${b}`, b - a);
   }
 
-  const p2 = normalized.match(/^[□?_？]\s*[+＋]\s*(\d+)\s*[=＝]\s*(\d+)$/);
+  const p2 = eqNormalized.match(/^[□?_？]\s*\+\s*(\d+)\s*=\s*(\d+)$/);
   if (p2) {
     const a = Number(p2[1]);
     const b = Number(p2[2]);
     return buildProblemBase("blank_plus_a_eq_b", { a, b }, `□ + ${a} = ${b}`, b - a);
   }
 
-  const p3 = normalized.match(/^(\d+)\s*[+＋]\s*(\d+)\s*[=＝]\s*[□?_？]$/);
+  const p3 = eqNormalized.match(/^(\d+)\s*\+\s*(\d+)\s*=\s*[□?_？]$/);
   if (p3) {
     const a = Number(p3[1]);
     const b = Number(p3[2]);
     return buildProblemBase("a_plus_b_eq_blank", { a, b }, `${a} + ${b} = □`, a + b);
   }
 
-  const p4 = normalized.match(/^(\d+)\s*[-－]\s*(\d+)\s*[=＝]\s*[□?_？]$/);
+  const p4 = eqNormalized.match(/^(\d+)\s*-\s*(\d+)\s*=\s*[□?_？]$/);
   if (p4) {
     const b = Number(p4[1]);
     const a = Number(p4[2]);
     return buildProblemBase("b_minus_a_eq_blank", { a, b }, `${b} - ${a} = □`, b - a);
   }
 
+  return null;
+}
+
+function normalizeEquationCandidate(text: string): string {
+  return text
+    .normalize("NFKC")
+    .replace(/\[\s*\]/g, "□")
+    .replace(/[口ロ〇◯○ＯOo_＿]/g, "□")
+    .replace(/[−ー–—－]/g, "-")
+    .replace(/[＋]/g, "+")
+    .replace(/[＝]/g, "=")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function equationFallbackParser(candidates: string[]): { parsed: MicroProblemDsl; normalized_text: string } | null {
+  for (const candidate of candidates) {
+    const normalized = normalizeEquationCandidate(candidate);
+    const parsed = parseByFamily(normalized);
+    if (parsed) {
+      return { parsed, normalized_text: normalized.slice(0, 120) };
+    }
+  }
   return null;
 }
 
@@ -727,6 +761,13 @@ function buildProblem(
     return buildProblemBase(family, { a, b }, `${a} + ${b} = □`, a + b);
   }
 
+  if (family === "a_plus_b_minus_c_eq_blank") {
+    const a = randInt(rng, range.min, range.max);
+    const b = randInt(rng, range.min, range.max);
+    const c = randInt(rng, 0, a + b);
+    return buildProblemBase(family, { a, b, c }, `${a} + ${b} - ${c} = □`, a + b - c);
+  }
+
   const a = randInt(rng, range.min, range.max);
   const diff = randInt(rng, range.min, range.max);
   const b = a + diff;
@@ -742,6 +783,8 @@ function solve(problem: MicroProblemDsl): number {
       return Number(p.b) - Number(p.a);
     case "a_plus_b_eq_blank":
       return Number(p.a) + Number(p.b);
+    case "a_plus_b_minus_c_eq_blank":
+      return Number(p.a) + Number(p.b) - Number(p.c);
     case "b_minus_a_eq_blank":
       return Number(p.b) - Number(p.a);
     case "compare_totals_diff_mc":
@@ -842,6 +885,13 @@ function validateProblem(problem: MicroProblemDsl, difficulty: Difficulty): stri
     if (Number(p.blank) < 0) return "negative_answer";
   }
 
+  if (problem.family === "a_plus_b_minus_c_eq_blank") {
+    const p = problem.params;
+    const needed = ["a", "b", "c"] as const;
+    if (!needed.every((k) => Number.isInteger(Number(p[k])))) return "missing_add_sub_params";
+    if (Number(p.c) > Number(p.a) + Number(p.b)) return "negative_answer";
+  }
+
   const modeReason = validateModeItems(problem);
   if (modeReason) return modeReason;
 
@@ -883,6 +933,9 @@ microGenerateRouter.post("/", async (req, res) => {
   let modelHttpStatus: number | null = null;
   let fallbackCount = 0;
   let inferenceLatencyMs = 0;
+  let parseStageSelected: ParseStage = hasImageBase64 ? "image" : "ocr";
+  let equationRegexHit = false;
+  let equationNormalizedText = "";
   let decodeDebug: DecodeFallbackDebug = {
     ocr_line_count: 0,
     keyword_hits: 0,
@@ -906,14 +959,20 @@ microGenerateRouter.post("/", async (req, res) => {
   let detected: DetectResult;
   let compareSignals: CompareSignals;
   let timesSignals: TimesSignals;
+  const equationCandidates: string[] = [];
 
   if (parsedReq.data.text) {
+    parseStageSelected = "ocr";
+    equationCandidates.push(parsedReq.data.text);
     const det = detectFamily(parsedReq.data.text);
     detected = det.detected;
     compareSignals = det.compare;
     timesSignals = det.times;
   } else {
     selectedDetectorPath = "image_gemini_detector";
+    parseStageSelected = "image";
+    const decodedTextForEquation = decodeBase64Text(imageBase64);
+    equationCandidates.push(decodedTextForEquation);
     const started = Date.now();
     const firstAttempt = await detectFamilyFromImage(imageBase64);
     let vision = firstAttempt;
@@ -936,9 +995,9 @@ microGenerateRouter.post("/", async (req, res) => {
     } else {
       detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
       selectedDetectorPath = "image_base64_decode_text_detector";
-      const decodedText = decodeBase64Text(imageBase64);
-      decodeDebug = buildDecodeFallbackDebug(decodedText);
-      const det = detectFamily(decodedText);
+      parseStageSelected = "ocr";
+      decodeDebug = buildDecodeFallbackDebug(decodedTextForEquation);
+      const det = detectFamily(decodedTextForEquation);
       compareSignals = det.compare;
       timesSignals = det.times;
 
@@ -954,6 +1013,26 @@ microGenerateRouter.post("/", async (req, res) => {
       if (decodeDebug.parse_candidates_count === 0 && !detectorFallbackReason) {
         detectorFallbackReason = "decode_text_fallback_failed";
       }
+    }
+  }
+
+  // Required pass before unknown: equation regex fallback over OCR-like candidates.
+  if (detected.family === "unknown") {
+    const fallback = equationFallbackParser(equationCandidates);
+    if (fallback) {
+      equationRegexHit = true;
+      equationNormalizedText = fallback.normalized_text;
+      parseStageSelected = "equation_regex_fallback";
+      detected = {
+        family: fallback.parsed.family,
+        confidence: 0.92,
+        parsed_example: fallback.parsed,
+        block_fallback: false,
+        intent: intentFromFamily(fallback.parsed.family)
+      };
+      const det = detectFamily(fallback.normalized_text);
+      compareSignals = det.compare;
+      timesSignals = det.times;
     }
   }
 
@@ -1076,7 +1155,11 @@ microGenerateRouter.post("/", async (req, res) => {
       parse_candidates_count: decodeDebug.parse_candidates_count,
       prompt_verb: selectedTheme?.verb_exist ?? null,
       prompt_unit: selectedTheme?.unit ?? null,
-      lexicon_version: LEXICON_VERSION
+      lexicon_version: LEXICON_VERSION,
+      parse_stage_selected: parseStageSelected,
+      equation_regex_hit: equationRegexHit,
+      equation_normalized_text: equationNormalizedText,
+      unknown_reason: detected.family === "unknown" ? unknownNote : null
     },
     meta: {
       family: String(detected.family),
