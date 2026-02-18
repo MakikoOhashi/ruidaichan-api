@@ -402,13 +402,65 @@ function normalizeEquationText(s: string): { normalized: string; compact: string
   };
 }
 
-function extractEquationSnippet(s: string): string {
-  const normalized = normalizeEquationText(s).normalized;
-  if (!normalized) return "";
-  const noSpaces = normalized.replace(/\s+/g, "");
-  const match = noSpaces.match(/\d+\+\d+-\d+=([□口ロ＿_Il\|]|\d+)?/);
-  if (match) return match[0];
-  return "";
+function splitChoiceText(text: string): { mainText: string; choicesText: string } {
+  const choiceStart = text.search(/[①-⑩]/);
+  if (choiceStart < 0) return { mainText: text, choicesText: "" };
+  return {
+    mainText: text.slice(0, choiceStart),
+    choicesText: text.slice(choiceStart)
+  };
+}
+
+function stripQuestionNumberNoise(text: string): string {
+  return text.replace(/[（(]\d+[）)]/g, " ").replace(/\b\d+\./g, " ");
+}
+
+function extractEquationCandidates(text: string): string[] {
+  const cleaned = stripQuestionNumberNoise(splitChoiceText(text).mainText);
+  const compact = normalizeEquationText(cleaned).compact;
+  if (!compact) return [];
+
+  const patterns: Array<{ re: RegExp; priority: number }> = [
+    { re: /\d+\+\d+-\d+=(?:[□口ロ＿_Il\|]|\d+)?/g, priority: 3 },
+    { re: /\d+\+\d+=(?:[□口ロ＿_Il\|]|\d+)?/g, priority: 2 },
+    { re: /\d+-\d+=(?:[□口ロ＿_Il\|]|\d+)?/g, priority: 1 }
+  ];
+
+  const hits: Array<{ text: string; start: number; end: number; priority: number }> = [];
+  for (const p of patterns) {
+    for (const m of compact.matchAll(p.re)) {
+      const v = m[0];
+      if (!v) continue;
+      hits.push({
+        text: v,
+        start: m.index ?? 0,
+        end: (m.index ?? 0) + v.length,
+        priority: p.priority
+      });
+    }
+  }
+
+  hits.sort((a, b) => {
+    if (a.start !== b.start) return a.start - b.start;
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    return b.text.length - a.text.length;
+  });
+
+  const selected: Array<{ text: string; start: number; end: number }> = [];
+  for (const h of hits) {
+    const overlaps = selected.some((s) => !(h.end <= s.start || h.start >= s.end));
+    if (overlaps) continue;
+    selected.push({ text: h.text, start: h.start, end: h.end });
+  }
+
+  const dedup: string[] = [];
+  const seen = new Set<string>();
+  for (const s of selected) {
+    if (seen.has(s.text)) continue;
+    seen.add(s.text);
+    dedup.push(s.text);
+  }
+  return dedup;
 }
 
 function hasChoiceSignals(text: string): boolean {
@@ -418,16 +470,22 @@ function hasChoiceSignals(text: string): boolean {
 function deterministicBlankCorrection(inputText: string): {
   before: string;
   after: string;
+  ambiguous: boolean;
+  blank_missing_detected: boolean;
+  blank_missing_rewritten: boolean;
   blank_confusion_detected: boolean;
   blank_confusion_original: string | null;
   blank_confusion_rewritten: string | null;
-  reason: "blank_ocr_confusion" | null;
+  reason: "blank_ocr_confusion" | "missing_blank" | null;
 } {
-  const snippet = extractEquationSnippet(inputText);
-  if (!snippet) {
+  const candidates = extractEquationCandidates(inputText);
+  if (candidates.length === 0) {
     return {
       before: "",
       after: "",
+      ambiguous: false,
+      blank_missing_detected: false,
+      blank_missing_rewritten: false,
       blank_confusion_detected: false,
       blank_confusion_original: null,
       blank_confusion_rewritten: null,
@@ -435,11 +493,29 @@ function deterministicBlankCorrection(inputText: string): {
     };
   }
 
-  const parsed = snippet.match(/^(\d+)\+(\d+)-(\d+)=(.*)$/);
+  if (candidates.length > 1) {
+    return {
+      before: candidates.join("|"),
+      after: "",
+      ambiguous: true,
+      blank_missing_detected: candidates.some((x) => x.endsWith("=")),
+      blank_missing_rewritten: false,
+      blank_confusion_detected: false,
+      blank_confusion_original: null,
+      blank_confusion_rewritten: null,
+      reason: null
+    };
+  }
+
+  const snippet = candidates[0];
+  const parsed = snippet.match(/^(\d+)([+\-])(\d+)(?:-(\d+))?=(.*)$/);
   if (!parsed) {
     return {
       before: snippet,
       after: snippet,
+      ambiguous: false,
+      blank_missing_detected: false,
+      blank_missing_rewritten: false,
       blank_confusion_detected: false,
       blank_confusion_original: null,
       blank_confusion_rewritten: null,
@@ -447,14 +523,47 @@ function deterministicBlankCorrection(inputText: string): {
     };
   }
 
-  const rhs = (parsed[4] ?? "").trim();
+  const rhs = (parsed[5] ?? "").trim();
   const blankLike = new Set(["□", "口", "ロ", "_", "＿", "I", "l", "|", "[]", ""]);
+  const choiceSignals = hasChoiceSignals(inputText);
+
+  if (rhs === "") {
+    if (choiceSignals) {
+      return {
+        before: snippet,
+        after: `${snippet}□`,
+        ambiguous: false,
+        blank_missing_detected: true,
+        blank_missing_rewritten: true,
+        blank_confusion_detected: false,
+        blank_confusion_original: null,
+        blank_confusion_rewritten: null,
+        reason: "missing_blank"
+      };
+    }
+
+    return {
+      before: snippet,
+      after: snippet,
+      ambiguous: false,
+      blank_missing_detected: true,
+      blank_missing_rewritten: false,
+      blank_confusion_detected: false,
+      blank_confusion_original: null,
+      blank_confusion_rewritten: null,
+      reason: null
+    };
+  }
+
   if (blankLike.has(rhs)) {
-    const rewritten = `${parsed[1]}+${parsed[2]}-${parsed[3]}=□`;
+    const rewritten = `${parsed[1]}${parsed[2]}${parsed[3]}${parsed[4] ? `-${parsed[4]}` : ""}=□`;
     const confused = rhs !== "□";
     return {
       before: snippet,
       after: rewritten,
+      ambiguous: false,
+      blank_missing_detected: false,
+      blank_missing_rewritten: false,
       blank_confusion_detected: confused,
       blank_confusion_original: confused ? rhs || "empty" : null,
       blank_confusion_rewritten: confused ? "□" : null,
@@ -464,12 +573,14 @@ function deterministicBlankCorrection(inputText: string): {
 
   // Conservative promotion from "=1" only when equation appears once and choice-style wording exists.
   const singleDigitRhs = /^\d$/.test(rhs);
-  const snippetCount = (normalizeEquationText(inputText).compact.match(/\d+\+\d+-\d+=/g) ?? []).length;
-  if (singleDigitRhs && rhs === "1" && snippetCount === 1 && hasChoiceSignals(inputText)) {
-    const rewritten = `${parsed[1]}+${parsed[2]}-${parsed[3]}=□`;
+  if (singleDigitRhs && rhs === "1" && candidates.length === 1 && choiceSignals) {
+    const rewritten = `${parsed[1]}${parsed[2]}${parsed[3]}${parsed[4] ? `-${parsed[4]}` : ""}=□`;
     return {
       before: snippet,
       after: rewritten,
+      ambiguous: false,
+      blank_missing_detected: false,
+      blank_missing_rewritten: false,
       blank_confusion_detected: true,
       blank_confusion_original: rhs,
       blank_confusion_rewritten: "□",
@@ -480,6 +591,9 @@ function deterministicBlankCorrection(inputText: string): {
   return {
     before: snippet,
     after: snippet,
+    ambiguous: false,
+    blank_missing_detected: false,
+    blank_missing_rewritten: false,
     blank_confusion_detected: false,
     blank_confusion_original: null,
     blank_confusion_rewritten: null,
@@ -487,7 +601,7 @@ function deterministicBlankCorrection(inputText: string): {
   };
 }
 
-async function proposeEquationCorrectionWithAi(inputText: string, deterministicCandidate: string): Promise<{
+async function proposeEquationCorrectionWithAi(inputText: string, deterministicCandidate: string, choicesText: string): Promise<{
   normalized_expression: string;
   confidence: number;
   reason: string;
@@ -517,7 +631,7 @@ async function proposeEquationCorrectionWithAi(inputText: string, deterministicC
           contents: [
             {
               role: "user",
-              parts: [{ text: `${prompt}\ninput:${inputText}\ndeterministic:${deterministicCandidate}` }]
+              parts: [{ text: `${prompt}\ninput:${inputText}\ndeterministic:${deterministicCandidate}\nchoices:${choicesText}` }]
             }
           ],
           generationConfig: { temperature: 0, responseMimeType: "application/json" }
@@ -1293,6 +1407,8 @@ microGenerateRouter.post("/", async (req, res) => {
   let equationCandidateAfter = "";
   let correctionStageSelected: CorrectionStage = "none";
   let correctionConfidence: number | null = null;
+  let blankMissingDetected = false;
+  let blankMissingRewritten = false;
   let blankConfusionDetected = false;
   let blankConfusionOriginal: string | null = null;
   let blankConfusionRewritten: string | null = null;
@@ -1480,6 +1596,8 @@ microGenerateRouter.post("/", async (req, res) => {
   const deterministicCorrection = deterministicBlankCorrection(eqCandidate.text);
   equationCandidateBefore = deterministicCorrection.before || eqCandidate.text;
   equationCandidateAfter = deterministicCorrection.after || eqCandidate.text;
+  blankMissingDetected = deterministicCorrection.blank_missing_detected;
+  blankMissingRewritten = deterministicCorrection.blank_missing_rewritten;
   blankConfusionDetected = deterministicCorrection.blank_confusion_detected;
   blankConfusionOriginal = deterministicCorrection.blank_confusion_original;
   blankConfusionRewritten = deterministicCorrection.blank_confusion_rewritten;
@@ -1489,8 +1607,15 @@ microGenerateRouter.post("/", async (req, res) => {
 
   const deterministicParsed =
     equationCandidateAfter && !binaryCandidateRejected ? equationFallbackParser(equationCandidateAfter) : null;
-  if (!deterministicParsed && equationCandidateAfter && !binaryCandidateRejected && shouldAttemptAiEquationCorrection(equationCandidateAfter)) {
-    const aiProposal = await proposeEquationCorrectionWithAi(equationNormalizedText || eqCandidate.text, equationCandidateAfter);
+  if (
+    !deterministicParsed &&
+    equationCandidateAfter &&
+    !binaryCandidateRejected &&
+    deterministicCorrection.ambiguous &&
+    shouldAttemptAiEquationCorrection(equationCandidateAfter)
+  ) {
+    const choicesText = splitChoiceText(eqCandidate.text).choicesText;
+    const aiProposal = await proposeEquationCorrectionWithAi(equationNormalizedText || eqCandidate.text, equationCandidateAfter, choicesText);
     if (aiProposal?.normalized_expression) {
       const aiParsed = equationFallbackParser(aiProposal.normalized_expression);
       if (aiParsed) {
@@ -1526,6 +1651,7 @@ microGenerateRouter.post("/", async (req, res) => {
   } else if (detected.family === "unknown") {
     if (binaryCandidateRejected) upstreamUnknownReason = "binary_candidate_rejected";
     else if (normalizeInputEmpty && hasImageBase64) upstreamUnknownReason = "ocr_empty_after_fallback";
+    else if (blankMissingDetected && !blankMissingRewritten) upstreamUnknownReason = "missing_blank_unrecoverable";
     else if (detectorFallbackReason === "model_429" || detectorFallbackReason === "model_timeout" || detectorFallbackReason === "model_5xx" || detectorFallbackReason === "model_http_error") upstreamUnknownReason = detectorFallbackReason;
     else if (normalizeInputEmpty) upstreamUnknownReason = "ocr_empty";
     else if (detectorFallbackReason === "empty_parse") upstreamUnknownReason = "empty_parse_upstream";
@@ -1667,6 +1793,8 @@ microGenerateRouter.post("/", async (req, res) => {
       correction_stage_selected: correctionStageSelected,
       equation_candidate_before: equationCandidateBefore.slice(0, 100),
       equation_candidate_after: equationCandidateAfter.slice(0, 100),
+      blank_missing_detected: blankMissingDetected,
+      blank_missing_rewritten: blankMissingRewritten,
       blank_confusion_detected: blankConfusionDetected,
       blank_confusion_original: blankConfusionOriginal,
       blank_confusion_rewritten: blankConfusionRewritten,
@@ -1684,7 +1812,9 @@ microGenerateRouter.post("/", async (req, res) => {
       note: forceUnknownByLexicon
         ? "theme_lexicon_mismatch"
         : generationFamily
-        ? blankConfusionDetected
+        ? blankMissingRewritten
+          ? "equation_corrected_missing_blank"
+          : blankConfusionDetected
           ? "equation_corrected_from_ocr_confusion"
           : policy.note
         : unknownNote,

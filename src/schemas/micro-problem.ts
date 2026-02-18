@@ -131,6 +131,8 @@ export const microGenerateResponseSchema = z
         correction_stage_selected: z.enum(["deterministic", "ai_assist", "none"]),
         equation_candidate_before: z.string(),
         equation_candidate_after: z.string(),
+        blank_missing_detected: z.boolean(),
+        blank_missing_rewritten: z.boolean(),
         blank_confusion_detected: z.boolean(),
         blank_confusion_original: z.string().nullable(),
         blank_confusion_rewritten: z.string().nullable(),

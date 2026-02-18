@@ -276,6 +276,93 @@ test("correction guard: plain 7+9-6=1 without choice signals stays unknown", asy
   });
 });
 
+test("missing blank is recovered for a+b= with choices", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(1) 4 + 9 =。① 3 ② 12 ③ 13 ④ 14 ⑤ 36",
+        N: 4,
+        difficulty: "same",
+        seed: "missing-blank-plus"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      meta: { note: string };
+      detected: { family: string };
+      debug: {
+        blank_missing_detected: boolean;
+        blank_missing_rewritten: boolean;
+        equation_candidate_after: string;
+      };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.meta.note, "equation_corrected_missing_blank");
+    assert.equal(body.detected.family, "a_plus_b_eq_blank");
+    assert.equal(body.debug.blank_missing_detected, true);
+    assert.equal(body.debug.blank_missing_rewritten, true);
+    assert.equal(body.debug.equation_candidate_after.includes("4+9=□"), true);
+  });
+});
+
+test("missing blank is recovered for a+b-c= with choices", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(2) 7+9-6=。①4 ②8 ③10 ④12 ⑤15",
+        N: 4,
+        difficulty: "same",
+        seed: "missing-blank-add-sub"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      detected: { family: string };
+      debug: { equation_candidate_after: string; blank_missing_rewritten: boolean };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.equal(body.debug.blank_missing_rewritten, true);
+    assert.equal(body.debug.equation_candidate_after.includes("7+9-6=□"), true);
+  });
+});
+
+test("ambiguous multiple missing-blank candidates fail closed", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(1) 4+9=。 (2) 7+2=。 ① 3 ② 12 ③ 13 ④ 14 ⑤ 36",
+        N: 4,
+        difficulty: "same",
+        seed: "missing-blank-amb"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      meta: { note: string };
+      problems: unknown[];
+      debug: { blank_missing_detected: boolean; blank_missing_rewritten: boolean };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.meta.note, "missing_blank_unrecoverable");
+    assert.equal(body.problems.length, 0);
+    assert.equal(body.debug.blank_missing_detected, true);
+    assert.equal(body.debug.blank_missing_rewritten, false);
+  });
+});
+
 test("word_problem(compare) returns prompt+choices with correct_index", async () => {
   await withServer(async (baseUrl) => {
     const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
@@ -911,6 +998,36 @@ test("text mode survives AI 429 by deterministic correction", async () => {
       assert.equal(res.status, 200);
       assert.equal(body.detected_mode, "equation");
       assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+      assert.equal(body.debug.correction_stage_selected, "deterministic");
+      assert.equal(body.debug.unknown_reason, null);
+    });
+  });
+});
+
+test("text missing-blank recovery survives AI 429 via deterministic path", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          text: "(1) 4 + 9 =。① 3 ② 12 ③ 13 ④ 14 ⑤ 36",
+          N: 4,
+          difficulty: "same",
+          seed: "missing-429"
+        })
+      });
+      const body = (await res.json()) as {
+        detected_mode: string;
+        debug: { correction_stage_selected: string; unknown_reason: string | null };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
       assert.equal(body.debug.correction_stage_selected, "deterministic");
       assert.equal(body.debug.unknown_reason, null);
     });
