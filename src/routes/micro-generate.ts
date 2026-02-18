@@ -63,6 +63,7 @@ type FallbackReason =
   | "decode_text_fallback_failed";
 
 type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "none";
+type CorrectionStage = "deterministic" | "ai_assist" | "none";
 
 type DecodeFallbackDebug = {
   ocr_line_count: number;
@@ -399,6 +400,163 @@ function normalizeEquationText(s: string): { normalized: string; compact: string
     normalized,
     compact: normalized.replace(/\s+/g, "")
   };
+}
+
+function extractEquationSnippet(s: string): string {
+  const normalized = normalizeEquationText(s).normalized;
+  if (!normalized) return "";
+  const noSpaces = normalized.replace(/\s+/g, "");
+  const match = noSpaces.match(/\d+\+\d+-\d+=([□口ロ＿_Il\|]|\d+)?/);
+  if (match) return match[0];
+  return "";
+}
+
+function hasChoiceSignals(text: string): boolean {
+  return /[①-⑩]|つぎから1つ|つぎから１つ|えらびなさい|選びなさい/.test(text);
+}
+
+function deterministicBlankCorrection(inputText: string): {
+  before: string;
+  after: string;
+  blank_confusion_detected: boolean;
+  blank_confusion_original: string | null;
+  blank_confusion_rewritten: string | null;
+  reason: "blank_ocr_confusion" | null;
+} {
+  const snippet = extractEquationSnippet(inputText);
+  if (!snippet) {
+    return {
+      before: "",
+      after: "",
+      blank_confusion_detected: false,
+      blank_confusion_original: null,
+      blank_confusion_rewritten: null,
+      reason: null
+    };
+  }
+
+  const parsed = snippet.match(/^(\d+)\+(\d+)-(\d+)=(.*)$/);
+  if (!parsed) {
+    return {
+      before: snippet,
+      after: snippet,
+      blank_confusion_detected: false,
+      blank_confusion_original: null,
+      blank_confusion_rewritten: null,
+      reason: null
+    };
+  }
+
+  const rhs = (parsed[4] ?? "").trim();
+  const blankLike = new Set(["□", "口", "ロ", "_", "＿", "I", "l", "|", "[]", ""]);
+  if (blankLike.has(rhs)) {
+    const rewritten = `${parsed[1]}+${parsed[2]}-${parsed[3]}=□`;
+    const confused = rhs !== "□";
+    return {
+      before: snippet,
+      after: rewritten,
+      blank_confusion_detected: confused,
+      blank_confusion_original: confused ? rhs || "empty" : null,
+      blank_confusion_rewritten: confused ? "□" : null,
+      reason: confused ? "blank_ocr_confusion" : null
+    };
+  }
+
+  // Conservative promotion from "=1" only when equation appears once and choice-style wording exists.
+  const singleDigitRhs = /^\d$/.test(rhs);
+  const snippetCount = (normalizeEquationText(inputText).compact.match(/\d+\+\d+-\d+=/g) ?? []).length;
+  if (singleDigitRhs && rhs === "1" && snippetCount === 1 && hasChoiceSignals(inputText)) {
+    const rewritten = `${parsed[1]}+${parsed[2]}-${parsed[3]}=□`;
+    return {
+      before: snippet,
+      after: rewritten,
+      blank_confusion_detected: true,
+      blank_confusion_original: rhs,
+      blank_confusion_rewritten: "□",
+      reason: "blank_ocr_confusion"
+    };
+  }
+
+  return {
+    before: snippet,
+    after: snippet,
+    blank_confusion_detected: false,
+    blank_confusion_original: null,
+    blank_confusion_rewritten: null,
+    reason: null
+  };
+}
+
+async function proposeEquationCorrectionWithAi(inputText: string, deterministicCandidate: string): Promise<{
+  normalized_expression: string;
+  confidence: number;
+  reason: string;
+} | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt = [
+    "You normalize OCR math text for elementary equation blanks.",
+    "Return strict JSON only:",
+    '{"normalized_expression":"7+9-6=□","confidence":0.85,"reason":"blank_ocr_confusion"}',
+    "Rules:",
+    "- Keep only one equation snippet.",
+    "- Use □ for blank.",
+    "- If uncertain, return the deterministic candidate unchanged."
+  ].join("\n");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(GEMINI_TIMEOUT_MS, 4000));
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `${prompt}\ninput:${inputText}\ndeterministic:${deterministicCandidate}` }]
+            }
+          ],
+          generationConfig: { temperature: 0, responseMimeType: "application/json" }
+        }),
+        signal: controller.signal
+      }
+    );
+    if (!response.ok) return null;
+    const json = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return null;
+    const parsed = JSON.parse(text) as {
+      normalized_expression?: unknown;
+      confidence?: unknown;
+      reason?: unknown;
+    };
+    const expression = typeof parsed.normalized_expression === "string" ? parsed.normalized_expression : "";
+    const confidence = Number(parsed.confidence ?? 0);
+    const reason = typeof parsed.reason === "string" ? parsed.reason : "ai_proposal";
+    if (!expression) return null;
+    return {
+      normalized_expression: expression,
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0,
+      reason
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function shouldAttemptAiEquationCorrection(text: string): boolean {
+  if (!text) return false;
+  const normalized = normalizeEquationText(text).compact;
+  const hasEquationSignals = /[0-9]/.test(normalized) && /[=+\-□口ロ_＿]/.test(normalized);
+  return hasEquationSignals;
 }
 
 function cleanCandidateText(s: string): string {
@@ -1131,6 +1289,13 @@ microGenerateRouter.post("/", async (req, res) => {
   let equationCompactText = "";
   let equationCandidateSource: EquationCandidateSource = "none";
   let equationCandidateLength = 0;
+  let equationCandidateBefore = "";
+  let equationCandidateAfter = "";
+  let correctionStageSelected: CorrectionStage = "none";
+  let correctionConfidence: number | null = null;
+  let blankConfusionDetected = false;
+  let blankConfusionOriginal: string | null = null;
+  let blankConfusionRewritten: string | null = null;
   let normalizeInputEmpty = false;
   let upstreamUnknownReason: string | null = null;
   let binaryCandidateRejected = false;
@@ -1312,8 +1477,33 @@ microGenerateRouter.post("/", async (req, res) => {
     equationCompactText = preview.compact.slice(0, 100);
   }
 
+  const deterministicCorrection = deterministicBlankCorrection(eqCandidate.text);
+  equationCandidateBefore = deterministicCorrection.before || eqCandidate.text;
+  equationCandidateAfter = deterministicCorrection.after || eqCandidate.text;
+  blankConfusionDetected = deterministicCorrection.blank_confusion_detected;
+  blankConfusionOriginal = deterministicCorrection.blank_confusion_original;
+  blankConfusionRewritten = deterministicCorrection.blank_confusion_rewritten;
+  if (deterministicCorrection.reason) {
+    correctionStageSelected = "deterministic";
+  }
+
+  const deterministicParsed =
+    equationCandidateAfter && !binaryCandidateRejected ? equationFallbackParser(equationCandidateAfter) : null;
+  if (!deterministicParsed && equationCandidateAfter && !binaryCandidateRejected && shouldAttemptAiEquationCorrection(equationCandidateAfter)) {
+    const aiProposal = await proposeEquationCorrectionWithAi(equationNormalizedText || eqCandidate.text, equationCandidateAfter);
+    if (aiProposal?.normalized_expression) {
+      const aiParsed = equationFallbackParser(aiProposal.normalized_expression);
+      if (aiParsed) {
+        equationCandidateAfter = aiProposal.normalized_expression;
+        correctionStageSelected = "ai_assist";
+        correctionConfidence = aiProposal.confidence;
+      }
+    }
+  }
+
   // Required pass before unknown: equation regex fallback over OCR-like candidates.
-  const fallback = !localRegexHit && eqCandidate.text && !binaryCandidateRejected ? equationFallbackParser(eqCandidate.text) : null;
+  const fallback =
+    !localRegexHit && equationCandidateAfter && !binaryCandidateRejected ? equationFallbackParser(equationCandidateAfter) : null;
   if (fallback) {
     localRegexHit = true;
     equationRegexHit = true;
@@ -1330,6 +1520,9 @@ microGenerateRouter.post("/", async (req, res) => {
     const det = detectFamily(fallback.normalized_text);
     compareSignals = det.compare;
     timesSignals = det.times;
+    if (blankConfusionDetected && !upstreamUnknownReason) {
+      upstreamUnknownReason = "equation_corrected_from_ocr_confusion";
+    }
   } else if (detected.family === "unknown") {
     if (binaryCandidateRejected) upstreamUnknownReason = "binary_candidate_rejected";
     else if (normalizeInputEmpty && hasImageBase64) upstreamUnknownReason = "ocr_empty_after_fallback";
@@ -1471,6 +1664,13 @@ microGenerateRouter.post("/", async (req, res) => {
       equation_compact_text: equationCompactText,
       equation_candidate_source: equationCandidateSource,
       equation_candidate_length: equationCandidateLength,
+      correction_stage_selected: correctionStageSelected,
+      equation_candidate_before: equationCandidateBefore.slice(0, 100),
+      equation_candidate_after: equationCandidateAfter.slice(0, 100),
+      blank_confusion_detected: blankConfusionDetected,
+      blank_confusion_original: blankConfusionOriginal,
+      blank_confusion_rewritten: blankConfusionRewritten,
+      correction_confidence: correctionConfidence,
       binary_candidate_rejected: binaryCandidateRejected,
       binary_reject_reason: binaryRejectReason,
       normalize_input_empty: normalizeInputEmpty,
@@ -1481,7 +1681,13 @@ microGenerateRouter.post("/", async (req, res) => {
       count_policy: "server_enforced",
       max_count: policy.maxCount,
       applied_count: policy.appliedCount,
-      note: forceUnknownByLexicon ? "theme_lexicon_mismatch" : generationFamily ? policy.note : unknownNote,
+      note: forceUnknownByLexicon
+        ? "theme_lexicon_mismatch"
+        : generationFamily
+        ? blankConfusionDetected
+          ? "equation_corrected_from_ocr_confusion"
+          : policy.note
+        : unknownNote,
       seed: seedAsString,
       sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text })))),
       request_hash: sha(parsedReq.data.text ? normalizeText(parsedReq.data.text) : imageBase64),

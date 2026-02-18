@@ -167,6 +167,115 @@ test("equation fallback complements missing blank: 7+9-6=", async () => {
   });
 });
 
+test("text correction rescues OCR confusion: 7+9-6=1 with choice signals", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(4) 7+9-6=1。つぎから1つえらびなさい。①4 ②8 ③10",
+        N: 4,
+        difficulty: "same",
+        seed: "ocr-confusion-1"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      detected: { family: string };
+      meta: { note: string };
+      debug: {
+        blank_confusion_detected: boolean;
+        blank_confusion_original: string | null;
+        blank_confusion_rewritten: string | null;
+        equation_candidate_after: string;
+        correction_stage_selected: string;
+      };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.equal(body.meta.note, "equation_corrected_from_ocr_confusion");
+    assert.equal(body.debug.blank_confusion_detected, true);
+    assert.equal(body.debug.blank_confusion_original, "1");
+    assert.equal(body.debug.blank_confusion_rewritten, "□");
+    assert.equal(body.debug.equation_candidate_after.includes("=□"), true);
+    assert.equal(body.debug.correction_stage_selected, "deterministic");
+  });
+});
+
+test("text correction handles blank variants: =口 and =_", async () => {
+  await withServer(async (baseUrl) => {
+    const headers = { "Content-Type": "application/json", "x-api-key": "test-key" };
+    const r1 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "7+9-6=口", N: 4, difficulty: "same", seed: "blank-kuchi" })
+    });
+    const r2 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "7+9-6=_", N: 4, difficulty: "same", seed: "blank-under" })
+    });
+    const b1 = (await r1.json()) as { detected_mode: string; detected: { family: string } };
+    const b2 = (await r2.json()) as { detected_mode: string; detected: { family: string } };
+
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(b1.detected_mode, "equation");
+    assert.equal(b2.detected_mode, "equation");
+    assert.equal(b1.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.equal(b2.detected.family, "a_plus_b_minus_c_eq_blank");
+  });
+});
+
+test("text correction extracts equation from noisy sentence", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(4) しきをときましょう。7 + 9 - 6 = 1。①4 ②8 ③10",
+        N: 4,
+        difficulty: "same",
+        seed: "noisy-eq"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      detected: { family: string };
+      debug: { equation_candidate_before: string; equation_candidate_after: string };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.equal(body.debug.equation_candidate_before.includes("7+9-6=1"), true);
+    assert.equal(body.debug.equation_candidate_after.includes("7+9-6=□"), true);
+  });
+});
+
+test("correction guard: plain 7+9-6=1 without choice signals stays unknown", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text: "7+9-6=1", N: 4, difficulty: "same", seed: "guard-eq1" })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      meta: { note: string };
+      debug: { blank_confusion_detected: boolean; correction_stage_selected: string };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.meta.note, "equation_regex_miss");
+    assert.equal(body.debug.blank_confusion_detected, false);
+    assert.equal(body.debug.correction_stage_selected, "none");
+  });
+});
+
 test("word_problem(compare) returns prompt+choices with correct_index", async () => {
   await withServer(async (baseUrl) => {
     const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
@@ -773,6 +882,39 @@ test("model_429 still returns equation when local OCR regex hits", async () => {
   } finally {
     delete process.env.LOCAL_OCR_STUB_TEXT;
   }
+});
+
+test("text mode survives AI 429 by deterministic correction", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          text: "(4) 7+9-6=1。つぎから1つえらびなさい。①4 ②8 ③10",
+          N: 4,
+          difficulty: "same",
+          seed: "deterministic-429"
+        })
+      });
+      const body = (await res.json()) as {
+        detected_mode: string;
+        detected: { family: string };
+        debug: { correction_stage_selected: string; unknown_reason: string | null };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+      assert.equal(body.debug.correction_stage_selected, "deterministic");
+      assert.equal(body.debug.unknown_reason, null);
+    });
+  });
 });
 
 test("image detector fails twice then returns unknown with concrete note", async () => {
