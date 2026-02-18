@@ -72,6 +72,20 @@ type VisionAttempt = {
   times?: TimesSignals;
 };
 
+type Theme = {
+  id: string;
+  subject_a: string;
+  subject_b: string;
+  unit: string;
+};
+
+const THEME_BANK: Theme[] = [
+  { id: "tulip", subject_a: "黄色のチューリップ", subject_b: "赤いチューリップ", unit: "本" },
+  { id: "candy", subject_a: "あかいあめ", subject_b: "きいろいあめ", unit: "こ" },
+  { id: "pencil", subject_a: "みどりのえんぴつ", subject_b: "あおいえんぴつ", unit: "本" },
+  { id: "plate", subject_a: "しろいおさら", subject_b: "あかいおさら", unit: "まい" }
+];
+
 function normalizeText(text: string): string {
   return text.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
@@ -209,6 +223,28 @@ function buildEquationChoices(answer: number, unit = ""): { choices: string[]; c
     .map((v) => `${v}${unit}`);
   const correctIndex = choices.findIndex((c) => c === `${answer}${unit}`);
   return { choices, correctIndex };
+}
+
+function buildCompareChoices(answer: number, unit: string, subjectA: string, subjectB: string): { choices: string[]; correctIndex: number } {
+  const wrong = new Set<number>([Math.max(0, answer - 1), answer + 1, answer + 2, Math.max(0, answer - 2)]);
+  wrong.delete(answer);
+  const values = [answer, ...Array.from(wrong).slice(0, 4)].slice(0, 5).sort((a, b) => a - b);
+  const choices = values.map((v, idx) => {
+    const subject = idx % 2 === 0 ? subjectA : subjectB;
+    return `${subject}が${v}${unit}おおい`;
+  });
+  const correctIndex = choices.findIndex((c) => c.includes(`${answer}${unit}`));
+  return { choices, correctIndex };
+}
+
+function isWordProblemFamily(family: ProblemFamily | "unknown"): family is "times_scale_mc" | "compare_totals_diff_mc" {
+  return family === "times_scale_mc" || family === "compare_totals_diff_mc";
+}
+
+function pickTheme(seed: string, family: ProblemFamily): Theme | null {
+  if (!isWordProblemFamily(family)) return null;
+  const idx = hashToSeed(`${seed}:${family}`) % THEME_BANK.length;
+  return THEME_BANK[idx] ?? THEME_BANK[0];
 }
 
 function parseByFamily(text: string): MicroProblemDsl | null {
@@ -596,7 +632,13 @@ function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | nu
   return { min: Math.max(0, mx - 5), max: mx + 5 };
 }
 
-function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Difficulty, example: MicroProblemDsl | null): MicroProblemDsl {
+function buildProblem(
+  family: ProblemFamily,
+  rng: () => number,
+  difficulty: Difficulty,
+  example: MicroProblemDsl | null,
+  theme: Theme | null
+): MicroProblemDsl {
   const range = rangeByDifficulty(difficulty, example);
 
   if (family === "times_scale_mc") {
@@ -605,9 +647,9 @@ function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Diff
     const base = randInt(rng, baseMin, baseMax);
     const multiplier = randInt(rng, 2, difficulty === "hard" ? 5 : 3);
     const answer = base * multiplier;
-    const unit = "本";
-    const subjectA = "黄色のチューリップ";
-    const subjectB = "赤いチューリップ";
+    const subjectA = theme?.subject_a ?? "黄色のチューリップ";
+    const subjectB = theme?.subject_b ?? "赤いチューリップ";
+    const unit = theme?.unit ?? "本";
     const { choices, correctIndex } = buildEquationChoices(answer, unit);
 
     return buildProblemBase(
@@ -637,13 +679,16 @@ function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Diff
     const redTotal = a + c;
     const yellowTotal = b + d;
     const blank = Math.abs(redTotal - yellowTotal);
-    const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
-    const { choices, correctIndex } = buildEquationChoices(blank, "こ");
+    const subjectA = theme?.subject_a ?? "黄色のチューリップ";
+    const subjectB = theme?.subject_b ?? "赤いチューリップ";
+    const unit = theme?.unit ?? "こ";
+    const winner = redTotal >= yellowTotal ? subjectA : subjectB;
+    const { choices, correctIndex } = buildCompareChoices(blank, unit, subjectA, subjectB);
 
     return buildProblemBase(
       family,
-      { a, b, c, d, blank, winner, choices, correct_index: correctIndex },
-      `あかは${a}こ、きいろは${b}こ。つぎに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。`,
+      { a, b, c, d, blank, winner, unit, subject_a: subjectA, subject_b: subjectB, choices, correct_index: correctIndex },
+      `${subjectA}は${a}${unit}、${subjectB}は${b}${unit}あります。つぎに ${subjectA}が${c}${unit}、${subjectB}が${d}${unit}ふえました。どちらが なん${unit} おおいですか。つぎから1つえらびなさい。`,
       blank
     );
   }
@@ -902,6 +947,9 @@ microGenerateRouter.post("/", async (req, res) => {
     })
   );
   const rng = mulberry32(rngSeed);
+  const seedAsString = String(parsedReq.data.seed);
+  const selectedTheme =
+    generationFamily && isWordProblemFamily(generationFamily) ? pickTheme(seedAsString, generationFamily) : null;
 
   const problems: MicroProblemDsl[] = [];
   const seen = new Set<string>();
@@ -910,7 +958,7 @@ microGenerateRouter.post("/", async (req, res) => {
 
   if (generationFamily) {
     for (let i = 0; i < MAX_REGEN_TRIES && problems.length < policy.appliedCount; i += 1) {
-      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, detected.parsed_example);
+      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, detected.parsed_example, selectedTheme);
       const duplicateKey = JSON.stringify({ render_text: problem.render_text, params: problem.params });
 
       if (seen.has(duplicateKey)) {
@@ -975,12 +1023,19 @@ microGenerateRouter.post("/", async (req, res) => {
       max_count: policy.maxCount,
       applied_count: policy.appliedCount,
       note: generationFamily ? policy.note : unknownNote,
-      seed: String(parsedReq.data.seed),
+      seed: seedAsString,
       sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text })))),
       request_hash: sha(parsedReq.data.text ? normalizeText(parsedReq.data.text) : imageBase64),
       detector_version: DETECTOR_VERSION,
       fallback_count: fallbackCount,
-      inference_latency_ms: inferenceLatencyMs
+      inference_latency_ms: inferenceLatencyMs,
+      ...(selectedTheme
+        ? {
+            theme_id: selectedTheme.id,
+            theme_candidates: THEME_BANK.map((t) => t.id),
+            theme_policy: "seed_deterministic" as const
+          }
+        : {})
     }
   };
 

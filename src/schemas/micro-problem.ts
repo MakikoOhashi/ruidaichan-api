@@ -129,7 +129,10 @@ export const microGenerateResponseSchema = z
         request_hash: z.string().optional(),
         detector_version: z.string().optional(),
         fallback_count: z.number().int().nonnegative().optional(),
-        inference_latency_ms: z.number().int().nonnegative().optional()
+        inference_latency_ms: z.number().int().nonnegative().optional(),
+        theme_id: z.string().optional(),
+        theme_candidates: z.array(z.string()).optional(),
+        theme_policy: z.literal("seed_deterministic").optional()
       })
       .strict()
   })

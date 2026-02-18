@@ -170,6 +170,117 @@ test("compatibility: family/params/render_text/answer remain", async () => {
   });
 });
 
+test("same seed returns same theme_id", async () => {
+  await withServer(async (baseUrl) => {
+    const payload = {
+      text: "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。",
+      N: 4,
+      difficulty: "same",
+      seed: "apple"
+    };
+    const headers = { "Content-Type": "application/json", "x-api-key": "test-key" };
+
+    const r1 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(payload) });
+    const r2 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(payload) });
+    const b1 = (await r1.json()) as { meta: { theme_id: string; theme_policy: string } };
+    const b2 = (await r2.json()) as { meta: { theme_id: string } };
+
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.equal(b1.meta.theme_id, b2.meta.theme_id);
+    assert.equal(b1.meta.theme_policy, "seed_deterministic");
+  });
+});
+
+test("different seed changes theme_id for word_problem", async () => {
+  await withServer(async (baseUrl) => {
+    const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
+    const headers = { "Content-Type": "application/json", "x-api-key": "test-key" };
+
+    const r1 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text, N: 4, difficulty: "same", seed: "apple" })
+    });
+    const r2 = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text, N: 4, difficulty: "same", seed: "banana" })
+    });
+    const b1 = (await r1.json()) as { meta: { theme_id: string; theme_candidates: string[] } };
+    const b2 = (await r2.json()) as { meta: { theme_id: string; theme_candidates: string[] } };
+
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+    assert.notEqual(b1.meta.theme_id, b2.meta.theme_id);
+    assert.equal(b1.meta.theme_candidates.includes(b1.meta.theme_id), true);
+    assert.equal(b2.meta.theme_candidates.includes(b2.meta.theme_id), true);
+  });
+});
+
+test("single generate keeps one theme across all problems", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。",
+        N: 5,
+        difficulty: "same",
+        seed: "apple"
+      })
+    });
+
+    const body = (await res.json()) as {
+      meta: { theme_id: string };
+      problems: Array<{ render_text: string; params: Record<string, unknown> }>;
+    };
+    const subjectASet = new Set(body.problems.map((p) => String(p.params.subject_a ?? "")));
+    const subjectBSet = new Set(body.problems.map((p) => String(p.params.subject_b ?? "")));
+    const unitSet = new Set(body.problems.map((p) => String(p.params.unit ?? "")));
+
+    assert.equal(res.status, 200);
+    assert.equal(typeof body.meta.theme_id, "string");
+    assert.equal(subjectASet.size, 1);
+    assert.equal(subjectBSet.size, 1);
+    assert.equal(unitSet.size, 1);
+    assert.equal(body.problems.every((p) => p.render_text.includes(String([...subjectASet][0]))), true);
+  });
+});
+
+test("compatibility plus items contract remain with theme meta", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。",
+        N: 4,
+        difficulty: "same",
+        seed: "apple"
+      })
+    });
+
+    const body = (await res.json()) as {
+      detected_mode: string;
+      required_items: string[];
+      items: Array<{ type: string }>;
+      meta: { theme_id?: string };
+      problems: Array<{ family: string; params: Record<string, unknown>; render_text: string; answer: number }>;
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "word_problem");
+    assert.equal(body.required_items.includes("prompt"), true);
+    assert.equal(body.items.some((i) => i.type === "choices"), true);
+    assert.equal(typeof body.meta.theme_id, "string");
+    assert.equal(typeof body.problems[0].family, "string");
+    assert.equal(typeof body.problems[0].params, "object");
+    assert.equal(typeof body.problems[0].render_text, "string");
+    assert.equal(typeof body.problems[0].answer, "number");
+  });
+});
+
 test("image fixture is stable across two calls (detector path and mode)", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
