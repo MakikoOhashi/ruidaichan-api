@@ -57,7 +57,7 @@ type FallbackReason =
   | "empty_parse"
   | "decode_text_fallback_failed";
 
-type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "decode_text" | "none";
+type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "none";
 
 type DecodeFallbackDebug = {
   ocr_line_count: number;
@@ -330,11 +330,38 @@ function cleanCandidateText(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]/g, "").trim();
 }
 
+function isLikelyBinaryText(s: string): { binary: boolean; reason: string | null } {
+  if (!s) return { binary: false, reason: null };
+  if (s.includes("PNG") || s.includes("IHDR") || s.includes("iCCP")) {
+    return { binary: true, reason: "png_signature" };
+  }
+
+  const length = Math.max(1, s.length);
+  const replacementCount = [...s].filter((ch) => ch === "\uFFFD").length;
+  if (replacementCount / length > 0.02) {
+    return { binary: true, reason: "replacement_char_ratio_high" };
+  }
+
+  const controlCount = [...s].filter((ch) => {
+    const code = ch.charCodeAt(0);
+    return code < 0x20 && ch !== "\n" && ch !== "\r" && ch !== "\t";
+  }).length;
+  if (controlCount / length > 0.01) {
+    return { binary: true, reason: "control_char_ratio_high" };
+  }
+
+  const abnormalCount = [...s].filter((ch) => !/[0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ\s+\-=□_口ロ\[\]（）()、。・？！]/.test(ch)).length;
+  if (abnormalCount / length > 0.35) {
+    return { binary: true, reason: "abnormal_char_ratio_high" };
+  }
+
+  return { binary: false, reason: null };
+}
+
 function buildEquationCandidateText(input: {
   detector_text?: string;
   ocr_lines?: string[];
   raw_ocr?: string;
-  decode_text?: string;
 }): { text: string; source: EquationCandidateSource; normalize_input_empty: boolean } {
   const detectorText = cleanCandidateText(input.detector_text ?? "");
   if (detectorText) return { text: detectorText, source: "detector_text", normalize_input_empty: false };
@@ -344,9 +371,6 @@ function buildEquationCandidateText(input: {
 
   const rawOcr = cleanCandidateText(input.raw_ocr ?? "");
   if (rawOcr) return { text: rawOcr, source: "raw_ocr", normalize_input_empty: false };
-
-  const decodeText = cleanCandidateText(input.decode_text ?? "");
-  if (decodeText) return { text: decodeText, source: "decode_text", normalize_input_empty: false };
 
   return { text: "", source: "none", normalize_input_empty: true };
 }
@@ -659,7 +683,22 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
       return { ok: false, status: response.status, error_reason: "empty_parse", retriable: true };
     }
 
-    const parsed = JSON.parse(text) as { family?: string; confidence?: number; params?: Record<string, number> };
+    const parsed = JSON.parse(text) as {
+      family?: string;
+      confidence?: number;
+      params?: Record<string, number>;
+      detector_text?: string;
+      expression?: string;
+      text?: string;
+    };
+    const extractedText =
+      typeof parsed.detector_text === "string"
+        ? parsed.detector_text
+        : typeof parsed.expression === "string"
+        ? parsed.expression
+        : typeof parsed.text === "string"
+        ? parsed.text
+        : "";
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence ?? 0)));
 
     if (parsed.family === "times_scale_mc") {
@@ -673,7 +712,7 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
         status: response.status,
         error_reason: null,
         retriable: false,
-        detector_text: text,
+        detector_text: extractedText || text,
         detected: {
           family: "times_scale_mc",
           confidence: Math.max(confidence, 0.8),
@@ -697,7 +736,7 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
         status: response.status,
         error_reason: null,
         retriable: false,
-        detector_text: text,
+        detector_text: extractedText || text,
         detected: {
           family: "compare_totals_diff_mc",
           confidence: Math.max(confidence, 0.8),
@@ -727,7 +766,8 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
       ok: false,
       status: response.status,
       error_reason: "empty_parse",
-      retriable: true
+      retriable: true,
+      detector_text: extractedText || ""
     };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
@@ -1011,12 +1051,14 @@ microGenerateRouter.post("/", async (req, res) => {
   let equationNormalizedText = "";
   let equationCompactText = "";
   let equationCandidateSource: EquationCandidateSource = "none";
+  let equationCandidateLength = 0;
   let normalizeInputEmpty = false;
   let upstreamUnknownReason: string | null = null;
+  let binaryCandidateRejected = false;
+  let binaryRejectReason: string | null = null;
   let detectorParsedText = "";
   let rawOcrText = "";
   let ocrLines: string[] = [];
-  let decodeTextForEquation = "";
   let decodeDebug: DecodeFallbackDebug = {
     ocr_line_count: 0,
     keyword_hits: 0,
@@ -1051,9 +1093,6 @@ microGenerateRouter.post("/", async (req, res) => {
   } else {
     selectedDetectorPath = "image_gemini_detector";
     parseStageSelected = "image";
-    decodeTextForEquation = decodeBase64Text(imageBase64);
-    rawOcrText = decodeTextForEquation;
-    ocrLines = decodeTextForEquation.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
     const started = Date.now();
     const firstAttempt = await detectFamilyFromImage(imageBase64);
     let vision = firstAttempt;
@@ -1066,6 +1105,7 @@ microGenerateRouter.post("/", async (req, res) => {
       vision = secondAttempt;
       modelHttpStatus = secondAttempt.status ?? modelHttpStatus;
     }
+    detectorParsedText = vision.detector_text ?? detectorParsedText;
 
     inferenceLatencyMs = Date.now() - started;
 
@@ -1078,8 +1118,8 @@ microGenerateRouter.post("/", async (req, res) => {
       detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
       selectedDetectorPath = "image_base64_decode_text_detector";
       parseStageSelected = "ocr";
-      decodeDebug = buildDecodeFallbackDebug(decodeTextForEquation);
-      const det = detectFamily(decodeTextForEquation);
+      decodeDebug = buildDecodeFallbackDebug("");
+      const det = detectFamily("");
       compareSignals = det.compare;
       timesSignals = det.times;
 
@@ -1101,19 +1141,28 @@ microGenerateRouter.post("/", async (req, res) => {
   const eqCandidate = buildEquationCandidateText({
     detector_text: detectorParsedText,
     ocr_lines: ocrLines,
-    raw_ocr: rawOcrText,
-    decode_text: decodeTextForEquation
+    raw_ocr: rawOcrText
   });
   equationCandidateSource = eqCandidate.source;
+  equationCandidateLength = eqCandidate.text.length;
   normalizeInputEmpty = eqCandidate.normalize_input_empty;
   if (eqCandidate.text) {
+    const binaryCheck = isLikelyBinaryText(eqCandidate.text);
+    if (binaryCheck.binary) {
+      binaryCandidateRejected = true;
+      binaryRejectReason = binaryCheck.reason;
+      upstreamUnknownReason = "binary_candidate_rejected";
+    }
+  }
+
+  if (eqCandidate.text && !binaryCandidateRejected) {
     const preview = normalizeEquationText(eqCandidate.text);
     equationNormalizedText = preview.normalized.slice(0, 100);
     equationCompactText = preview.compact.slice(0, 100);
   }
 
   // Required pass before unknown: equation regex fallback over OCR-like candidates.
-  const fallback = equationFallbackParser(eqCandidate.text);
+  const fallback = eqCandidate.text && !binaryCandidateRejected ? equationFallbackParser(eqCandidate.text) : null;
   if (fallback) {
     equationRegexHit = true;
     equationNormalizedText = fallback.normalized_text;
@@ -1130,9 +1179,14 @@ microGenerateRouter.post("/", async (req, res) => {
     compareSignals = det.compare;
     timesSignals = det.times;
   } else if (detected.family === "unknown") {
-    if (normalizeInputEmpty) upstreamUnknownReason = "normalize_input_empty";
+    if (binaryCandidateRejected) upstreamUnknownReason = "binary_candidate_rejected";
+    else if (detectorFallbackReason === "model_429" || detectorFallbackReason === "model_timeout" || detectorFallbackReason === "model_5xx" || detectorFallbackReason === "model_http_error") {
+      upstreamUnknownReason = detectorFallbackReason;
+    }
+    else if (normalizeInputEmpty) upstreamUnknownReason = "ocr_empty";
     else if (detectorFallbackReason === "empty_parse") upstreamUnknownReason = "empty_parse_upstream";
-    else upstreamUnknownReason = detectorFallbackReason ?? "equation_regex_miss";
+    else if (detectorFallbackReason) upstreamUnknownReason = detectorFallbackReason;
+    else upstreamUnknownReason = "equation_regex_miss";
   }
 
   const detectedFamilyBeforeFallback = detected.family;
@@ -1260,6 +1314,9 @@ microGenerateRouter.post("/", async (req, res) => {
       equation_normalized_text: equationNormalizedText,
       equation_compact_text: equationCompactText,
       equation_candidate_source: equationCandidateSource,
+      equation_candidate_length: equationCandidateLength,
+      binary_candidate_rejected: binaryCandidateRejected,
+      binary_reject_reason: binaryRejectReason,
       normalize_input_empty: normalizeInputEmpty,
       unknown_reason: detected.family === "unknown" ? unknownNote : null
     },

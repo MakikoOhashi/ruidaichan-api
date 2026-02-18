@@ -65,31 +65,54 @@ test("equation mode returns expression items", async () => {
 });
 
 test("image/ocr equation fallback detects 7 + 9 - 6 = □ as equation", async () => {
-  delete process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = "test-gemini-key";
 
-  await withServer(async (baseUrl) => {
-    const expr = Buffer.from("7 + 9 - 6 = □", "utf8").toString("base64");
-    const res = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({ image_base64: `data:text/plain;base64,${expr}`, N: 4, difficulty: "same", seed: "eq-img" })
-    });
-
-    const body = (await res.json()) as {
-      detected_mode: string;
-      intent: string;
-      required_items: string[];
-      items: Array<{ type: string; text?: string }>;
-      debug: { parse_stage_selected: string; equation_regex_hit: boolean };
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const payload = {
+      candidates: [
+        {
+          content: {
+            parts: [
+              {
+                text: JSON.stringify({
+                  family: "unknown",
+                  confidence: 0.2,
+                  detector_text: "7 + 9 - 6 = □"
+                })
+              }
+            ]
+          }
+        }
+      ]
     };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({ image_base64: "data:image/png;base64,ZmFrZQ==", N: 4, difficulty: "same", seed: "eq-img" })
+      });
 
-    assert.equal(res.status, 200);
-    assert.equal(body.detected_mode, "equation");
-    assert.equal(body.intent, "equation_add_sub_blank");
-    assert.deepEqual(body.required_items, ["expression"]);
-    assert.equal(body.items[0]?.type, "expression");
-    assert.equal(body.debug.parse_stage_selected, "equation_regex_fallback");
-    assert.equal(body.debug.equation_regex_hit, true);
+      const body = (await res.json()) as {
+        detected_mode: string;
+        intent: string;
+        required_items: string[];
+        items: Array<{ type: string; text?: string }>;
+        debug: { parse_stage_selected: string; equation_regex_hit: boolean; equation_candidate_source: string };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.intent, "equation_add_sub_blank");
+      assert.deepEqual(body.required_items, ["expression"]);
+      assert.equal(body.items[0]?.type, "expression");
+      assert.equal(body.debug.parse_stage_selected, "equation_regex_fallback");
+      assert.equal(body.debug.equation_regex_hit, true);
+      assert.equal(body.debug.equation_candidate_source, "detector_text");
+    });
   });
 });
 
@@ -218,7 +241,7 @@ test("fail-closed: mode/items mismatch returns unknown with empty problems", asy
   });
 });
 
-test("empty normalized equation input returns unknown with normalize_input_empty", async () => {
+test("empty normalized equation input returns unknown with ocr_empty", async () => {
   delete process.env.GEMINI_API_KEY;
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/micro/generate`, {
@@ -234,9 +257,42 @@ test("empty normalized equation input returns unknown with normalize_input_empty
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "normalize_input_empty");
+    assert.equal(body.meta.note, "ocr_empty");
     assert.equal(body.debug.equation_candidate_source, "none");
     assert.equal(body.debug.normalize_input_empty, true);
+    assert.equal(body.debug.equation_normalized_text, "");
+  });
+});
+
+test("binary-like candidate is rejected and regex is skipped", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "�PNG IHDR iCCP \u0000\u0001\u0002",
+        N: 4,
+        difficulty: "same",
+        seed: "bin-reject"
+      })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      meta: { note: string };
+      debug: {
+        binary_candidate_rejected: boolean;
+        binary_reject_reason: string | null;
+        equation_regex_hit: boolean;
+        equation_normalized_text: string;
+      };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.meta.note, "binary_candidate_rejected");
+    assert.equal(body.debug.binary_candidate_rejected, true);
+    assert.equal(typeof body.debug.binary_reject_reason, "string");
+    assert.equal(body.debug.equation_regex_hit, false);
     assert.equal(body.debug.equation_normalized_text, "");
   });
 });

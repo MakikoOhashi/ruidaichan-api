@@ -122,7 +122,10 @@ export const microGenerateResponseSchema = z
         equation_regex_hit: z.boolean(),
         equation_normalized_text: z.string(),
         equation_compact_text: z.string(),
-        equation_candidate_source: z.enum(["detector_text", "ocr_lines", "raw_ocr", "decode_text", "none"]),
+        equation_candidate_source: z.enum(["detector_text", "ocr_lines", "raw_ocr", "none"]),
+        equation_candidate_length: z.number().int().nonnegative(),
+        binary_candidate_rejected: z.boolean(),
+        binary_reject_reason: z.string().nullable(),
         normalize_input_empty: z.boolean(),
         unknown_reason: z.string().nullable()
       })
