@@ -113,7 +113,10 @@ export const microGenerateResponseSchema = z
         model_http_status: z.number().int().nullable(),
         ocr_line_count: z.number().int().nonnegative(),
         keyword_hits: z.number().int().nonnegative(),
-        parse_candidates_count: z.number().int().nonnegative()
+        parse_candidates_count: z.number().int().nonnegative(),
+        prompt_verb: z.string().nullable(),
+        prompt_unit: z.string().nullable(),
+        lexicon_version: z.string()
       })
       .strict()
       .optional(),

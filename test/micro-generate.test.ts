@@ -281,6 +281,120 @@ test("compatibility plus items contract remain with theme meta", async () => {
   });
 });
 
+test("candy theme uses あります and never さいています", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あかいあめは きいろいあめの2ばいです。きいろいあめが15このとき、あかいあめは何こですか。",
+        N: 4,
+        difficulty: "same",
+        seed: "b"
+      })
+    });
+
+    const body = (await res.json()) as {
+      meta: { theme_id: string };
+      problems: Array<{ render_text: string }>;
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.meta.theme_id, "candy");
+    assert.equal(body.problems.every((p) => p.render_text.includes("あります")), true);
+    assert.equal(body.problems.some((p) => p.render_text.includes("さいています")), false);
+  });
+});
+
+test("tulip theme uses さいています", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "黄色のチューリップが赤いチューリップの2ばいです。赤いチューリップが15本のとき、黄色のチューリップは何本ですか。",
+        N: 4,
+        difficulty: "same",
+        seed: "a"
+      })
+    });
+
+    const body = (await res.json()) as {
+      meta: { theme_id: string };
+      problems: Array<{ render_text: string }>;
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.meta.theme_id, "tulip");
+    assert.equal(body.problems.every((p) => p.render_text.includes("さいています")), true);
+  });
+});
+
+test("unit consistency: prompt unit and choices unit must match", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あかいあめは きいろいあめの2ばいです。きいろいあめが15このとき、あかいあめは何こですか。",
+        N: 4,
+        difficulty: "same",
+        seed: "b"
+      })
+    });
+
+    const body = (await res.json()) as {
+      meta: { theme_id: string };
+      problems: Array<{ render_text: string; items: Array<{ type: string; choices?: string[] }> }>;
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.meta.theme_id, "candy");
+    for (const p of body.problems) {
+      assert.equal(p.render_text.includes("こ"), true);
+      const choices = p.items.find((i) => i.type === "choices")?.choices ?? [];
+      assert.equal(choices.every((c) => c.includes("こ")), true);
+    }
+  });
+});
+
+test("fail-closed: lexicon mismatch returns unknown with theme_lexicon_mismatch", async () => {
+  const prev = process.env.FORCE_THEME_LEXICON_MISMATCH;
+  process.env.FORCE_THEME_LEXICON_MISMATCH = "1";
+
+  try {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          text: "あかいあめは きいろいあめの2ばいです。きいろいあめが15このとき、あかいあめは何こですか。",
+          N: 4,
+          difficulty: "same",
+          seed: "b"
+        })
+      });
+
+      const body = (await res.json()) as {
+        detected_mode: string;
+        problems: unknown[];
+        meta: { note: string };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "unknown");
+      assert.equal(body.problems.length, 0);
+      assert.equal(body.meta.note, "theme_lexicon_mismatch");
+    });
+  } finally {
+    if (prev === undefined) {
+      delete process.env.FORCE_THEME_LEXICON_MISMATCH;
+    } else {
+      process.env.FORCE_THEME_LEXICON_MISMATCH = prev;
+    }
+  }
+});
+
 test("image fixture is stable across two calls (detector path and mode)", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

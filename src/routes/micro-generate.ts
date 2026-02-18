@@ -77,13 +77,15 @@ type Theme = {
   subject_a: string;
   subject_b: string;
   unit: string;
+  verb_exist: string;
 };
 
+const LEXICON_VERSION = "theme_lexicon_v1";
 const THEME_BANK: Theme[] = [
-  { id: "tulip", subject_a: "黄色のチューリップ", subject_b: "赤いチューリップ", unit: "本" },
-  { id: "candy", subject_a: "あかいあめ", subject_b: "きいろいあめ", unit: "こ" },
-  { id: "pencil", subject_a: "みどりのえんぴつ", subject_b: "あおいえんぴつ", unit: "本" },
-  { id: "plate", subject_a: "しろいおさら", subject_b: "あかいおさら", unit: "まい" }
+  { id: "tulip", subject_a: "黄色のチューリップ", subject_b: "赤いチューリップ", unit: "本", verb_exist: "さいています" },
+  { id: "candy", subject_a: "あかいあめ", subject_b: "きいろいあめ", unit: "こ", verb_exist: "あります" },
+  { id: "pencil", subject_a: "みどりのえんぴつ", subject_b: "あおいえんぴつ", unit: "本", verb_exist: "あります" },
+  { id: "plate", subject_a: "しろいおさら", subject_b: "あかいおさら", unit: "まい", verb_exist: "あります" }
 ];
 
 function normalizeText(text: string): string {
@@ -245,6 +247,18 @@ function pickTheme(seed: string, family: ProblemFamily): Theme | null {
   if (!isWordProblemFamily(family)) return null;
   const idx = hashToSeed(`${seed}:${family}`) % THEME_BANK.length;
   return THEME_BANK[idx] ?? THEME_BANK[0];
+}
+
+function buildTimesScalePrompt(theme: Theme, base: number, multiplier: number): string {
+  const forceMismatch = process.env.FORCE_THEME_LEXICON_MISMATCH === "1";
+  const verb = forceMismatch ? "さいています" : theme.verb_exist;
+  return `${theme.subject_a}が、${theme.subject_b}の${multiplier}ばい${verb}。${theme.subject_b}が${base}${theme.unit}のとき、${theme.subject_a}は何${theme.unit}ですか。つぎから1つえらびなさい。`;
+}
+
+function buildComparePrompt(theme: Theme, a: number, b: number, c: number, d: number): string {
+  const forceMismatch = process.env.FORCE_THEME_LEXICON_MISMATCH === "1";
+  const unit = forceMismatch ? "こ" : theme.unit;
+  return `${theme.subject_a}は${a}${unit}、${theme.subject_b}は${b}${unit}${theme.verb_exist}。つぎに ${theme.subject_a}が${c}${unit}、${theme.subject_b}が${d}${unit}ふえました。どちらが なん${unit} おおいですか。つぎから1つえらびなさい。`;
 }
 
 function parseByFamily(text: string): MicroProblemDsl | null {
@@ -664,7 +678,7 @@ function buildProblem(
         choices,
         correct_index: correctIndex
       },
-      `${subjectA}が、${subjectB}の${multiplier}ばいさいています。${subjectB}が${base}${unit}のとき、${subjectA}は何${unit}ですか。つぎから1つえらびなさい。`,
+      buildTimesScalePrompt(theme ?? THEME_BANK[0], base, multiplier),
       answer
     );
   }
@@ -688,7 +702,7 @@ function buildProblem(
     return buildProblemBase(
       family,
       { a, b, c, d, blank, winner, unit, subject_a: subjectA, subject_b: subjectB, choices, correct_index: correctIndex },
-      `${subjectA}は${a}${unit}、${subjectB}は${b}${unit}あります。つぎに ${subjectA}が${c}${unit}、${subjectB}が${d}${unit}ふえました。どちらが なん${unit} おおいですか。つぎから1つえらびなさい。`,
+      buildComparePrompt(theme ?? THEME_BANK[0], a, b, c, d),
       blank
     );
   }
@@ -770,6 +784,34 @@ function validateModeItems(problem: MicroProblemDsl): string | null {
       return "choices_index_invalid";
     }
   }
+
+  return null;
+}
+
+function validateThemeLexicon(problem: MicroProblemDsl, theme: Theme | null): string | null {
+  if (!theme) return null;
+  if (problem.detected_mode !== "word_problem") return null;
+
+  const promptItem = problem.items.find((i) => i.type === "prompt");
+  if (!promptItem || promptItem.type !== "prompt") return "theme_lexicon_mismatch";
+  const promptText = promptItem.text;
+
+  if (theme.id !== "tulip" && promptText.includes("さいています")) {
+    return "theme_lexicon_mismatch";
+  }
+
+  if (!promptText.includes(theme.verb_exist)) {
+    return "theme_lexicon_mismatch";
+  }
+
+  if (!promptText.includes(theme.unit)) {
+    return "theme_lexicon_mismatch";
+  }
+
+  const choicesItem = problem.items.find((i) => i.type === "choices");
+  if (!choicesItem || choicesItem.type !== "choices") return "theme_lexicon_mismatch";
+  const unitMismatch = choicesItem.choices.some((c) => !c.includes(theme.unit));
+  if (unitMismatch) return "theme_lexicon_mismatch";
 
   return null;
 }
@@ -916,7 +958,7 @@ microGenerateRouter.post("/", async (req, res) => {
   }
 
   const detectedFamilyBeforeFallback = detected.family;
-  const needConfirm = detected.confidence < DETECT_CONFIDENCE_THRESHOLD || detected.family === "unknown";
+  const needConfirmBase = detected.confidence < DETECT_CONFIDENCE_THRESHOLD || detected.family === "unknown";
   const generationFamily: ProblemFamily | null =
     detected.family === "unknown" ? (detected.block_fallback ? null : null) : detected.family;
   const detectedFamilyAfterFallback = generationFamily;
@@ -974,6 +1016,13 @@ microGenerateRouter.post("/", async (req, res) => {
         continue;
       }
 
+      const lexiconReason = validateThemeLexicon(problem, selectedTheme);
+      if (lexiconReason) {
+        rejectedCount += 1;
+        bumpReason(reasons, lexiconReason);
+        continue;
+      }
+
       seen.add(duplicateKey);
       problems.push(problem);
     }
@@ -981,7 +1030,10 @@ microGenerateRouter.post("/", async (req, res) => {
     bumpReason(reasons, "unknown_no_generation");
   }
 
-  const mode = modeFromFamily(detected.family);
+  const forceUnknownByLexicon = problems.length === 0 && (reasons.theme_lexicon_mismatch ?? 0) > 0;
+  const needConfirm = needConfirmBase || forceUnknownByLexicon;
+
+  const mode = forceUnknownByLexicon ? "unknown" : modeFromFamily(detected.family);
   const requiredItems = requiredItemsFromMode(mode);
   const topItems = problems.length > 0 ? problems[0].items : [];
 
@@ -994,11 +1046,17 @@ microGenerateRouter.post("/", async (req, res) => {
     confidence: detected.confidence,
     required_items: requiredItems,
     items: topItems,
-    detected: {
-      family: detected.family,
-      confidence: detected.confidence,
-      parsed_example: detected.parsed_example
-    },
+    detected: forceUnknownByLexicon
+      ? {
+          family: "unknown" as const,
+          confidence: Math.min(detected.confidence, 0.6),
+          parsed_example: null
+        }
+      : {
+          family: detected.family,
+          confidence: detected.confidence,
+          parsed_example: detected.parsed_example
+        },
     problems,
     rejected_count: rejectedCount,
     reasons,
@@ -1015,14 +1073,17 @@ microGenerateRouter.post("/", async (req, res) => {
       model_http_status: modelHttpStatus,
       ocr_line_count: decodeDebug.ocr_line_count,
       keyword_hits: decodeDebug.keyword_hits,
-      parse_candidates_count: decodeDebug.parse_candidates_count
+      parse_candidates_count: decodeDebug.parse_candidates_count,
+      prompt_verb: selectedTheme?.verb_exist ?? null,
+      prompt_unit: selectedTheme?.unit ?? null,
+      lexicon_version: LEXICON_VERSION
     },
     meta: {
       family: String(detected.family),
       count_policy: "server_enforced",
       max_count: policy.maxCount,
       applied_count: policy.appliedCount,
-      note: generationFamily ? policy.note : unknownNote,
+      note: forceUnknownByLexicon ? "theme_lexicon_mismatch" : generationFamily ? policy.note : unknownNote,
       seed: seedAsString,
       sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text })))),
       request_hash: sha(parsedReq.data.text ? normalizeText(parsedReq.data.text) : imageBase64),
