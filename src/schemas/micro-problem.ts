@@ -12,6 +12,8 @@ export const problemFamilySchema = z.enum([
 
 export const difficultySchema = z.enum(["easy", "same", "hard"]);
 export const detectedModeSchema = z.enum(["equation", "word_problem", "unknown"]);
+const inferenceLevelSchema = z.enum(["strict", "soft", "unknown"]);
+const candidateSourceSchema = z.enum(["deterministic", "heuristic", "ai_assist"]);
 
 export const renderItemSchema = z.union([
   z
@@ -91,6 +93,9 @@ export const microGenerateResponseSchema = z
     spec_version: z.literal("micro_problem_render_v1"),
     request_id: z.string().min(1),
     schema_version: z.literal("micro_generate_response_v1"),
+    inference_level: inferenceLevelSchema,
+    candidate_count: z.number().int().nonnegative(),
+    selected_candidate_source: candidateSourceSchema,
     detected_mode: detectedModeSchema,
     intent: z.string().min(1),
     confidence: z.number().min(0).max(1),
@@ -140,7 +145,10 @@ export const microGenerateResponseSchema = z
         binary_candidate_rejected: z.boolean(),
         binary_reject_reason: z.string().nullable(),
         normalize_input_empty: z.boolean(),
-        unknown_reason: z.string().nullable()
+        unknown_reason: z.string().nullable(),
+        candidate_count: z.number().int().nonnegative(),
+        fail_reasons_by_stage: z.record(z.array(z.string())),
+        normalized_text: z.string()
       })
       .strict()
       .optional(),

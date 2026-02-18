@@ -49,6 +49,9 @@ test("equation mode returns expression items", async () => {
 
     const body = (await res.json()) as {
       spec_version: string;
+      inference_level: string;
+      candidate_count: number;
+      selected_candidate_source: string;
       detected_mode: string;
       required_items: string[];
       items: Array<{ type: string }>;
@@ -58,12 +61,71 @@ test("equation mode returns expression items", async () => {
 
     assert.equal(res.status, 200);
     assert.equal(body.spec_version, "micro_problem_render_v1");
+    assert.equal(body.inference_level, "strict");
+    assert.equal(body.candidate_count > 0, true);
+    assert.equal(body.selected_candidate_source, "deterministic");
     assert.equal(body.detected_mode, "equation");
     assert.deepEqual(body.required_items, ["expression"]);
     assert.equal(body.items.some((i) => i.type === "expression"), true);
     assert.equal(body.debug.input_mode, "text");
     assert.equal(body.debug.selected_detector_path, "text_detector");
     assert.equal(body.problems.every((p) => p.items.some((i) => i.type === "expression")), true);
+  });
+});
+
+test("soft inference succeeds for missing-blank equation with noise", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "(1) 4 + 9 =。① 3 ② 12 ③ 13 ④ 14 ⑤ 36",
+        N: 4,
+        difficulty: "same",
+        seed: "soft-eq-v1"
+      })
+    });
+    const body = (await res.json()) as {
+      inference_level: string;
+      selected_candidate_source: string;
+      detected_mode: string;
+      meta: { note: string };
+      items: Array<{ type: string }>;
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.inference_level, "soft");
+    assert.equal(body.selected_candidate_source, "deterministic");
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.meta.note, "equation_corrected_missing_blank");
+    assert.equal(body.items.some((i) => i.type === "expression"), true);
+  });
+});
+
+test("soft word_problem inference succeeds with lexical variation", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "あか18こ きいろ23こ あか27こ きいろ12こ どちらが何こ多いですか",
+        N: 4,
+        difficulty: "same",
+        seed: "soft-word-v1"
+      })
+    });
+    const body = (await res.json()) as {
+      inference_level: string;
+      detected_mode: string;
+      meta: { note: string };
+      required_items: string[];
+      items: Array<{ type: string }>;
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.inference_level, "soft");
+    assert.equal(body.detected_mode, "word_problem");
+    assert.equal(body.meta.note, "inferred_soft_word_problem");
+    assert.equal(body.required_items.includes("prompt"), true);
+    assert.equal(body.items.some((i) => i.type === "choices"), true);
   });
 });
 
@@ -538,10 +600,21 @@ test("true unknown remains unknown for plain narrative without equation", async 
       body: JSON.stringify({ text: "きょうは いいてんきです。", N: 4, difficulty: "same", seed: "unknown-text" })
     });
 
-    const body = (await res.json()) as { detected_mode: string; need_confirm: boolean };
+    const body = (await res.json()) as {
+      inference_level: string;
+      candidate_count: number;
+      detected_mode: string;
+      need_confirm: boolean;
+      meta: { note: string };
+      debug: { fail_reasons_by_stage: Record<string, string[]> };
+    };
     assert.equal(res.status, 200);
+    assert.equal(body.inference_level, "unknown");
     assert.equal(body.detected_mode, "unknown");
     assert.equal(body.need_confirm, true);
+    assert.equal(["unknown_no_viable_candidate", "equation_regex_miss"].includes(body.meta.note), true);
+    assert.equal(typeof body.debug.fail_reasons_by_stage, "object");
+    assert.equal(body.candidate_count >= 0, true);
   });
 });
 

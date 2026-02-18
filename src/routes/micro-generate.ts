@@ -64,6 +64,15 @@ type FallbackReason =
 
 type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "none";
 type CorrectionStage = "deterministic" | "ai_assist" | "none";
+type InferenceLevel = "strict" | "soft" | "unknown";
+type CandidateSourceStage = "deterministic" | "heuristic" | "ai_assist";
+
+type Candidate = {
+  detected: DetectResult;
+  source_stage: CandidateSourceStage;
+  inference_level: Exclude<InferenceLevel, "unknown">;
+  score: number;
+};
 
 type DecodeFallbackDebug = {
   ocr_line_count: number;
@@ -959,6 +968,83 @@ function detectFamily(text: string): { detected: DetectResult; compare: CompareS
   };
 }
 
+function pushCandidate(pool: Candidate[], candidate: Candidate): void {
+  const family = candidate.detected.family;
+  if (family === "unknown") return;
+  const key = `${family}:${candidate.source_stage}:${candidate.detected.parsed_example?.render_text ?? "no_example"}`;
+  const exists = pool.find((c) => `${c.detected.family}:${c.source_stage}:${c.detected.parsed_example?.render_text ?? "no_example"}` === key);
+  if (!exists) {
+    pool.push(candidate);
+  }
+}
+
+function buildHeuristicSalvageCandidates(inputText: string): Candidate[] {
+  const out: Candidate[] = [];
+  const normalized = normalizeText(inputText);
+  if (!normalized) return out;
+
+  const eqCandidates = extractEquationCandidates(normalized);
+  if (eqCandidates.length === 1) {
+    const corrected = deterministicBlankCorrection(normalized);
+    const eqText = corrected.after || eqCandidates[0];
+    const parsed = equationFallbackParser(eqText);
+    if (parsed) {
+      pushCandidate(out, {
+        detected: {
+          family: parsed.parsed.family,
+          confidence: corrected.reason ? 0.65 : 0.58,
+          parsed_example: parsed.parsed,
+          block_fallback: false,
+          intent: intentFromFamily(parsed.parsed.family)
+        },
+        source_stage: "heuristic",
+        inference_level: "soft",
+        score: corrected.reason ? 0.65 : 0.58
+      });
+    }
+  }
+
+  const compare = detectCompareTotalsSignals(normalized);
+  if (compare.compare_score >= 3) {
+    const parsed = parseCompareTotals(normalized);
+    if (parsed) {
+      pushCandidate(out, {
+        detected: {
+          family: "compare_totals_diff_mc",
+          confidence: 0.6,
+          parsed_example: parsed,
+          block_fallback: false,
+          intent: intentFromFamily("compare_totals_diff_mc")
+        },
+        source_stage: "heuristic",
+        inference_level: "soft",
+        score: 0.6
+      });
+    }
+  }
+
+  const times = detectTimesSignals(normalized);
+  if (times.times_word_hits > 0 && times.number_count >= 2) {
+    const parsed = parseTimesScale(normalized);
+    if (parsed) {
+      pushCandidate(out, {
+        detected: {
+          family: "times_scale_mc",
+          confidence: 0.58,
+          parsed_example: parsed,
+          block_fallback: false,
+          intent: intentFromFamily("times_scale_mc")
+        },
+        source_stage: "heuristic",
+        inference_level: "soft",
+        score: 0.58
+      });
+    }
+  }
+
+  return out;
+}
+
 async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -1414,6 +1500,7 @@ microGenerateRouter.post("/", async (req, res) => {
   let blankConfusionRewritten: string | null = null;
   let normalizeInputEmpty = false;
   let upstreamUnknownReason: string | null = null;
+  let normalizedInputPreview = "";
   let binaryCandidateRejected = false;
   let binaryRejectReason: string | null = null;
   let detectorParsedText = "";
@@ -1425,6 +1512,11 @@ microGenerateRouter.post("/", async (req, res) => {
     ocr_line_count: 0,
     keyword_hits: 0,
     parse_candidates_count: 0
+  };
+  const failReasonsByStage: Record<CandidateSourceStage, string[]> = {
+    deterministic: [],
+    heuristic: [],
+    ai_assist: []
   };
 
   const imageBase64 = parsedReq.data.image_base64 ?? "";
@@ -1575,6 +1667,7 @@ microGenerateRouter.post("/", async (req, res) => {
     ocr_lines: ocrLines,
     raw_ocr: rawOcrText
   });
+  normalizedInputPreview = normalizeText(eqCandidate.text || parsedReq.data.text || rawOcrText).slice(0, 120);
   equationCandidateSource = eqCandidate.source;
   equationCandidateLength = eqCandidate.text.length;
   normalizeInputEmpty = eqCandidate.normalize_input_empty;
@@ -1661,11 +1754,44 @@ microGenerateRouter.post("/", async (req, res) => {
   }
 
   const detectedFamilyBeforeFallback = detected.family;
-  const needConfirmBase = detected.confidence < DETECT_CONFIDENCE_THRESHOLD || detected.family === "unknown";
-  const generationFamily: ProblemFamily | null =
-    detected.family === "unknown" ? (detected.block_fallback ? null : null) : detected.family;
-  const detectedFamilyAfterFallback = generationFamily;
-  const unknownNote = upstreamUnknownReason ?? "insufficient_signals";
+  const unknownNote = upstreamUnknownReason ?? "unknown_no_viable_candidate";
+
+  const candidatePool: Candidate[] = [];
+  const detectedSourceStage: CandidateSourceStage =
+    parseStageSelected === "ai_refine" || correctionStageSelected === "ai_assist" ? "ai_assist" : "deterministic";
+  const detectedInferenceLevel: Exclude<InferenceLevel, "unknown"> =
+    detectedSourceStage === "deterministic" &&
+    !blankMissingRewritten &&
+    !blankConfusionDetected &&
+    detected.confidence >= DETECT_CONFIDENCE_THRESHOLD
+      ? "strict"
+      : "soft";
+
+  if (detected.family !== "unknown") {
+    if (detected.confidence >= 0.45) {
+      pushCandidate(candidatePool, {
+        detected,
+        source_stage: detectedSourceStage,
+        inference_level: detectedInferenceLevel,
+        score: detected.confidence
+      });
+    } else {
+      failReasonsByStage[detectedSourceStage].push("confidence_below_min");
+    }
+  } else {
+    failReasonsByStage.deterministic.push(unknownNote);
+  }
+
+  const heuristicInput = parsedReq.data.text ?? rawOcrText ?? eqCandidate.text;
+  const heuristicCandidates = buildHeuristicSalvageCandidates(heuristicInput);
+  if (heuristicCandidates.length === 0) {
+    failReasonsByStage.heuristic.push("no_salvage_candidate");
+  } else {
+    for (const c of heuristicCandidates) pushCandidate(candidatePool, c);
+  }
+
+  candidatePool.sort((a, b) => b.score - a.score);
+  const detectedFamilyAfterFallback = candidatePool[0]?.detected.family ?? null;
 
   console.log(
     JSON.stringify({
@@ -1680,63 +1806,87 @@ microGenerateRouter.post("/", async (req, res) => {
     })
   );
 
-  const policy = countPolicy(detected.family, parsedReq.data.N);
-
-  const rngSeed = hashToSeed(
-    JSON.stringify({
-      input: parsedReq.data.text ? normalizeText(parsedReq.data.text) : parsedReq.data.image_base64 ?? "",
-      N: policy.appliedCount,
-      difficulty: parsedReq.data.difficulty,
-      seed: String(parsedReq.data.seed),
-      family: generationFamily ?? "unknown"
-    })
-  );
-  const rng = mulberry32(rngSeed);
   const seedAsString = String(parsedReq.data.seed);
-  const selectedTheme =
-    generationFamily && isWordProblemFamily(generationFamily) ? pickTheme(seedAsString, generationFamily) : null;
-
+  let selectedCandidate: Candidate | null = null;
+  let selectedTheme: Theme | null = null;
+  let selectedPolicy = countPolicy("unknown", parsedReq.data.N);
   const problems: MicroProblemDsl[] = [];
-  const seen = new Set<string>();
   const reasons: Record<string, number> = {};
   let rejectedCount = 0;
+  for (const candidate of candidatePool) {
+    const generationFamily = candidate.detected.family === "unknown" ? null : candidate.detected.family;
+    if (!generationFamily) continue;
 
-  if (generationFamily) {
-    for (let i = 0; i < MAX_REGEN_TRIES && problems.length < policy.appliedCount; i += 1) {
-      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, detected.parsed_example, selectedTheme);
+    const policy = countPolicy(generationFamily, parsedReq.data.N);
+    const rngSeed = hashToSeed(
+      JSON.stringify({
+        input: parsedReq.data.text ? normalizeText(parsedReq.data.text) : parsedReq.data.image_base64 ?? "",
+        N: policy.appliedCount,
+        difficulty: parsedReq.data.difficulty,
+        seed: seedAsString,
+        family: generationFamily
+      })
+    );
+    const rng = mulberry32(rngSeed);
+    const theme = isWordProblemFamily(generationFamily) ? pickTheme(seedAsString, generationFamily) : null;
+    const candidateProblems: MicroProblemDsl[] = [];
+    const candidateSeen = new Set<string>();
+    const candidateReasons: Record<string, number> = {};
+    let candidateRejected = 0;
+
+    for (let i = 0; i < MAX_REGEN_TRIES && candidateProblems.length < policy.appliedCount; i += 1) {
+      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, candidate.detected.parsed_example, theme);
       const duplicateKey = JSON.stringify({ render_text: problem.render_text, params: problem.params });
 
-      if (seen.has(duplicateKey)) {
-        rejectedCount += 1;
-        bumpReason(reasons, "duplicate");
+      if (candidateSeen.has(duplicateKey)) {
+        candidateRejected += 1;
+        bumpReason(candidateReasons, "duplicate");
         continue;
       }
 
       const reason = validateProblem(problem, parsedReq.data.difficulty);
       if (reason) {
-        rejectedCount += 1;
-        bumpReason(reasons, reason);
+        candidateRejected += 1;
+        bumpReason(candidateReasons, reason);
         continue;
       }
 
-      const lexiconReason = validateThemeLexicon(problem, selectedTheme);
+      const lexiconReason = validateThemeLexicon(problem, theme);
       if (lexiconReason) {
-        rejectedCount += 1;
-        bumpReason(reasons, lexiconReason);
+        candidateRejected += 1;
+        bumpReason(candidateReasons, lexiconReason);
         continue;
       }
 
-      seen.add(duplicateKey);
-      problems.push(problem);
+      candidateSeen.add(duplicateKey);
+      candidateProblems.push(problem);
     }
-  } else {
-    bumpReason(reasons, "unknown_no_generation");
+
+    if (candidateProblems.length > 0) {
+      selectedCandidate = candidate;
+      selectedTheme = theme;
+      selectedPolicy = policy;
+      problems.push(...candidateProblems);
+      rejectedCount = candidateRejected;
+      Object.assign(reasons, candidateReasons);
+      break;
+    }
+
+    rejectedCount += candidateRejected;
+    for (const [k, v] of Object.entries(candidateReasons)) {
+      reasons[k] = (reasons[k] ?? 0) + v;
+    }
+    failReasonsByStage[candidate.source_stage].push("all_candidates_rejected");
   }
 
-  const forceUnknownByLexicon = problems.length === 0 && (reasons.theme_lexicon_mismatch ?? 0) > 0;
-  const needConfirm = needConfirmBase || forceUnknownByLexicon;
+  if (!selectedCandidate) {
+    bumpReason(reasons, "unknown_no_viable_candidate");
+  }
 
-  const mode = forceUnknownByLexicon ? "unknown" : modeFromFamily(detected.family);
+  const inferenceLevel: InferenceLevel = selectedCandidate ? selectedCandidate.inference_level : "unknown";
+  const needConfirm = !selectedCandidate || selectedCandidate.detected.confidence < DETECT_CONFIDENCE_THRESHOLD;
+
+  const mode = selectedCandidate ? modeFromFamily(selectedCandidate.detected.family) : "unknown";
   const requiredItems = requiredItemsFromMode(mode);
   const topItems = problems.length > 0 ? problems[0].items : [];
 
@@ -1744,21 +1894,24 @@ microGenerateRouter.post("/", async (req, res) => {
     spec_version: "micro_problem_render_v1" as const,
     request_id: requestId,
     schema_version: "micro_generate_response_v1" as const,
+    inference_level: inferenceLevel,
+    candidate_count: candidatePool.length,
+    selected_candidate_source: (selectedCandidate?.source_stage ?? "heuristic") as CandidateSourceStage,
     detected_mode: mode,
-    intent: detected.intent,
-    confidence: detected.confidence,
+    intent: selectedCandidate?.detected.intent ?? "unknown_intent",
+    confidence: selectedCandidate?.detected.confidence ?? 0.35,
     required_items: requiredItems,
     items: topItems,
-    detected: forceUnknownByLexicon
+    detected: selectedCandidate
       ? {
-          family: "unknown" as const,
-          confidence: Math.min(detected.confidence, 0.6),
-          parsed_example: null
+          family: selectedCandidate.detected.family,
+          confidence: selectedCandidate.detected.confidence,
+          parsed_example: selectedCandidate.detected.parsed_example
         }
       : {
-          family: detected.family,
-          confidence: detected.confidence,
-          parsed_example: detected.parsed_example
+          family: "unknown" as const,
+          confidence: 0.35,
+          parsed_example: null
         },
     problems,
     rejected_count: rejectedCount,
@@ -1802,29 +1955,36 @@ microGenerateRouter.post("/", async (req, res) => {
       binary_candidate_rejected: binaryCandidateRejected,
       binary_reject_reason: binaryRejectReason,
       normalize_input_empty: normalizeInputEmpty,
-      unknown_reason: detected.family === "unknown" ? unknownNote : null
+      unknown_reason: selectedCandidate ? null : unknownNote,
+      candidate_count: candidatePool.length,
+      fail_reasons_by_stage: failReasonsByStage,
+      normalized_text: normalizedInputPreview
     },
     meta: {
-      family: String(detected.family),
+      family: String(selectedCandidate?.detected.family ?? "unknown"),
       count_policy: "server_enforced",
-      max_count: policy.maxCount,
-      applied_count: policy.appliedCount,
-      note: forceUnknownByLexicon
-        ? "theme_lexicon_mismatch"
-        : generationFamily
-        ? blankMissingRewritten
-          ? "equation_corrected_missing_blank"
-          : blankConfusionDetected
-          ? "equation_corrected_from_ocr_confusion"
-          : policy.note
-        : unknownNote,
+      max_count: selectedPolicy.maxCount,
+      applied_count: problems.length,
+      note: !selectedCandidate
+        ? (reasons.theme_lexicon_mismatch ?? 0) > 0
+          ? "theme_lexicon_mismatch"
+          : unknownNote
+        : selectedCandidate.inference_level === "soft"
+        ? mode === "equation"
+          ? blankMissingRewritten
+            ? "equation_corrected_missing_blank"
+            : blankConfusionDetected
+            ? "equation_corrected_from_ocr_confusion"
+            : "inferred_soft_equation"
+          : "inferred_soft_word_problem"
+        : selectedPolicy.note,
       seed: seedAsString,
       sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text })))),
       request_hash: sha(parsedReq.data.text ? normalizeText(parsedReq.data.text) : imageBase64),
       detector_version: DETECTOR_VERSION,
       fallback_count: fallbackCount,
       inference_latency_ms: inferenceLatencyMs,
-      ...(selectedTheme
+      ...(selectedTheme && selectedCandidate
         ? {
             theme_id: selectedTheme.id,
             theme_candidates: THEME_BANK.map((t) => t.id),
@@ -1847,6 +2007,7 @@ microGenerateRouter.post("/", async (req, res) => {
   if (topLevelModeMismatch || topLevelItemsMismatch) {
     response = {
       ...response,
+      inference_level: "unknown",
       detected_mode: "unknown",
       intent: "unknown_intent",
       required_items: [],
