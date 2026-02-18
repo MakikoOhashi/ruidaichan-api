@@ -119,6 +119,28 @@ test("equation fallback handles OCR variants: 7+9-6=口 and full-width symbols",
   });
 });
 
+test("equation fallback complements missing blank: 7+9-6=", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text: "7+9-6=", N: 4, difficulty: "same", seed: "eq-v3" })
+    });
+
+    const body = (await res.json()) as {
+      detected_mode: string;
+      detected: { family: string };
+      required_items: string[];
+      items: Array<{ type: string; text?: string }>;
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "equation");
+    assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+    assert.deepEqual(body.required_items, ["expression"]);
+    assert.equal(body.items[0]?.type, "expression");
+  });
+});
+
 test("word_problem(compare) returns prompt+choices with correct_index", async () => {
   await withServer(async (baseUrl) => {
     const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
@@ -192,7 +214,30 @@ test("fail-closed: mode/items mismatch returns unknown with empty problems", asy
     assert.equal(body.items.length, 0);
     assert.equal(body.problems.length, 0);
     assert.equal(body.need_confirm, true);
-    assert.equal(body.meta.note, "insufficient_signals");
+    assert.equal(body.meta.note, "equation_regex_miss");
+  });
+});
+
+test("empty normalized equation input returns unknown with normalize_input_empty", async () => {
+  delete process.env.GEMINI_API_KEY;
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ image_base64: "data:image/png;base64,AA==", N: 4, difficulty: "same", seed: "empty-eq" })
+    });
+    const body = (await res.json()) as {
+      detected_mode: string;
+      meta: { note: string };
+      debug: { equation_candidate_source: string; normalize_input_empty: boolean; equation_normalized_text: string };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.meta.note, "normalize_input_empty");
+    assert.equal(body.debug.equation_candidate_source, "none");
+    assert.equal(body.debug.normalize_input_empty, true);
+    assert.equal(body.debug.equation_normalized_text, "");
   });
 });
 

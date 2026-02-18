@@ -121,6 +121,9 @@ export const microGenerateResponseSchema = z
         parse_stage_selected: z.enum(["image", "ocr", "equation_regex_fallback"]),
         equation_regex_hit: z.boolean(),
         equation_normalized_text: z.string(),
+        equation_compact_text: z.string(),
+        equation_candidate_source: z.enum(["detector_text", "ocr_lines", "raw_ocr", "decode_text", "none"]),
+        normalize_input_empty: z.boolean(),
         unknown_reason: z.string().nullable()
       })
       .strict()

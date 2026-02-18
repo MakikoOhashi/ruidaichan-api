@@ -57,6 +57,8 @@ type FallbackReason =
   | "empty_parse"
   | "decode_text_fallback_failed";
 
+type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "decode_text" | "none";
+
 type DecodeFallbackDebug = {
   ocr_line_count: number;
   keyword_hits: number;
@@ -71,6 +73,7 @@ type VisionAttempt = {
   detected?: DetectResult;
   compare?: CompareSignals;
   times?: TimesSignals;
+  detector_text?: string;
 };
 
 type Theme = {
@@ -265,7 +268,7 @@ function buildComparePrompt(theme: Theme, a: number, b: number, c: number, d: nu
 
 function parseByFamily(text: string): MicroProblemDsl | null {
   const normalized = normalizeText(text);
-  const eqNormalized = normalizeEquationCandidate(normalized);
+  const eqNormalized = normalizeEquationText(normalized).normalized;
 
   const p5 = eqNormalized.match(/^(\d+)\s*\+\s*(\d+)\s*-\s*(\d+)\s*=\s*[□?_？]$/);
   if (p5) {
@@ -306,27 +309,95 @@ function parseByFamily(text: string): MicroProblemDsl | null {
   return null;
 }
 
-function normalizeEquationCandidate(text: string): string {
-  return text
+function normalizeEquationText(s: string): { normalized: string; compact: string } {
+  const normalized = s
     .normalize("NFKC")
     .replace(/\[\s*\]/g, "□")
-    .replace(/[口ロ〇◯○ＯOo_＿]/g, "□")
-    .replace(/[−ー–—－]/g, "-")
+    .replace(/[口ロ＿_]/g, "□")
+    .replace(/[−ー–―]/g, "-")
     .replace(/[＋]/g, "+")
     .replace(/[＝]/g, "=")
+    .replace(/[\r\n\t]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+  return {
+    normalized,
+    compact: normalized.replace(/\s+/g, "")
+  };
 }
 
-function equationFallbackParser(candidates: string[]): { parsed: MicroProblemDsl; normalized_text: string } | null {
-  for (const candidate of candidates) {
-    const normalized = normalizeEquationCandidate(candidate);
-    const parsed = parseByFamily(normalized);
-    if (parsed) {
-      return { parsed, normalized_text: normalized.slice(0, 120) };
-    }
+function cleanCandidateText(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+}
+
+function buildEquationCandidateText(input: {
+  detector_text?: string;
+  ocr_lines?: string[];
+  raw_ocr?: string;
+  decode_text?: string;
+}): { text: string; source: EquationCandidateSource; normalize_input_empty: boolean } {
+  const detectorText = cleanCandidateText(input.detector_text ?? "");
+  if (detectorText) return { text: detectorText, source: "detector_text", normalize_input_empty: false };
+
+  const ocrJoined = cleanCandidateText((input.ocr_lines ?? []).filter(Boolean).join(" "));
+  if (ocrJoined) return { text: ocrJoined, source: "ocr_lines", normalize_input_empty: false };
+
+  const rawOcr = cleanCandidateText(input.raw_ocr ?? "");
+  if (rawOcr) return { text: rawOcr, source: "raw_ocr", normalize_input_empty: false };
+
+  const decodeText = cleanCandidateText(input.decode_text ?? "");
+  if (decodeText) return { text: decodeText, source: "decode_text", normalize_input_empty: false };
+
+  return { text: "", source: "none", normalize_input_empty: true };
+}
+
+function equationFallbackParser(candidateText: string): { parsed: MicroProblemDsl; normalized_text: string; compact_text: string } | null {
+  const { normalized, compact } = normalizeEquationText(candidateText);
+  if (!normalized) return null;
+
+  const p1 = compact.match(/^(\d+)\+(\d+)-(\d+)=□$/);
+  if (p1) {
+    const a = Number(p1[1]);
+    const b = Number(p1[2]);
+    const c = Number(p1[3]);
+    return {
+      parsed: buildProblemBase("a_plus_b_minus_c_eq_blank", { a, b, c }, `${a} + ${b} - ${c} = □`, a + b - c),
+      normalized_text: normalized.slice(0, 100),
+      compact_text: compact.slice(0, 100)
+    };
   }
-  return null;
+
+  const p2 = compact.match(/^(\d+)\+(\d+)-(\d+)=$/);
+  if (p2) {
+    const a = Number(p2[1]);
+    const b = Number(p2[2]);
+    const c = Number(p2[3]);
+    return {
+      parsed: buildProblemBase("a_plus_b_minus_c_eq_blank", { a, b, c }, `${a} + ${b} - ${c} = □`, a + b - c),
+      normalized_text: normalized.slice(0, 100),
+      compact_text: compact.slice(0, 100)
+    };
+  }
+
+  const p3 = compact.match(/^(\d+)\+(\d+)-(\d+)=([□口ロ_])$/);
+  if (p3) {
+    const a = Number(p3[1]);
+    const b = Number(p3[2]);
+    const c = Number(p3[3]);
+    return {
+      parsed: buildProblemBase("a_plus_b_minus_c_eq_blank", { a, b, c }, `${a} + ${b} - ${c} = □`, a + b - c),
+      normalized_text: normalized.slice(0, 100),
+      compact_text: compact.slice(0, 100)
+    };
+  }
+
+  const parsed = parseByFamily(normalized);
+  if (!parsed) return null;
+  return {
+    parsed,
+    normalized_text: normalized.slice(0, 100),
+    compact_text: compact.slice(0, 100)
+  };
 }
 
 function detectTimesSignals(text: string): TimesSignals {
@@ -602,6 +673,7 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
         status: response.status,
         error_reason: null,
         retriable: false,
+        detector_text: text,
         detected: {
           family: "times_scale_mc",
           confidence: Math.max(confidence, 0.8),
@@ -625,6 +697,7 @@ async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt
         status: response.status,
         error_reason: null,
         retriable: false,
+        detector_text: text,
         detected: {
           family: "compare_totals_diff_mc",
           confidence: Math.max(confidence, 0.8),
@@ -936,6 +1009,14 @@ microGenerateRouter.post("/", async (req, res) => {
   let parseStageSelected: ParseStage = hasImageBase64 ? "image" : "ocr";
   let equationRegexHit = false;
   let equationNormalizedText = "";
+  let equationCompactText = "";
+  let equationCandidateSource: EquationCandidateSource = "none";
+  let normalizeInputEmpty = false;
+  let upstreamUnknownReason: string | null = null;
+  let detectorParsedText = "";
+  let rawOcrText = "";
+  let ocrLines: string[] = [];
+  let decodeTextForEquation = "";
   let decodeDebug: DecodeFallbackDebug = {
     ocr_line_count: 0,
     keyword_hits: 0,
@@ -959,11 +1040,10 @@ microGenerateRouter.post("/", async (req, res) => {
   let detected: DetectResult;
   let compareSignals: CompareSignals;
   let timesSignals: TimesSignals;
-  const equationCandidates: string[] = [];
-
   if (parsedReq.data.text) {
     parseStageSelected = "ocr";
-    equationCandidates.push(parsedReq.data.text);
+    rawOcrText = parsedReq.data.text;
+    ocrLines = parsedReq.data.text.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
     const det = detectFamily(parsedReq.data.text);
     detected = det.detected;
     compareSignals = det.compare;
@@ -971,8 +1051,9 @@ microGenerateRouter.post("/", async (req, res) => {
   } else {
     selectedDetectorPath = "image_gemini_detector";
     parseStageSelected = "image";
-    const decodedTextForEquation = decodeBase64Text(imageBase64);
-    equationCandidates.push(decodedTextForEquation);
+    decodeTextForEquation = decodeBase64Text(imageBase64);
+    rawOcrText = decodeTextForEquation;
+    ocrLines = decodeTextForEquation.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
     const started = Date.now();
     const firstAttempt = await detectFamilyFromImage(imageBase64);
     let vision = firstAttempt;
@@ -989,6 +1070,7 @@ microGenerateRouter.post("/", async (req, res) => {
     inferenceLatencyMs = Date.now() - started;
 
     if (vision.ok && vision.detected && vision.compare && vision.times) {
+      detectorParsedText = vision.detector_text ?? "";
       detected = vision.detected;
       compareSignals = vision.compare;
       timesSignals = vision.times;
@@ -996,8 +1078,8 @@ microGenerateRouter.post("/", async (req, res) => {
       detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
       selectedDetectorPath = "image_base64_decode_text_detector";
       parseStageSelected = "ocr";
-      decodeDebug = buildDecodeFallbackDebug(decodedTextForEquation);
-      const det = detectFamily(decodedTextForEquation);
+      decodeDebug = buildDecodeFallbackDebug(decodeTextForEquation);
+      const det = detectFamily(decodeTextForEquation);
       compareSignals = det.compare;
       timesSignals = det.times;
 
@@ -1016,24 +1098,41 @@ microGenerateRouter.post("/", async (req, res) => {
     }
   }
 
+  const eqCandidate = buildEquationCandidateText({
+    detector_text: detectorParsedText,
+    ocr_lines: ocrLines,
+    raw_ocr: rawOcrText,
+    decode_text: decodeTextForEquation
+  });
+  equationCandidateSource = eqCandidate.source;
+  normalizeInputEmpty = eqCandidate.normalize_input_empty;
+  if (eqCandidate.text) {
+    const preview = normalizeEquationText(eqCandidate.text);
+    equationNormalizedText = preview.normalized.slice(0, 100);
+    equationCompactText = preview.compact.slice(0, 100);
+  }
+
   // Required pass before unknown: equation regex fallback over OCR-like candidates.
-  if (detected.family === "unknown") {
-    const fallback = equationFallbackParser(equationCandidates);
-    if (fallback) {
-      equationRegexHit = true;
-      equationNormalizedText = fallback.normalized_text;
-      parseStageSelected = "equation_regex_fallback";
-      detected = {
-        family: fallback.parsed.family,
-        confidence: 0.92,
-        parsed_example: fallback.parsed,
-        block_fallback: false,
-        intent: intentFromFamily(fallback.parsed.family)
-      };
-      const det = detectFamily(fallback.normalized_text);
-      compareSignals = det.compare;
-      timesSignals = det.times;
-    }
+  const fallback = equationFallbackParser(eqCandidate.text);
+  if (fallback) {
+    equationRegexHit = true;
+    equationNormalizedText = fallback.normalized_text;
+    equationCompactText = fallback.compact_text;
+    parseStageSelected = "equation_regex_fallback";
+    detected = {
+      family: fallback.parsed.family,
+      confidence: 0.92,
+      parsed_example: fallback.parsed,
+      block_fallback: false,
+      intent: intentFromFamily(fallback.parsed.family)
+    };
+    const det = detectFamily(fallback.normalized_text);
+    compareSignals = det.compare;
+    timesSignals = det.times;
+  } else if (detected.family === "unknown") {
+    if (normalizeInputEmpty) upstreamUnknownReason = "normalize_input_empty";
+    else if (detectorFallbackReason === "empty_parse") upstreamUnknownReason = "empty_parse_upstream";
+    else upstreamUnknownReason = detectorFallbackReason ?? "equation_regex_miss";
   }
 
   const detectedFamilyBeforeFallback = detected.family;
@@ -1041,7 +1140,7 @@ microGenerateRouter.post("/", async (req, res) => {
   const generationFamily: ProblemFamily | null =
     detected.family === "unknown" ? (detected.block_fallback ? null : null) : detected.family;
   const detectedFamilyAfterFallback = generationFamily;
-  const unknownNote = detectorFallbackReason ?? "insufficient_signals";
+  const unknownNote = upstreamUnknownReason ?? "insufficient_signals";
 
   console.log(
     JSON.stringify({
@@ -1159,6 +1258,9 @@ microGenerateRouter.post("/", async (req, res) => {
       parse_stage_selected: parseStageSelected,
       equation_regex_hit: equationRegexHit,
       equation_normalized_text: equationNormalizedText,
+      equation_compact_text: equationCompactText,
+      equation_candidate_source: equationCandidateSource,
+      normalize_input_empty: normalizeInputEmpty,
       unknown_reason: detected.family === "unknown" ? unknownNote : null
     },
     meta: {
