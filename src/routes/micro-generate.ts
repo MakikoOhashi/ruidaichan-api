@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Router } from "express";
 import {
-  difficultySchema,
   microGenerateRequestSchema,
   microGenerateResponseSchema,
   microProblemDslSchema,
@@ -14,7 +13,7 @@ import {
 export const microGenerateRouter = Router();
 
 const DETECT_CONFIDENCE_THRESHOLD = 0.75;
-const MAX_REGEN_TRIES = 200;
+const MAX_REGEN_TRIES = 250;
 const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS ?? 8000);
 const DEPLOY_COMMIT = process.env.RENDER_GIT_COMMIT ?? process.env.GIT_COMMIT_SHA ?? "unknown";
@@ -24,6 +23,8 @@ type DetectResult = {
   family: ProblemFamily | "unknown";
   confidence: number;
   parsed_example: MicroProblemDsl | null;
+  block_fallback: boolean;
+  intent: string;
 };
 
 type CompareSignals = {
@@ -33,6 +34,14 @@ type CompareSignals = {
   total_word_hits: number;
   number_count: number;
   compare_score: number;
+};
+
+type TimesSignals = {
+  times_word_hits: number;
+  question_word_hits: number;
+  pattern_hit: boolean;
+  number_count: number;
+  times_score: number;
 };
 
 function normalizeText(text: string): string {
@@ -60,6 +69,10 @@ function hashToSeed(input: string): number {
   return Number.parseInt(h, 16) >>> 0;
 }
 
+function sha(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
 function mulberry32(seed: number): () => number {
   let t = seed >>> 0;
   return () => {
@@ -74,6 +87,69 @@ function randInt(rng: () => number, min: number, max: number): number {
   return Math.floor(rng() * (max - min + 1)) + min;
 }
 
+function modeFromFamily(family: ProblemFamily | "unknown"): "equation" | "word_problem" | "unknown" {
+  if (family === "compare_totals_diff_mc" || family === "times_scale_mc") return "word_problem";
+  if (family === "unknown") return "unknown";
+  return "equation";
+}
+
+function intentFromFamily(family: ProblemFamily | "unknown"): string {
+  if (family === "compare_totals_diff_mc") return "compare_totals_difference";
+  if (family === "times_scale_mc") return "times_scale_question";
+  if (family === "unknown") return "unknown_intent";
+  return "equation_fill_blank";
+}
+
+function requiredItemsFromMode(mode: "equation" | "word_problem" | "unknown"): Array<"prompt" | "choices" | "expression"> {
+  if (mode === "equation") return ["expression"];
+  if (mode === "word_problem") return ["prompt", "choices"];
+  return [];
+}
+
+function buildProblemBase(family: ProblemFamily, params: Record<string, number | string | string[]>, renderText: string, answer: number): MicroProblemDsl {
+  const mode = modeFromFamily(family);
+  const required = requiredItemsFromMode(mode);
+
+  const items: MicroProblemDsl["items"] =
+    mode === "equation"
+      ? [{ type: "expression", slot: "expr", text: renderText as string }]
+      : mode === "word_problem"
+      ? [
+          { type: "prompt", slot: "stem", text: renderText as string },
+          {
+            type: "choices",
+            slot: "options",
+            style: "mc",
+            choices: Array.isArray(params.choices) ? params.choices : [],
+            correct_index: Number(params.correct_index ?? 0)
+          }
+        ]
+      : [];
+
+  return {
+    spec_version: "micro_problem_dsl_v1",
+    family,
+    params,
+    render_text: renderText,
+    answer,
+    detected_mode: mode,
+    intent: intentFromFamily(family),
+    required_items: required,
+    items
+  };
+}
+
+function buildEquationChoices(answer: number, unit = ""): { choices: string[]; correctIndex: number } {
+  const wrong = new Set<number>([Math.max(0, answer - 1), answer + 1, answer + 2, Math.max(0, answer - 2)]);
+  wrong.delete(answer);
+  const choices = [answer, ...Array.from(wrong).slice(0, 4)]
+    .slice(0, 5)
+    .sort((a, b) => a - b)
+    .map((v) => `${v}${unit}`);
+  const correctIndex = choices.findIndex((c) => c === `${answer}${unit}`);
+  return { choices, correctIndex };
+}
+
 function parseByFamily(text: string): MicroProblemDsl | null {
   const normalized = normalizeText(text);
 
@@ -81,78 +157,77 @@ function parseByFamily(text: string): MicroProblemDsl | null {
   if (p1) {
     const a = Number(p1[1]);
     const b = Number(p1[2]);
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family: "a_plus_blank_eq_b",
-      params: { a, b },
-      render_text: `${a} + □ = ${b}`,
-      answer: b - a
-    };
+    return buildProblemBase("a_plus_blank_eq_b", { a, b }, `${a} + □ = ${b}`, b - a);
   }
 
   const p2 = normalized.match(/^[□?_？]\s*[+＋]\s*(\d+)\s*[=＝]\s*(\d+)$/);
   if (p2) {
     const a = Number(p2[1]);
     const b = Number(p2[2]);
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family: "blank_plus_a_eq_b",
-      params: { a, b },
-      render_text: `□ + ${a} = ${b}`,
-      answer: b - a
-    };
+    return buildProblemBase("blank_plus_a_eq_b", { a, b }, `□ + ${a} = ${b}`, b - a);
   }
 
   const p3 = normalized.match(/^(\d+)\s*[+＋]\s*(\d+)\s*[=＝]\s*[□?_？]$/);
   if (p3) {
     const a = Number(p3[1]);
     const b = Number(p3[2]);
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family: "a_plus_b_eq_blank",
-      params: { a, b },
-      render_text: `${a} + ${b} = □`,
-      answer: a + b
-    };
+    return buildProblemBase("a_plus_b_eq_blank", { a, b }, `${a} + ${b} = □`, a + b);
   }
 
   const p4 = normalized.match(/^(\d+)\s*[-－]\s*(\d+)\s*[=＝]\s*[□?_？]$/);
   if (p4) {
     const b = Number(p4[1]);
     const a = Number(p4[2]);
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family: "b_minus_a_eq_blank",
-      params: { a, b },
-      render_text: `${b} - ${a} = □`,
-      answer: b - a
-    };
+    return buildProblemBase("b_minus_a_eq_blank", { a, b }, `${b} - ${a} = □`, b - a);
   }
 
   return null;
 }
 
-function parseCompareTotals(text: string): MicroProblemDsl | null {
+function detectTimesSignals(text: string): TimesSignals {
   const normalized = normalizeText(text);
-  const numbers = [...normalized.matchAll(/\d+/g)].map((m) => Number(m[0]));
-  if (numbers.length < 4) return null;
+  const times_word_hits = [...normalized.matchAll(/ばい|倍/g)].length;
+  const question_word_hits = [...normalized.matchAll(/何本|何こ|何個/g)].length;
+  const pattern_hit = /(.+?)(?:は|が)[、,\s]*(.+?)の(\d+)(?:ばい|倍)/.test(normalized);
+  const number_count = [...normalized.matchAll(/\d+/g)].length;
+  const times_score =
+    (times_word_hits > 0 ? 1 : 0) +
+    (question_word_hits > 0 ? 1 : 0) +
+    (pattern_hit ? 1 : 0) +
+    (number_count >= 2 ? 1 : 0);
 
-  const a = numbers[0];
-  const b = numbers[1];
-  const c = numbers[2];
-  const d = numbers[3];
-  const redTotal = a + c;
-  const yellowTotal = b + d;
-  const blank = Math.abs(redTotal - yellowTotal);
-  const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
+  return { times_word_hits, question_word_hits, pattern_hit, number_count, times_score };
+}
 
-  return {
-    spec_version: "micro_problem_dsl_v1",
-    family: "compare_totals_diff_mc",
-    params: { a, b, c, d, blank },
-    render_text: `あかは${a}こ、きいろは${b}こ。さらに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。(${winner})`,
-    answer: blank
-  };
+function parseTimesScale(text: string): MicroProblemDsl | null {
+  const normalized = normalizeText(text);
+  const pattern = normalized.match(/(.+?)(?:は|が)[、,\s]*(.+?)の(\d+)(?:ばい|倍).*?(\d+)(本|こ|個)/);
+  if (!pattern) return null;
+
+  const subject_a = pattern[1].trim();
+  const subject_b = pattern[2].trim();
+  const multiplier = Number(pattern[3]);
+  const base = Number(pattern[4]);
+  const unit = pattern[5];
+  if (!Number.isInteger(multiplier) || !Number.isInteger(base) || multiplier < 2) return null;
+
+  const answer = base * multiplier;
+  const { choices, correctIndex } = buildEquationChoices(answer, unit);
+  return buildProblemBase(
+    "times_scale_mc",
+    {
+      base,
+      multiplier,
+      answer,
+      unit,
+      subject_a,
+      subject_b,
+      choices,
+      correct_index: correctIndex
+    },
+    `${subject_a}が、${subject_b}の${multiplier}ばいさいています。${subject_b}が${base}${unit}のとき、${subject_a}は何${unit}ですか。つぎから1つえらびなさい。`,
+    answer
+  );
 }
 
 function detectCompareTotalsSignals(text: string): CompareSignals {
@@ -182,37 +257,122 @@ function detectCompareTotalsSignals(text: string): CompareSignals {
   };
 }
 
-function detectFamily(text: string): { detected: DetectResult; signals: CompareSignals } {
-  const signals = detectCompareTotalsSignals(text);
-  if (signals.compare_score >= 4) {
+function parseCompareTotals(text: string): MicroProblemDsl | null {
+  const normalized = normalizeText(text);
+  const numbers = [...normalized.matchAll(/\d+/g)].map((m) => Number(m[0]));
+  if (numbers.length < 4) return null;
+
+  const a = numbers[0];
+  const b = numbers[1];
+  const c = numbers[2];
+  const d = numbers[3];
+  const redTotal = a + c;
+  const yellowTotal = b + d;
+  const blank = Math.abs(redTotal - yellowTotal);
+  const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
+  const { choices, correctIndex } = buildEquationChoices(blank, "こ");
+
+  return buildProblemBase(
+    "compare_totals_diff_mc",
+    { a, b, c, d, blank, winner, choices, correct_index: correctIndex },
+    `あかは${a}こ、きいろは${b}こです。さらに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。`,
+    blank
+  );
+}
+
+function detectFamily(text: string): { detected: DetectResult; compare: CompareSignals; times: TimesSignals } {
+  const times = detectTimesSignals(text);
+  if (times.times_word_hits > 0) {
+    const parsedTimes = parseTimesScale(text);
+    if (parsedTimes) {
+      return {
+        detected: {
+          family: "times_scale_mc",
+          confidence: times.times_score >= 4 ? 0.9 : 0.8,
+          parsed_example: parsedTimes,
+          block_fallback: false,
+          intent: intentFromFamily("times_scale_mc")
+        },
+        compare: {
+          color_hits: 0,
+          two_actor_hits: 0,
+          compare_word_hits: 0,
+          total_word_hits: 0,
+          number_count: times.number_count,
+          compare_score: 0
+        },
+        times
+      };
+    }
+
+    return {
+      detected: {
+        family: "unknown",
+        confidence: times.question_word_hits > 0 ? 0.74 : 0.6,
+        parsed_example: null,
+        block_fallback: true,
+        intent: "times_signal_detected_but_unresolved"
+      },
+      compare: {
+        color_hits: 0,
+        two_actor_hits: 0,
+        compare_word_hits: 0,
+        total_word_hits: 0,
+        number_count: times.number_count,
+        compare_score: 0
+      },
+      times
+    };
+  }
+
+  const compare = detectCompareTotalsSignals(text);
+  if (compare.compare_score >= 4) {
     const parsedCompare = parseCompareTotals(text);
     if (parsedCompare) {
-      const confidence = signals.compare_score >= 5 ? 0.92 : 0.82;
       return {
         detected: {
           family: "compare_totals_diff_mc",
-          confidence,
-          parsed_example: parsedCompare
+          confidence: compare.compare_score >= 5 ? 0.92 : 0.82,
+          parsed_example: parsedCompare,
+          block_fallback: false,
+          intent: intentFromFamily("compare_totals_diff_mc")
         },
-        signals
+        compare,
+        times
       };
     }
   }
 
   const parsed = parseByFamily(text);
   if (parsed) {
-    return { detected: { family: parsed.family, confidence: 0.92, parsed_example: parsed }, signals };
+    return {
+      detected: {
+        family: parsed.family,
+        confidence: 0.92,
+        parsed_example: parsed,
+        block_fallback: false,
+        intent: intentFromFamily(parsed.family)
+      },
+      compare,
+      times
+    };
   }
 
   const hasMathSignal = /[+＋=＝\-－□?_？]/.test(text);
-  if (hasMathSignal) {
-    return { detected: { family: "unknown", confidence: 0.6, parsed_example: null }, signals };
-  }
-
-  return { detected: { family: "unknown", confidence: 0.35, parsed_example: null }, signals };
+  return {
+    detected: {
+      family: "unknown",
+      confidence: hasMathSignal ? 0.6 : 0.35,
+      parsed_example: null,
+      block_fallback: false,
+      intent: "unknown_intent"
+    },
+    compare,
+    times
+  };
 }
 
-async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: DetectResult; signals: CompareSignals } | null> {
+async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: DetectResult; compare: CompareSignals; times: TimesSignals } | null> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
 
@@ -225,15 +385,8 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
   try {
     const prompt = [
       "Classify a single elementary math sub-problem.",
-      "Target family names:",
-      "- compare_totals_diff_mc (two groups, compare totals, ask which/how many more)",
-      "- a_plus_blank_eq_b",
-      "- blank_plus_a_eq_b",
-      "- a_plus_b_eq_blank",
-      "- b_minus_a_eq_blank",
-      "- unknown",
-      "Return ONLY JSON with this exact shape:",
-      '{"family":"compare_totals_diff_mc","confidence":0.0,"params":{"a":18,"b":23,"c":27,"d":12,"blank":10}}'
+      "family must be one of: times_scale_mc, compare_totals_diff_mc, a_plus_blank_eq_b, blank_plus_a_eq_b, a_plus_b_eq_blank, b_minus_a_eq_blank, unknown",
+      "Return ONLY JSON: {\"family\":\"times_scale_mc\",\"confidence\":0.86,\"params\":{\"base\":15,\"multiplier\":2}}"
     ].join("\n");
 
     const response = await fetch(
@@ -247,19 +400,11 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
               role: "user",
               parts: [
                 { text: prompt },
-                {
-                  inline_data: {
-                    mime_type: mimeFromInput(imageBase64),
-                    data: payload
-                  }
-                }
+                { inline_data: { mime_type: mimeFromInput(imageBase64), data: payload } }
               ]
             }
           ],
-          generationConfig: {
-            temperature: 0.1,
-            responseMimeType: "application/json"
-          }
+          generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
         }),
         signal: controller.signal
       }
@@ -272,65 +417,82 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) return null;
 
-    const parsed = JSON.parse(text) as {
-      family?: string;
-      confidence?: number;
-      params?: Record<string, number>;
-    };
-
-    const family = parsed.family;
+    const parsed = JSON.parse(text) as { family?: string; confidence?: number; params?: Record<string, number> };
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence ?? 0)));
-    if (!family) return null;
 
-    if (family === "compare_totals_diff_mc" && parsed.params) {
-      const a = Math.trunc(parsed.params.a ?? 0);
-      const b = Math.trunc(parsed.params.b ?? 0);
-      const c = Math.trunc(parsed.params.c ?? 0);
-      const d = Math.trunc(parsed.params.d ?? 0);
-      const blank = Math.abs(a + c - (b + d));
-      const parsed_example: MicroProblemDsl = {
-        spec_version: "micro_problem_dsl_v1",
-        family: "compare_totals_diff_mc",
-        params: { a, b, c, d, blank },
-        render_text: `あかは${a}こ、きいろは${b}こ。さらに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。`,
-        answer: blank
-      };
+    if (parsed.family === "times_scale_mc") {
+      const base = Math.max(1, Math.trunc(parsed.params?.base ?? 15));
+      const multiplier = Math.max(2, Math.trunc(parsed.params?.multiplier ?? 2));
+      const normalized = `${base} ${multiplier}倍 何本`;
+      const local = detectFamily(normalized);
+      const family = local.detected.parsed_example?.family === "times_scale_mc" ? local.detected.parsed_example : parseTimesScale(`黄色は赤の${multiplier}ばい。赤が${base}本のとき何本？`);
       return {
-        detected: { family: "compare_totals_diff_mc", confidence: Math.max(confidence, 0.8), parsed_example },
-        signals: {
+        detected: {
+          family: "times_scale_mc",
+          confidence: Math.max(confidence, 0.8),
+          parsed_example: family,
+          block_fallback: false,
+          intent: intentFromFamily("times_scale_mc")
+        },
+        compare: local.compare,
+        times: local.times
+      };
+    }
+
+    if (parsed.family === "compare_totals_diff_mc") {
+      const a = Math.max(1, Math.trunc(parsed.params?.a ?? 10));
+      const b = Math.max(1, Math.trunc(parsed.params?.b ?? 8));
+      const c = Math.max(1, Math.trunc(parsed.params?.c ?? 6));
+      const d = Math.max(1, Math.trunc(parsed.params?.d ?? 4));
+      const parsed_example = parseCompareTotals(`あか${a}こ きいろ${b}こ あか${c}こ きいろ${d}こ どちらが何こ多い あわせて`);
+      return {
+        detected: {
+          family: "compare_totals_diff_mc",
+          confidence: Math.max(confidence, 0.8),
+          parsed_example,
+          block_fallback: false,
+          intent: intentFromFamily("compare_totals_diff_mc")
+        },
+        compare: {
           color_hits: 2,
           two_actor_hits: 2,
           compare_word_hits: 1,
           total_word_hits: 1,
           number_count: 4,
           compare_score: 5
-        }
-      };
-    }
-
-    if (problemFamilySchema.options.includes(family as ProblemFamily)) {
-      return {
-        detected: { family: family as ProblemFamily, confidence, parsed_example: null },
-        signals: {
-          color_hits: 0,
-          two_actor_hits: 0,
-          compare_word_hits: 0,
-          total_word_hits: 0,
-          number_count: 0,
-          compare_score: 0
+        },
+        times: {
+          times_word_hits: 0,
+          question_word_hits: 1,
+          pattern_hit: false,
+          number_count: 4,
+          times_score: 2
         }
       };
     }
 
     return {
-      detected: { family: "unknown", confidence: Math.min(confidence, 0.6), parsed_example: null },
-      signals: {
+      detected: {
+        family: "unknown",
+        confidence: Math.min(confidence, 0.7),
+        parsed_example: null,
+        block_fallback: false,
+        intent: "vision_unknown"
+      },
+      compare: {
         color_hits: 0,
         two_actor_hits: 0,
         compare_word_hits: 0,
         total_word_hits: 0,
         number_count: 0,
         compare_score: 0
+      },
+      times: {
+        times_word_hits: 0,
+        question_word_hits: 0,
+        pattern_hit: false,
+        number_count: 0,
+        times_score: 0
       }
     };
   } catch {
@@ -345,13 +507,41 @@ function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | nu
   if (difficulty === "hard") return { min: 5, max: 30 };
 
   if (!example) return { min: 0, max: 12 };
-  const values = Object.values(example.params);
+  const values = Object.values(example.params).filter((v): v is number => typeof v === "number");
   const mx = Math.max(...values, example.answer);
   return { min: Math.max(0, mx - 5), max: mx + 5 };
 }
 
 function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Difficulty, example: MicroProblemDsl | null): MicroProblemDsl {
   const range = rangeByDifficulty(difficulty, example);
+
+  if (family === "times_scale_mc") {
+    const baseMin = difficulty === "easy" ? 2 : difficulty === "hard" ? 10 : 5;
+    const baseMax = difficulty === "easy" ? 20 : difficulty === "hard" ? 60 : 35;
+    const base = randInt(rng, baseMin, baseMax);
+    const multiplier = randInt(rng, 2, difficulty === "hard" ? 5 : 3);
+    const answer = base * multiplier;
+    const unit = "本";
+    const subjectA = "黄色のチューリップ";
+    const subjectB = "赤いチューリップ";
+    const { choices, correctIndex } = buildEquationChoices(answer, unit);
+
+    return buildProblemBase(
+      family,
+      {
+        base,
+        multiplier,
+        answer,
+        unit,
+        subject_a: subjectA,
+        subject_b: subjectB,
+        choices,
+        correct_index: correctIndex
+      },
+      `${subjectA}が、${subjectB}の${multiplier}ばいさいています。${subjectB}が${base}${unit}のとき、${subjectA}は何${unit}ですか。つぎから1つえらびなさい。`,
+      answer
+    );
+  }
 
   if (family === "compare_totals_diff_mc") {
     const min = difficulty === "easy" ? 1 : difficulty === "hard" ? 10 : 3;
@@ -364,101 +554,125 @@ function buildProblem(family: ProblemFamily, rng: () => number, difficulty: Diff
     const yellowTotal = b + d;
     const blank = Math.abs(redTotal - yellowTotal);
     const winner = redTotal >= yellowTotal ? "あか" : "きいろ";
+    const { choices, correctIndex } = buildEquationChoices(blank, "こ");
 
-    return {
-      spec_version: "micro_problem_dsl_v1",
+    return buildProblemBase(
       family,
-      params: { a, b, c, d, blank },
-      render_text: `あかは${a}こ、きいろは${b}こ。つぎに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。(${winner})`,
-      answer: blank
-    };
+      { a, b, c, d, blank, winner, choices, correct_index: correctIndex },
+      `あかは${a}こ、きいろは${b}こ。つぎに あか${c}こ、きいろ${d}こ ふえました。どちらが なんこ おおいですか。`,
+      blank
+    );
   }
 
   if (family === "a_plus_blank_eq_b") {
     const a = randInt(rng, range.min, range.max);
     const x = randInt(rng, range.min, range.max);
     const b = a + x;
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family,
-      params: { a, b },
-      render_text: `${a} + □ = ${b}`,
-      answer: x
-    };
+    return buildProblemBase(family, { a, b }, `${a} + □ = ${b}`, x);
   }
 
   if (family === "blank_plus_a_eq_b") {
     const a = randInt(rng, range.min, range.max);
     const x = randInt(rng, range.min, range.max);
     const b = a + x;
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family,
-      params: { a, b },
-      render_text: `□ + ${a} = ${b}`,
-      answer: x
-    };
+    return buildProblemBase(family, { a, b }, `□ + ${a} = ${b}`, x);
   }
 
   if (family === "a_plus_b_eq_blank") {
     const a = randInt(rng, range.min, range.max);
     const b = randInt(rng, range.min, range.max);
-    return {
-      spec_version: "micro_problem_dsl_v1",
-      family,
-      params: { a, b },
-      render_text: `${a} + ${b} = □`,
-      answer: a + b
-    };
+    return buildProblemBase(family, { a, b }, `${a} + ${b} = □`, a + b);
   }
 
   const a = randInt(rng, range.min, range.max);
   const diff = randInt(rng, range.min, range.max);
   const b = a + diff;
-  return {
-    spec_version: "micro_problem_dsl_v1",
-    family,
-    params: { a, b },
-    render_text: `${b} - ${a} = □`,
-    answer: diff
-  };
+  return buildProblemBase(family, { a, b }, `${b} - ${a} = □`, diff);
 }
 
 function solve(problem: MicroProblemDsl): number {
   const p = problem.params;
   switch (problem.family) {
     case "a_plus_blank_eq_b":
-      return p.b - p.a;
+      return Number(p.b) - Number(p.a);
     case "blank_plus_a_eq_b":
-      return p.b - p.a;
+      return Number(p.b) - Number(p.a);
     case "a_plus_b_eq_blank":
-      return p.a + p.b;
+      return Number(p.a) + Number(p.b);
     case "b_minus_a_eq_blank":
-      return p.b - p.a;
+      return Number(p.b) - Number(p.a);
     case "compare_totals_diff_mc":
-      return Math.abs((p.a + p.c) - (p.b + p.d));
+      return Math.abs((Number(p.a) + Number(p.c)) - (Number(p.b) + Number(p.d)));
+    case "times_scale_mc":
+      return Number(p.base) * Number(p.multiplier);
   }
 }
 
 function isInRangeForDifficulty(problem: MicroProblemDsl, difficulty: Difficulty): boolean {
-  const vals = [...Object.values(problem.params), problem.answer];
-  if (difficulty === "easy") return vals.every((v) => v >= 0 && v <= 20);
-  if (difficulty === "hard") return vals.every((v) => v >= 0 && v <= 99);
-  return vals.every((v) => v >= 0 && v <= 50);
+  const numericParams = Object.values(problem.params).filter((v): v is number => typeof v === "number");
+  const vals = [...numericParams, problem.answer];
+  if (difficulty === "easy") return vals.every((v) => v >= 0 && v <= 30);
+  if (difficulty === "hard") return vals.every((v) => v >= 0 && v <= 120);
+  return vals.every((v) => v >= 0 && v <= 70);
+}
+
+function validateModeItems(problem: MicroProblemDsl): string | null {
+  if (problem.detected_mode === "word_problem") {
+    if (!problem.required_items.includes("prompt") || !problem.required_items.includes("choices")) {
+      return "mode_items_mismatch";
+    }
+  }
+  if (problem.detected_mode === "equation") {
+    if (!problem.required_items.includes("expression")) {
+      return "mode_items_mismatch";
+    }
+  }
+
+  const itemTypes = new Set(problem.items.map((i) => i.type));
+  for (const req of problem.required_items) {
+    if (req === "prompt" && !itemTypes.has("prompt")) return "mode_items_mismatch";
+    if (req === "choices" && !itemTypes.has("choices")) return "mode_items_mismatch";
+    if (req === "expression" && !itemTypes.has("expression")) return "mode_items_mismatch";
+  }
+
+  const choicesItem = problem.items.find((i) => i.type === "choices");
+  if (choicesItem && choicesItem.type === "choices") {
+    if (choicesItem.correct_index < 0 || choicesItem.correct_index >= choicesItem.choices.length) {
+      return "choices_index_invalid";
+    }
+  }
+
+  return null;
 }
 
 function validateProblem(problem: MicroProblemDsl, difficulty: Difficulty): string | null {
   const parsed = microProblemDslSchema.safeParse(problem);
   if (!parsed.success) return "schema_invalid";
 
+  if (problem.family === "times_scale_mc") {
+    const p = problem.params;
+    const needed = ["base", "multiplier", "answer"] as const;
+    if (!needed.every((k) => Number.isInteger(Number(p[k])))) return "missing_times_params";
+    if (Number(p.multiplier) < 2) return "times_multiplier_too_small";
+    const computed = Number(p.base) * Number(p.multiplier);
+    if (Number(p.answer) !== computed) return "times_answer_mismatch";
+    const choiceList = Array.isArray(p.choices) ? p.choices : [];
+    const answerToken = `${computed}${String(p.unit ?? "")}`;
+    const contains = choiceList.filter((c) => c === answerToken).length;
+    if (contains !== 1) return "times_choices_invalid";
+  }
+
   if (problem.family === "compare_totals_diff_mc") {
     const p = problem.params;
     const needed = ["a", "b", "c", "d", "blank"] as const;
-    if (!needed.every((k) => Number.isInteger(p[k]))) return "missing_compare_params";
-    const computed = Math.abs((p.a + p.c) - (p.b + p.d));
-    if (p.blank !== computed) return "compare_blank_mismatch";
-    if (p.blank < 0) return "negative_answer";
+    if (!needed.every((k) => Number.isInteger(Number(p[k])))) return "missing_compare_params";
+    const computed = Math.abs((Number(p.a) + Number(p.c)) - (Number(p.b) + Number(p.d)));
+    if (Number(p.blank) !== computed) return "compare_blank_mismatch";
+    if (Number(p.blank) < 0) return "negative_answer";
   }
+
+  const modeReason = validateModeItems(problem);
+  if (modeReason) return modeReason;
 
   if (solve(problem) !== problem.answer) return "solver_mismatch";
   if (problem.answer < 0) return "negative_answer";
@@ -469,6 +683,14 @@ function validateProblem(problem: MicroProblemDsl, difficulty: Difficulty): stri
 
 function bumpReason(reasons: Record<string, number>, key: string): void {
   reasons[key] = (reasons[key] ?? 0) + 1;
+}
+
+function countPolicy(family: ProblemFamily | "unknown", requestedN: 4 | 5 | 10): { maxCount: number; appliedCount: number; note: string } {
+  if (family === "compare_totals_diff_mc" || family === "times_scale_mc") {
+    const maxCount = 5;
+    return { maxCount, appliedCount: Math.min(requestedN, maxCount), note: "文章題は5問まで" };
+  }
+  return { maxCount: requestedN, appliedCount: requestedN, note: "requested_count_applied" };
 }
 
 microGenerateRouter.post("/", async (req, res) => {
@@ -485,16 +707,7 @@ microGenerateRouter.post("/", async (req, res) => {
     });
   }
 
-  let selectedDetectorPath = "text_detector";
-  let detected: DetectResult;
-  let signalCounts: CompareSignals = {
-    color_hits: 0,
-    two_actor_hits: 0,
-    compare_word_hits: 0,
-    total_word_hits: 0,
-    number_count: 0,
-    compare_score: 0
-  };
+  let selectedDetectorPath = textPresent ? "text_detector" : "image_detector";
 
   console.log(
     JSON.stringify({
@@ -502,57 +715,64 @@ microGenerateRouter.post("/", async (req, res) => {
       request_id: requestId,
       has_image_base64: hasImageBase64,
       text_present: textPresent,
-      selected_detector_path: textPresent ? "text_detector" : "image_detector"
+      selected_detector_path: selectedDetectorPath
     })
   );
 
+  let detected: DetectResult;
+  let compareSignals: CompareSignals;
+  let timesSignals: TimesSignals;
+
   if (parsedReq.data.text) {
-    const text = normalizeText(parsedReq.data.text);
-    const resByText = detectFamily(text);
-    detected = resByText.detected;
-    signalCounts = resByText.signals;
-    selectedDetectorPath = "text_detector";
+    const det = detectFamily(parsedReq.data.text);
+    detected = det.detected;
+    compareSignals = det.compare;
+    timesSignals = det.times;
   } else {
     const imageBase64 = parsedReq.data.image_base64 ?? "";
-    const visionResult = await detectFamilyFromImage(imageBase64);
-    if (visionResult) {
-      detected = visionResult.detected;
-      signalCounts = visionResult.signals;
+    const vision = await detectFamilyFromImage(imageBase64);
+    if (vision) {
       selectedDetectorPath = "image_gemini_detector";
+      detected = vision.detected;
+      compareSignals = vision.compare;
+      timesSignals = vision.times;
     } else {
-      const decodedText = decodeBase64Text(imageBase64);
-      const resByDecoded = detectFamily(decodedText);
-      detected = resByDecoded.detected;
-      signalCounts = resByDecoded.signals;
       selectedDetectorPath = "image_base64_decode_text_detector";
+      const det = detectFamily(decodeBase64Text(imageBase64));
+      detected = det.detected;
+      compareSignals = det.compare;
+      timesSignals = det.times;
     }
   }
 
   const detectedFamilyBeforeFallback = detected.family;
-
   const needConfirm = detected.confidence < DETECT_CONFIDENCE_THRESHOLD || detected.family === "unknown";
-  const candidateFamilies = problemFamilySchema.options;
-  const generationFamily: ProblemFamily = detected.family === "unknown" ? "a_plus_blank_eq_b" : detected.family;
+  const generationFamily: ProblemFamily | null =
+    detected.family === "unknown" ? (detected.block_fallback ? null : null) : detected.family;
   const detectedFamilyAfterFallback = generationFamily;
 
   console.log(
     JSON.stringify({
       event: "micro_generate_detection",
       request_id: requestId,
-      signal_counts: signalCounts,
-      compare_score: signalCounts.compare_score,
+      signal_counts: compareSignals,
+      compare_score: compareSignals.compare_score,
+      times_signal_counts: timesSignals,
       detected_family_before_fallback: detectedFamilyBeforeFallback,
-      detected_family_after_fallback: detectedFamilyAfterFallback
+      detected_family_after_fallback: detectedFamilyAfterFallback,
+      block_arithmetic_fallback: detected.block_fallback
     })
   );
+
+  const policy = countPolicy(detected.family, parsedReq.data.N);
 
   const rngSeed = hashToSeed(
     JSON.stringify({
       input: parsedReq.data.text ? normalizeText(parsedReq.data.text) : parsedReq.data.image_base64 ?? "",
-      N: parsedReq.data.N,
+      N: policy.appliedCount,
       difficulty: parsedReq.data.difficulty,
       seed: String(parsedReq.data.seed),
-      family: generationFamily
+      family: generationFamily ?? "unknown"
     })
   );
   const rng = mulberry32(rngSeed);
@@ -562,42 +782,97 @@ microGenerateRouter.post("/", async (req, res) => {
   const reasons: Record<string, number> = {};
   let rejectedCount = 0;
 
-  for (let i = 0; i < MAX_REGEN_TRIES && problems.length < parsedReq.data.N; i += 1) {
-    const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, detected.parsed_example);
-    const duplicateKey = problem.render_text;
+  if (generationFamily) {
+    for (let i = 0; i < MAX_REGEN_TRIES && problems.length < policy.appliedCount; i += 1) {
+      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, detected.parsed_example);
+      const duplicateKey = JSON.stringify({ render_text: problem.render_text, params: problem.params });
 
-    if (seen.has(duplicateKey)) {
-      rejectedCount += 1;
-      bumpReason(reasons, "duplicate");
-      continue;
+      if (seen.has(duplicateKey)) {
+        rejectedCount += 1;
+        bumpReason(reasons, "duplicate");
+        continue;
+      }
+
+      const reason = validateProblem(problem, parsedReq.data.difficulty);
+      if (reason) {
+        rejectedCount += 1;
+        bumpReason(reasons, reason);
+        continue;
+      }
+
+      seen.add(duplicateKey);
+      problems.push(problem);
     }
-
-    const reason = validateProblem(problem, parsedReq.data.difficulty);
-    if (reason) {
-      rejectedCount += 1;
-      bumpReason(reasons, reason);
-      continue;
-    }
-
-    seen.add(duplicateKey);
-    problems.push(problem);
+  } else {
+    bumpReason(reasons, "unknown_no_generation");
   }
 
-  const response = {
+  const mode = modeFromFamily(detected.family);
+  const requiredItems = requiredItemsFromMode(mode);
+  const topItems = problems.length > 0 ? problems[0].items : [];
+
+  let response = {
+    spec_version: "micro_problem_render_v1" as const,
     request_id: requestId,
-    schema_version: "micro_generate_response_v1",
-    detected,
+    schema_version: "micro_generate_response_v1" as const,
+    detected_mode: mode,
+    intent: detected.intent,
+    confidence: detected.confidence,
+    required_items: requiredItems,
+    items: topItems,
+    detected: {
+      family: detected.family,
+      confidence: detected.confidence,
+      parsed_example: detected.parsed_example
+    },
     problems,
     rejected_count: rejectedCount,
     reasons,
     need_confirm: needConfirm,
-    ...(needConfirm ? { confirm_choices: [...candidateFamilies] } : {}),
+    ...(needConfirm ? { confirm_choices: [...problemFamilySchema.options] } : {}),
     debug: {
       deploy_commit: DEPLOY_COMMIT,
       build_timestamp: BUILD_TIMESTAMP,
       selected_detector_path: selectedDetectorPath
+    },
+    meta: {
+      family: String(detected.family),
+      count_policy: "server_enforced",
+      max_count: policy.maxCount,
+      applied_count: policy.appliedCount,
+      note: generationFamily ? policy.note : "insufficient_signals",
+      seed: String(parsedReq.data.seed),
+      sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text }))))
     }
   };
+
+  const topLevelModeMismatch =
+    (response.detected_mode === "word_problem" && !response.required_items.includes("prompt")) ||
+    (response.detected_mode === "equation" && !response.required_items.includes("expression"));
+  const topLevelItemsMismatch = response.required_items.some((req) => {
+    if (req === "prompt") return !response.items.some((i) => i.type === "prompt");
+    if (req === "choices") return !response.items.some((i) => i.type === "choices");
+    if (req === "expression") return !response.items.some((i) => i.type === "expression");
+    return false;
+  });
+
+  if (topLevelModeMismatch || topLevelItemsMismatch) {
+    response = {
+      ...response,
+      detected_mode: "unknown",
+      intent: "unknown_intent",
+      required_items: [],
+      items: [],
+      problems: [],
+      need_confirm: true,
+      confirm_choices: [...problemFamilySchema.options],
+      meta: {
+        ...response.meta,
+        applied_count: 0,
+        note: "mode_items_mismatch"
+      }
+    };
+  }
 
   const validated = microGenerateResponseSchema.safeParse(response);
   if (!validated.success) {

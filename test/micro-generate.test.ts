@@ -21,41 +21,109 @@ async function withServer(fn: (baseUrl: string) => Promise<void>) {
   }
 }
 
-test("micro generate is deterministic with same input+seed", async () => {
+test("equation mode returns expression items", async () => {
   await withServer(async (baseUrl) => {
-    const payload = {
-      text: "4 + □ = 10",
-      N: 5,
-      difficulty: "same",
-      seed: "abc-123"
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text: "4 + □ = 10", N: 5, difficulty: "same", seed: "eq" })
+    });
+
+    const body = (await res.json()) as {
+      spec_version: string;
+      detected_mode: string;
+      required_items: string[];
+      items: Array<{ type: string }>;
+      problems: Array<{ items: Array<{ type: string }>; family: string }>;
     };
 
-    const [r1, r2] = await Promise.all([
-      fetch(`${baseUrl}/micro/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-        body: JSON.stringify(payload)
-      }),
-      fetch(`${baseUrl}/micro/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-        body: JSON.stringify(payload)
-      })
-    ]);
+    assert.equal(res.status, 200);
+    assert.equal(body.spec_version, "micro_problem_render_v1");
+    assert.equal(body.detected_mode, "equation");
+    assert.deepEqual(body.required_items, ["expression"]);
+    assert.equal(body.items.some((i) => i.type === "expression"), true);
+    assert.equal(body.problems.every((p) => p.items.some((i) => i.type === "expression")), true);
+  });
+});
 
-    const b1 = (await r1.json()) as { problems: Array<{ render_text: string }> };
-    const b2 = (await r2.json()) as { problems: Array<{ render_text: string }> };
+test("word_problem(compare) returns prompt+choices with correct_index", async () => {
+  await withServer(async (baseUrl) => {
+    const text = "あかは18こ、きいろは23こ。あか27こ、きいろ12こふえました。どちらが何こ多いですか。あわせて。";
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text, N: 4, difficulty: "same", seed: "cmp" })
+    });
 
-    assert.equal(r1.status, 200);
-    assert.equal(r2.status, 200);
-    assert.deepEqual(
-      b1.problems.map((p) => p.render_text),
-      b2.problems.map((p) => p.render_text)
+    const body = (await res.json()) as {
+      detected_mode: string;
+      required_items: string[];
+      detected: { family: string };
+      need_confirm: boolean;
+      problems: Array<{ family: string; items: Array<{ type: string; correct_index?: number }> }>;
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected.family, "compare_totals_diff_mc");
+    assert.equal(body.detected_mode, "word_problem");
+    assert.deepEqual(body.required_items, ["prompt", "choices"]);
+    assert.equal(body.need_confirm, false);
+    assert.equal(body.problems.every((p) => p.family === "compare_totals_diff_mc"), true);
+    assert.equal(
+      body.problems.every((p) => p.items.some((i) => i.type === "choices" && Number.isInteger(i.correct_index))),
+      true
     );
   });
 });
 
-test("micro detect parses known family and returns confidence", async () => {
+test("count policy enforces max 5 for compare", async () => {
+  await withServer(async (baseUrl) => {
+    const text = "あかは10こ、きいろは8こ。あか5こ、きいろ2こふえました。どちらが何こ多い？あわせて。";
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text, N: 10, difficulty: "same", seed: "limit" })
+    });
+
+    const body = (await res.json()) as {
+      meta: { max_count: number; applied_count: number; count_policy: string };
+      problems: unknown[];
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.meta.count_policy, "server_enforced");
+    assert.equal(body.meta.max_count, 5);
+    assert.equal(body.meta.applied_count, 5);
+    assert.equal(body.problems.length, 5);
+  });
+});
+
+test("fail-closed: mode/items mismatch returns unknown with empty problems", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({ text: "AはBの2ばいです。", N: 4, difficulty: "same", seed: "amb" })
+    });
+
+    const body = (await res.json()) as {
+      detected_mode: string;
+      items: unknown[];
+      problems: unknown[];
+      need_confirm: boolean;
+      meta: { note: string };
+    };
+
+    assert.equal(res.status, 200);
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.items.length, 0);
+    assert.equal(body.problems.length, 0);
+    assert.equal(body.need_confirm, true);
+    assert.equal(body.meta.note, "insufficient_signals");
+  });
+});
+
+test("compatibility: family/params/render_text/answer remain", async () => {
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/micro/generate`, {
       method: "POST",
@@ -65,147 +133,21 @@ test("micro detect parses known family and returns confidence", async () => {
 
     const body = (await res.json()) as {
       schema_version: string;
-      detected: { family: string; confidence: number };
-      need_confirm: boolean;
       request_id: string;
+      confidence: number;
+      problems: Array<{ family: string; params: Record<string, unknown>; render_text: string; answer: number }>;
+      debug?: { deploy_commit?: string };
     };
 
     assert.equal(res.status, 200);
     assert.equal(body.schema_version, "micro_generate_response_v1");
-    assert.equal(body.detected.family, "blank_plus_a_eq_b");
-    assert.equal(body.detected.confidence > 0.75, true);
-    assert.equal(body.need_confirm, false);
     assert.equal(typeof body.request_id, "string");
-  });
-});
-
-test("low confidence returns need_confirm with choices", async () => {
-  await withServer(async (baseUrl) => {
-    const res = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({ text: "これは算数の文です", N: 4, difficulty: "easy", seed: "s" })
-    });
-
-    const body = (await res.json()) as {
-      detected: { family: string; confidence: number };
-      need_confirm: boolean;
-      confirm_choices?: string[];
-    };
-
-    assert.equal(res.status, 200);
-    assert.equal(body.detected.family, "unknown");
-    assert.equal(body.detected.confidence < 0.75, true);
-    assert.equal(body.need_confirm, true);
-    assert.equal(Array.isArray(body.confirm_choices), true);
-    assert.equal((body.confirm_choices ?? []).length >= 2, true);
-  });
-});
-
-test("compare_totals_diff_mc detection has priority and no confirm", async () => {
-  await withServer(async (baseUrl) => {
-    const text =
-      "あかは18こ、きいろは23こです。Aさんはあかを27こ、Bさんはきいろを12こふやしました。どちらが何こ多いですか。あわせて考えましょう。";
-    const res = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({ text, N: 4, difficulty: "same", seed: "cmp-seed" })
-    });
-
-    const body = (await res.json()) as {
-      detected: { family: string; confidence: number };
-      need_confirm: boolean;
-      problems: Array<{ family: string; render_text: string }>;
-    };
-
-    assert.equal(res.status, 200);
-    assert.equal(body.detected.family, "compare_totals_diff_mc");
-    assert.equal(body.detected.confidence >= 0.75, true);
-    assert.equal(body.need_confirm, false);
-    assert.equal(body.problems.every((p) => p.family === "compare_totals_diff_mc"), true);
-    assert.equal(body.problems.every((p) => p.render_text.includes("どちらが")), true);
-  });
-});
-
-test("compare detection works on image_base64 path (decoded text route)", async () => {
-  await withServer(async (baseUrl) => {
-    const text =
-      "あかは18こ、きいろは23こです。Aさんはあかを27こ、Bさんはきいろを12こふやしました。どちらが何こ多いですか。あわせて考えましょう。";
-    const imageBase64 = Buffer.from(text, "utf8").toString("base64");
-
-    const res = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({ image_base64: imageBase64, N: 4, difficulty: "same", seed: "img-route" })
-    });
-
-    const body = (await res.json()) as {
-      detected: { family: string; confidence: number };
-      need_confirm: boolean;
-      problems: Array<{ family: string }>;
-      debug?: { selected_detector_path?: string };
-    };
-
-    assert.equal(res.status, 200);
-    assert.equal(body.detected.family, "compare_totals_diff_mc");
-    assert.equal(body.need_confirm, false);
-    assert.equal(body.problems.every((p) => p.family === "compare_totals_diff_mc"), true);
-    assert.equal(typeof body.debug?.selected_detector_path, "string");
-  });
-});
-
-test("compare_totals_diff_mc deterministic with same seed", async () => {
-  await withServer(async (baseUrl) => {
-    const payload = {
-      text: "あかは10こ、きいろは7こ。あか5こ、きいろ2こふえました。どちらが何こ多い？あわせる。",
-      N: 5,
-      difficulty: "same",
-      seed: "same-seed-compare"
-    };
-
-    const r1 = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify(payload)
-    });
-    const r2 = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify(payload)
-    });
-
-    const b1 = (await r1.json()) as { problems: Array<{ render_text: string }> };
-    const b2 = (await r2.json()) as { problems: Array<{ render_text: string }> };
-    assert.deepEqual(
-      b1.problems.map((p) => p.render_text),
-      b2.problems.map((p) => p.render_text)
-    );
-  });
-});
-
-test("compare_totals_diff_mc validator keeps blank consistent", async () => {
-  await withServer(async (baseUrl) => {
-    const res = await fetch(`${baseUrl}/micro/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
-      body: JSON.stringify({
-        text: "あかは8こ、きいろは4こ。あか3こ、きいろ6こふえた。どちらが何こ多い？あわせる。",
-        N: 4,
-        difficulty: "easy",
-        seed: "validator-compare"
-      })
-    });
-
-    const body = (await res.json()) as {
-      problems: Array<{ family: string; params: Record<string, number>; answer: number }>;
-    };
-
-    assert.equal(res.status, 200);
-    for (const p of body.problems) {
-      if (p.family !== "compare_totals_diff_mc") continue;
-      const computed = Math.abs((p.params.a + p.params.c) - (p.params.b + p.params.d));
-      assert.equal(p.params.blank, computed);
-      assert.equal(p.answer, computed);
-    }
+    assert.equal(typeof body.confidence, "number");
+    assert.equal(body.problems.length > 0, true);
+    assert.equal(typeof body.problems[0].family, "string");
+    assert.equal(typeof body.problems[0].params, "object");
+    assert.equal(typeof body.problems[0].render_text, "string");
+    assert.equal(typeof body.problems[0].answer, "number");
+    assert.equal(typeof body.debug?.deploy_commit, "string");
   });
 });

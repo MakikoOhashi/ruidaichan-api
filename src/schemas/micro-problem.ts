@@ -5,10 +5,45 @@ export const problemFamilySchema = z.enum([
   "blank_plus_a_eq_b",
   "a_plus_b_eq_blank",
   "b_minus_a_eq_blank",
-  "compare_totals_diff_mc"
+  "compare_totals_diff_mc",
+  "times_scale_mc"
 ]);
 
 export const difficultySchema = z.enum(["easy", "same", "hard"]);
+export const detectedModeSchema = z.enum(["equation", "word_problem", "unknown"]);
+
+export const renderItemSchema = z.union([
+  z
+    .object({
+      type: z.literal("prompt"),
+      slot: z.literal("stem"),
+      text: z.string().min(1)
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("expression"),
+      slot: z.literal("expr"),
+      text: z.string().min(1)
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("blank"),
+      slot: z.literal("expr_blank"),
+      symbol: z.string().min(1)
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("choices"),
+      slot: z.literal("options"),
+      style: z.literal("mc"),
+      choices: z.array(z.string().min(1)).min(2),
+      correct_index: z.number().int().min(0)
+    })
+    .strict()
+]);
 
 export const microGenerateRequestSchema = z
   .object({
@@ -32,9 +67,13 @@ export const microProblemDslSchema = z
   .object({
     spec_version: z.literal("micro_problem_dsl_v1"),
     family: problemFamilySchema,
-    params: z.record(z.number().int()),
+    params: z.record(z.union([z.number().int(), z.string(), z.array(z.string())])),
     render_text: z.string().min(1),
-    answer: z.number().int()
+    answer: z.number().int(),
+    detected_mode: detectedModeSchema,
+    intent: z.string().min(1),
+    required_items: z.array(z.enum(["prompt", "choices", "expression"])),
+    items: z.array(renderItemSchema)
   })
   .strict();
 
@@ -48,8 +87,14 @@ export const detectedSchema = z
 
 export const microGenerateResponseSchema = z
   .object({
+    spec_version: z.literal("micro_problem_render_v1"),
     request_id: z.string().min(1),
     schema_version: z.literal("micro_generate_response_v1"),
+    detected_mode: detectedModeSchema,
+    intent: z.string().min(1),
+    confidence: z.number().min(0).max(1),
+    required_items: z.array(z.enum(["prompt", "choices", "expression"])),
+    items: z.array(renderItemSchema),
     detected: detectedSchema,
     problems: z.array(microProblemDslSchema),
     rejected_count: z.number().int().nonnegative(),
@@ -63,7 +108,18 @@ export const microGenerateResponseSchema = z
         selected_detector_path: z.string()
       })
       .strict()
-      .optional()
+      .optional(),
+    meta: z
+      .object({
+        family: z.string(),
+        count_policy: z.string(),
+        max_count: z.number().int().positive(),
+        applied_count: z.number().int().nonnegative(),
+        note: z.string(),
+        seed: z.string().optional(),
+        sha: z.string().optional()
+      })
+      .strict()
   })
   .strict()
   .superRefine((value, ctx) => {
