@@ -21,6 +21,24 @@ async function withServer(fn: (baseUrl: string) => Promise<void>) {
   }
 }
 
+async function withMockFetch(
+  handler: (
+    original: typeof fetch,
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ) => Promise<Response>,
+  fn: () => Promise<void>
+) {
+  const original = globalThis.fetch;
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+    handler(original, input, init)) as typeof fetch;
+  try {
+    await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
 test("equation mode returns expression items", async () => {
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/micro/generate`, {
@@ -149,5 +167,159 @@ test("compatibility: family/params/render_text/answer remain", async () => {
     assert.equal(typeof body.problems[0].render_text, "string");
     assert.equal(typeof body.problems[0].answer, "number");
     assert.equal(typeof body.debug?.deploy_commit, "string");
+  });
+});
+
+test("image fixture is stable across two calls (detector path and mode)", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) {
+      return original(input, init);
+    }
+    const payload = {
+      candidates: [
+        {
+          content: {
+            parts: [
+              {
+                text: JSON.stringify({
+                  family: "compare_totals_diff_mc",
+                  confidence: 0.91,
+                  params: { a: 18, b: 23, c: 27, d: 12 }
+                })
+              }
+            ]
+          }
+        }
+      ]
+    };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const bodyPayload = {
+        image_base64: "data:image/png;base64,ZmFrZS1pbWFnZS1ieXRlcw==",
+        N: 4,
+        difficulty: "same",
+        seed: "fixed-seed"
+      };
+      const headers = { "Content-Type": "application/json", "x-api-key": "test-key" };
+
+      const r1 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(bodyPayload) });
+      const r2 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(bodyPayload) });
+
+      const b1 = (await r1.json()) as { detected_mode: string; debug: { selected_detector_path: string } };
+      const b2 = (await r2.json()) as { detected_mode: string; debug: { selected_detector_path: string } };
+
+      assert.equal(r1.status, 200);
+      assert.equal(r2.status, 200);
+      assert.equal(b1.debug.selected_detector_path, "image_gemini_detector");
+      assert.equal(b2.debug.selected_detector_path, "image_gemini_detector");
+      assert.equal(b1.detected_mode, b2.detected_mode);
+    });
+  });
+});
+
+test("image detector retries once and succeeds without unknown", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let callCount = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) {
+      return original(input, init);
+    }
+    callCount += 1;
+    if (callCount === 1) {
+      return new Response(JSON.stringify({ error: "temporary" }), { status: 503, headers: { "Content-Type": "application/json" } });
+    }
+
+    const payload = {
+      candidates: [
+        {
+          content: {
+            parts: [
+              {
+                text: JSON.stringify({
+                  family: "times_scale_mc",
+                  confidence: 0.88,
+                  params: { base: 15, multiplier: 2 }
+                })
+              }
+            ]
+          }
+        }
+      ]
+    };
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          image_base64: "data:image/png;base64,ZmFrZS1pbWFnZS1ieXRlcw==",
+          N: 4,
+          difficulty: "same",
+          seed: "retry-seed"
+        })
+      });
+
+      const body = (await res.json()) as {
+        detected_mode: string;
+        detected: { family: string };
+        meta: { fallback_count: number };
+        debug: { selected_detector_path: string; detector_fallback_reason: string | null };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.detected.family, "times_scale_mc");
+      assert.equal(body.detected_mode, "word_problem");
+      assert.equal(body.debug.selected_detector_path, "image_gemini_detector");
+      assert.equal(body.debug.detector_fallback_reason, null);
+      assert.equal(body.meta.fallback_count, 1);
+    });
+  });
+});
+
+test("image detector fails twice then returns unknown with concrete note", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) {
+      return original(input, init);
+    }
+    return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          image_base64: "data:image/png;base64,ZmFrZS1pbWFnZS1ieXRlcw==",
+          N: 4,
+          difficulty: "same",
+          seed: "retry-fail-seed"
+        })
+      });
+
+      const body = (await res.json()) as {
+        detected_mode: string;
+        problems: unknown[];
+        meta: { note: string; fallback_count: number };
+        debug: { selected_detector_path: string; detector_fallback_reason: string | null; model_http_status: number | null };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "unknown");
+      assert.equal(body.problems.length, 0);
+      assert.equal(body.meta.note, "model_429");
+      assert.equal(body.meta.fallback_count, 1);
+      assert.equal(body.debug.selected_detector_path, "image_base64_decode_text_detector");
+      assert.equal(body.debug.detector_fallback_reason, "model_429");
+      assert.equal(body.debug.model_http_status, 429);
+    });
   });
 });

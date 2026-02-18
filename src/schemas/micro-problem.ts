@@ -105,7 +105,15 @@ export const microGenerateResponseSchema = z
       .object({
         deploy_commit: z.string(),
         build_timestamp: z.string(),
-        selected_detector_path: z.string()
+        selected_detector_path: z.string(),
+        detector_fallback_reason: z.string().nullable(),
+        image_bytes_length: z.number().int().nonnegative(),
+        mime_type: z.string(),
+        model_name: z.string(),
+        model_http_status: z.number().int().nullable(),
+        ocr_line_count: z.number().int().nonnegative(),
+        keyword_hits: z.number().int().nonnegative(),
+        parse_candidates_count: z.number().int().nonnegative()
       })
       .strict()
       .optional(),
@@ -117,7 +125,11 @@ export const microGenerateResponseSchema = z
         applied_count: z.number().int().nonnegative(),
         note: z.string(),
         seed: z.string().optional(),
-        sha: z.string().optional()
+        sha: z.string().optional(),
+        request_hash: z.string().optional(),
+        detector_version: z.string().optional(),
+        fallback_count: z.number().int().nonnegative().optional(),
+        inference_latency_ms: z.number().int().nonnegative().optional()
       })
       .strict()
   })

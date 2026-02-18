@@ -16,6 +16,7 @@ const DETECT_CONFIDENCE_THRESHOLD = 0.75;
 const MAX_REGEN_TRIES = 250;
 const GEMINI_MODEL = process.env.GEMINI_VISION_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS ?? 8000);
+const DETECTOR_VERSION = "image_route_v2";
 const DEPLOY_COMMIT = process.env.RENDER_GIT_COMMIT ?? process.env.GIT_COMMIT_SHA ?? "unknown";
 const BUILD_TIMESTAMP = process.env.BUILD_TIMESTAMP ?? new Date().toISOString();
 
@@ -44,13 +45,54 @@ type TimesSignals = {
   times_score: number;
 };
 
+type DetectorPath = "text_detector" | "image_gemini_detector" | "image_base64_decode_text_detector";
+
+type FallbackReason =
+  | "gemini_api_key_missing"
+  | "model_timeout"
+  | "model_429"
+  | "model_5xx"
+  | "model_http_error"
+  | "empty_parse"
+  | "decode_text_fallback_failed";
+
+type DecodeFallbackDebug = {
+  ocr_line_count: number;
+  keyword_hits: number;
+  parse_candidates_count: number;
+};
+
+type VisionAttempt = {
+  ok: boolean;
+  status: number | null;
+  error_reason: FallbackReason | null;
+  retriable: boolean;
+  detected?: DetectResult;
+  compare?: CompareSignals;
+  times?: TimesSignals;
+};
+
 function normalizeText(text: string): string {
   return text.normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
+function base64Payload(base64: string): string {
+  return base64.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+}
+
+function imageBytesLength(base64: string): number {
+  const payload = base64Payload(base64);
+  if (!payload) return 0;
+  try {
+    return Buffer.from(payload, "base64").byteLength;
+  } catch {
+    return 0;
+  }
+}
+
 function decodeBase64Text(base64: string): string {
   try {
-    const payload = base64.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+    const payload = base64Payload(base64);
     if (!payload) return "";
     const text = Buffer.from(payload, "base64").toString("utf8");
     return normalizeText(text);
@@ -62,6 +104,25 @@ function decodeBase64Text(base64: string): string {
 function mimeFromInput(base64: string): string {
   const m = base64.match(/^data:([^;,]+)[;,]/);
   return m?.[1] ?? "image/png";
+}
+
+function parseCandidatesCountFromText(text: string): number {
+  let candidates = 0;
+  if (parseByFamily(text)) candidates += 1;
+  if (parseTimesScale(text)) candidates += 1;
+  if (parseCompareTotals(text)) candidates += 1;
+  return candidates;
+}
+
+function buildDecodeFallbackDebug(text: string): DecodeFallbackDebug {
+  const normalized = normalizeText(text);
+  const lineTokens = normalized.split(/[。\n]/).map((x) => x.trim()).filter(Boolean);
+  const keyword_hits = [...normalized.matchAll(/どちら|何こ|何個|あわせ|合計|ばい|倍|[+＋=＝\-－□]/g)].length;
+  return {
+    ocr_line_count: lineTokens.length,
+    keyword_hits,
+    parse_candidates_count: parseCandidatesCountFromText(normalized)
+  };
 }
 
 function hashToSeed(input: string): number {
@@ -372,12 +433,26 @@ function detectFamily(text: string): { detected: DetectResult; compare: CompareS
   };
 }
 
-async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: DetectResult; compare: CompareSignals; times: TimesSignals } | null> {
+async function detectFamilyFromImage(imageBase64: string): Promise<VisionAttempt> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  if (!apiKey) {
+    return {
+      ok: false,
+      status: null,
+      error_reason: "gemini_api_key_missing",
+      retriable: false
+    };
+  }
 
-  const payload = imageBase64.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
-  if (!payload) return null;
+  const payload = base64Payload(imageBase64);
+  if (!payload) {
+    return {
+      ok: false,
+      status: null,
+      error_reason: "empty_parse",
+      retriable: true
+    };
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
@@ -410,12 +485,24 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
       }
     );
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const status = response.status;
+      if (status === 429) {
+        return { ok: false, status, error_reason: "model_429", retriable: true };
+      }
+      if (status >= 500) {
+        return { ok: false, status, error_reason: "model_5xx", retriable: true };
+      }
+      return { ok: false, status, error_reason: "model_http_error", retriable: false };
+    }
+
     const json = (await response.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return null;
+    if (!text) {
+      return { ok: false, status: response.status, error_reason: "empty_parse", retriable: true };
+    }
 
     const parsed = JSON.parse(text) as { family?: string; confidence?: number; params?: Record<string, number> };
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence ?? 0)));
@@ -427,6 +514,10 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
       const local = detectFamily(normalized);
       const family = local.detected.parsed_example?.family === "times_scale_mc" ? local.detected.parsed_example : parseTimesScale(`黄色は赤の${multiplier}ばい。赤が${base}本のとき何本？`);
       return {
+        ok: true,
+        status: response.status,
+        error_reason: null,
+        retriable: false,
         detected: {
           family: "times_scale_mc",
           confidence: Math.max(confidence, 0.8),
@@ -446,6 +537,10 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
       const d = Math.max(1, Math.trunc(parsed.params?.d ?? 4));
       const parsed_example = parseCompareTotals(`あか${a}こ きいろ${b}こ あか${c}こ きいろ${d}こ どちらが何こ多い あわせて`);
       return {
+        ok: true,
+        status: response.status,
+        error_reason: null,
+        retriable: false,
         detected: {
           family: "compare_totals_diff_mc",
           confidence: Math.max(confidence, 0.8),
@@ -472,34 +567,23 @@ async function detectFamilyFromImage(imageBase64: string): Promise<{ detected: D
     }
 
     return {
-      detected: {
-        family: "unknown",
-        confidence: Math.min(confidence, 0.7),
-        parsed_example: null,
-        block_fallback: false,
-        intent: "vision_unknown"
-      },
-      compare: {
-        color_hits: 0,
-        two_actor_hits: 0,
-        compare_word_hits: 0,
-        total_word_hits: 0,
-        number_count: 0,
-        compare_score: 0
-      },
-      times: {
-        times_word_hits: 0,
-        question_word_hits: 0,
-        pattern_hit: false,
-        number_count: 0,
-        times_score: 0
-      }
+      ok: false,
+      status: response.status,
+      error_reason: "empty_parse",
+      retriable: true
     };
-  } catch {
-    return null;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return { ok: false, status: null, error_reason: "model_timeout", retriable: true };
+    }
+    return { ok: false, status: null, error_reason: "model_http_error", retriable: false };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | null): { min: number; max: number } {
@@ -707,7 +791,20 @@ microGenerateRouter.post("/", async (req, res) => {
     });
   }
 
-  let selectedDetectorPath = textPresent ? "text_detector" : "image_detector";
+  let selectedDetectorPath: DetectorPath = textPresent ? "text_detector" : "image_gemini_detector";
+  let detectorFallbackReason: FallbackReason | null = null;
+  let modelHttpStatus: number | null = null;
+  let fallbackCount = 0;
+  let inferenceLatencyMs = 0;
+  let decodeDebug: DecodeFallbackDebug = {
+    ocr_line_count: 0,
+    keyword_hits: 0,
+    parse_candidates_count: 0
+  };
+
+  const imageBase64 = parsedReq.data.image_base64 ?? "";
+  const imageBytes = imageBytesLength(imageBase64);
+  const imageMime = hasImageBase64 ? mimeFromInput(imageBase64) : "text/plain";
 
   console.log(
     JSON.stringify({
@@ -729,19 +826,47 @@ microGenerateRouter.post("/", async (req, res) => {
     compareSignals = det.compare;
     timesSignals = det.times;
   } else {
-    const imageBase64 = parsedReq.data.image_base64 ?? "";
-    const vision = await detectFamilyFromImage(imageBase64);
-    if (vision) {
-      selectedDetectorPath = "image_gemini_detector";
+    selectedDetectorPath = "image_gemini_detector";
+    const started = Date.now();
+    const firstAttempt = await detectFamilyFromImage(imageBase64);
+    let vision = firstAttempt;
+    modelHttpStatus = firstAttempt.status;
+
+    if (!firstAttempt.ok && firstAttempt.retriable && (firstAttempt.error_reason === "model_timeout" || firstAttempt.error_reason === "model_429" || firstAttempt.error_reason === "model_5xx" || firstAttempt.error_reason === "empty_parse")) {
+      fallbackCount += 1;
+      await sleep(150);
+      const secondAttempt = await detectFamilyFromImage(imageBase64);
+      vision = secondAttempt;
+      modelHttpStatus = secondAttempt.status ?? modelHttpStatus;
+    }
+
+    inferenceLatencyMs = Date.now() - started;
+
+    if (vision.ok && vision.detected && vision.compare && vision.times) {
       detected = vision.detected;
       compareSignals = vision.compare;
       timesSignals = vision.times;
     } else {
+      detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
       selectedDetectorPath = "image_base64_decode_text_detector";
-      const det = detectFamily(decodeBase64Text(imageBase64));
-      detected = det.detected;
+      const decodedText = decodeBase64Text(imageBase64);
+      decodeDebug = buildDecodeFallbackDebug(decodedText);
+      const det = detectFamily(decodedText);
       compareSignals = det.compare;
       timesSignals = det.times;
+
+      // Fail closed: decode fallback is observational only.
+      detected = {
+        family: "unknown",
+        confidence: 0.35,
+        parsed_example: null,
+        block_fallback: true,
+        intent: "unknown_intent"
+      };
+
+      if (decodeDebug.parse_candidates_count === 0 && !detectorFallbackReason) {
+        detectorFallbackReason = "decode_text_fallback_failed";
+      }
     }
   }
 
@@ -750,6 +875,7 @@ microGenerateRouter.post("/", async (req, res) => {
   const generationFamily: ProblemFamily | null =
     detected.family === "unknown" ? (detected.block_fallback ? null : null) : detected.family;
   const detectedFamilyAfterFallback = generationFamily;
+  const unknownNote = detectorFallbackReason ?? "insufficient_signals";
 
   console.log(
     JSON.stringify({
@@ -833,16 +959,28 @@ microGenerateRouter.post("/", async (req, res) => {
     debug: {
       deploy_commit: DEPLOY_COMMIT,
       build_timestamp: BUILD_TIMESTAMP,
-      selected_detector_path: selectedDetectorPath
+      selected_detector_path: selectedDetectorPath,
+      detector_fallback_reason: detectorFallbackReason,
+      image_bytes_length: imageBytes,
+      mime_type: imageMime,
+      model_name: GEMINI_MODEL,
+      model_http_status: modelHttpStatus,
+      ocr_line_count: decodeDebug.ocr_line_count,
+      keyword_hits: decodeDebug.keyword_hits,
+      parse_candidates_count: decodeDebug.parse_candidates_count
     },
     meta: {
       family: String(detected.family),
       count_policy: "server_enforced",
       max_count: policy.maxCount,
       applied_count: policy.appliedCount,
-      note: generationFamily ? policy.note : "insufficient_signals",
+      note: generationFamily ? policy.note : unknownNote,
       seed: String(parsedReq.data.seed),
-      sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text }))))
+      sha: sha(JSON.stringify(problems.map((p) => ({ f: p.family, t: p.render_text })))),
+      request_hash: sha(parsedReq.data.text ? normalizeText(parsedReq.data.text) : imageBase64),
+      detector_version: DETECTOR_VERSION,
+      fallback_count: fallbackCount,
+      inference_latency_ms: inferenceLatencyMs
     }
   };
 
