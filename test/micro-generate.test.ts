@@ -52,6 +52,7 @@ test("equation mode returns expression items", async () => {
       detected_mode: string;
       required_items: string[];
       items: Array<{ type: string }>;
+      debug: { input_mode: string; selected_detector_path: string };
       problems: Array<{ items: Array<{ type: string }>; family: string }>;
     };
 
@@ -60,6 +61,8 @@ test("equation mode returns expression items", async () => {
     assert.equal(body.detected_mode, "equation");
     assert.deepEqual(body.required_items, ["expression"]);
     assert.equal(body.items.some((i) => i.type === "expression"), true);
+    assert.equal(body.debug.input_mode, "text");
+    assert.equal(body.debug.selected_detector_path, "text_detector");
     assert.equal(body.problems.every((p) => p.items.some((i) => i.type === "expression")), true);
   });
 });
@@ -109,7 +112,7 @@ test("image/ocr equation fallback detects 7 + 9 - 6 = □ as equation", async ()
       assert.equal(body.intent, "equation_add_sub_blank");
       assert.deepEqual(body.required_items, ["expression"]);
       assert.equal(body.items[0]?.type, "expression");
-      assert.equal(body.debug.parse_stage_selected, "equation_regex_fallback");
+      assert.equal(body.debug.parse_stage_selected, "local_ocr_regex");
       assert.equal(body.debug.equation_regex_hit, true);
       assert.equal(body.debug.equation_candidate_source, "detector_text");
     });
@@ -178,6 +181,7 @@ test("word_problem(compare) returns prompt+choices with correct_index", async ()
       required_items: string[];
       detected: { family: string };
       need_confirm: boolean;
+      debug: { input_mode: string; selected_detector_path: string };
       problems: Array<{ family: string; items: Array<{ type: string; correct_index?: number }> }>;
     };
 
@@ -185,12 +189,45 @@ test("word_problem(compare) returns prompt+choices with correct_index", async ()
     assert.equal(body.detected.family, "compare_totals_diff_mc");
     assert.equal(body.detected_mode, "word_problem");
     assert.deepEqual(body.required_items, ["prompt", "choices"]);
+    assert.equal(body.debug.input_mode, "text");
+    assert.equal(body.debug.selected_detector_path, "text_detector");
     assert.equal(body.need_confirm, false);
     assert.equal(body.problems.every((p) => p.family === "compare_totals_diff_mc"), true);
     assert.equal(
       body.problems.every((p) => p.items.some((i) => i.type === "choices" && Number.isInteger(i.correct_index))),
       true
     );
+  });
+});
+
+test("text mode does not run image detector and does not surface model_429", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let modelCallCount = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    modelCallCount += 1;
+    return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({ text: "きょうは いいてんきです。", N: 4, difficulty: "same", seed: "txt-no-image" })
+      });
+      const body = (await res.json()) as {
+        detected_mode: string;
+        debug: { input_mode: string; selected_detector_path: string; unknown_reason: string | null };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.debug.input_mode, "text");
+      assert.equal(body.debug.selected_detector_path, "text_detector");
+      assert.notEqual(body.debug.unknown_reason, "model_429");
+      assert.equal(modelCallCount, 0);
+      assert.equal(body.detected_mode, "unknown");
+    });
   });
 });
 
@@ -241,7 +278,7 @@ test("fail-closed: mode/items mismatch returns unknown with empty problems", asy
   });
 });
 
-test("empty normalized equation input returns unknown with ocr_empty", async () => {
+test("empty normalized equation input returns unknown with ocr_empty_after_fallback", async () => {
   delete process.env.GEMINI_API_KEY;
   await withServer(async (baseUrl) => {
     const res = await fetch(`${baseUrl}/micro/generate`, {
@@ -257,7 +294,7 @@ test("empty normalized equation input returns unknown with ocr_empty", async () 
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "ocr_empty");
+    assert.equal(body.meta.note, "ocr_empty_after_fallback");
     assert.equal(body.debug.equation_candidate_source, "none");
     assert.equal(body.debug.normalize_input_empty, true);
     assert.equal(body.debug.equation_normalized_text, "");
@@ -624,13 +661,15 @@ test("image fixture is stable across two calls (detector path and mode)", async 
       const r1 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(bodyPayload) });
       const r2 = await fetch(`${baseUrl}/micro/generate`, { method: "POST", headers, body: JSON.stringify(bodyPayload) });
 
-      const b1 = (await r1.json()) as { detected_mode: string; debug: { selected_detector_path: string } };
-      const b2 = (await r2.json()) as { detected_mode: string; debug: { selected_detector_path: string } };
+      const b1 = (await r1.json()) as { detected_mode: string; debug: { selected_detector_path: string; input_mode: string } };
+      const b2 = (await r2.json()) as { detected_mode: string; debug: { selected_detector_path: string; input_mode: string } };
 
       assert.equal(r1.status, 200);
       assert.equal(r2.status, 200);
       assert.equal(b1.debug.selected_detector_path, "image_gemini_detector");
       assert.equal(b2.debug.selected_detector_path, "image_gemini_detector");
+      assert.equal(b1.debug.input_mode, "image");
+      assert.equal(b2.debug.input_mode, "image");
       assert.equal(b1.detected_mode, b2.detected_mode);
     });
   });
@@ -698,6 +737,44 @@ test("image detector retries once and succeeds without unknown", async () => {
   });
 });
 
+test("model_429 still returns equation when local OCR regex hits", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  process.env.LOCAL_OCR_STUB_TEXT = "7+9-6=□";
+  try {
+    await withMockFetch(async (original, input, init) => {
+      const url = String(input);
+      if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+      return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
+    }, async () => {
+      await withServer(async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/micro/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+          body: JSON.stringify({
+            image_base64: "data:image/png;base64,ZmFrZS1pbWFnZS1ieXRlcw==",
+            N: 4,
+            difficulty: "same",
+            seed: "local-ocr-hit"
+          })
+        });
+        const body = (await res.json()) as {
+          detected_mode: string;
+          detected: { family: string };
+          debug: { local_regex_hit: boolean; parse_stage_selected: string };
+        };
+
+        assert.equal(res.status, 200);
+        assert.equal(body.detected_mode, "equation");
+        assert.equal(body.detected.family, "a_plus_b_minus_c_eq_blank");
+        assert.equal(body.debug.local_regex_hit, true);
+        assert.equal(body.debug.parse_stage_selected, "local_ocr_regex");
+      });
+    });
+  } finally {
+    delete process.env.LOCAL_OCR_STUB_TEXT;
+  }
+});
+
 test("image detector fails twice then returns unknown with concrete note", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
@@ -730,7 +807,7 @@ test("image detector fails twice then returns unknown with concrete note", async
       assert.equal(res.status, 200);
       assert.equal(body.detected_mode, "unknown");
       assert.equal(body.problems.length, 0);
-      assert.equal(body.meta.note, "model_429");
+      assert.equal(body.meta.note, "ocr_empty_after_fallback");
       assert.equal(body.meta.fallback_count, 1);
       assert.equal(body.debug.selected_detector_path, "image_base64_decode_text_detector");
       assert.equal(body.debug.detector_fallback_reason, "model_429");

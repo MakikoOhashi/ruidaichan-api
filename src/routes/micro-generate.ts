@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { Router } from "express";
 import {
   microGenerateRequestSchema,
@@ -46,7 +50,8 @@ type TimesSignals = {
 };
 
 type DetectorPath = "text_detector" | "image_gemini_detector" | "image_base64_decode_text_detector";
-type ParseStage = "image" | "ocr" | "equation_regex_fallback";
+type ParseStage = "local_ocr_regex" | "ai_refine" | "unknown";
+type OcrPrimaryEngine = "vision" | "tesseract" | "none";
 
 type FallbackReason =
   | "gemini_api_key_missing"
@@ -124,6 +129,76 @@ function decodeBase64Text(base64: string): string {
 function mimeFromInput(base64: string): string {
   const m = base64.match(/^data:([^;,]+)[;,]/);
   return m?.[1] ?? "image/png";
+}
+
+function extensionFromMime(mime: string): string {
+  if (mime.includes("png")) return "png";
+  if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
+  if (mime.includes("webp")) return "webp";
+  return "bin";
+}
+
+function splitOcrLines(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+async function runTesseract(imagePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("tesseract", [imagePath, "stdout", "-l", "jpn+eng", "--psm", "6"], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("tesseract_timeout"));
+    }, 5000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`tesseract_failed:${code}:${stderr.slice(0, 160)}`));
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+async function extractPrimaryOcrFromImage(imageBase64: string): Promise<{ engine: OcrPrimaryEngine; lines: string[]; raw: string }> {
+  const stubText = process.env.LOCAL_OCR_STUB_TEXT;
+  if (stubText && stubText.trim()) {
+    const raw = stubText.trim();
+    return { engine: "tesseract", lines: splitOcrLines(raw), raw };
+  }
+
+  const mime = mimeFromInput(imageBase64);
+  const payload = base64Payload(imageBase64);
+  if (!payload) return { engine: "none", lines: [], raw: "" };
+  if (!mime.startsWith("image/")) return { engine: "none", lines: [], raw: "" };
+
+  const bytes = Buffer.from(payload, "base64");
+  const dir = await mkdtemp(join(tmpdir(), "ruidaichan-ocr-"));
+  const file = join(dir, `input.${extensionFromMime(mime)}`);
+  try {
+    await writeFile(file, bytes);
+    const out = (await runTesseract(file)).trim();
+    if (!out) return { engine: "none", lines: [], raw: "" };
+    return { engine: "tesseract", lines: splitOcrLines(out), raw: out };
+  } catch {
+    return { engine: "none", lines: [], raw: "" };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 function parseCandidatesCountFromText(text: string): number {
@@ -783,6 +858,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function jitterMs(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | null): { min: number; max: number } {
   if (difficulty === "easy") return { min: 0, max: 9 };
   if (difficulty === "hard") return { min: 5, max: 30 };
@@ -1046,7 +1125,7 @@ microGenerateRouter.post("/", async (req, res) => {
   let modelHttpStatus: number | null = null;
   let fallbackCount = 0;
   let inferenceLatencyMs = 0;
-  let parseStageSelected: ParseStage = hasImageBase64 ? "image" : "ocr";
+  let parseStageSelected: ParseStage = "unknown";
   let equationRegexHit = false;
   let equationNormalizedText = "";
   let equationCompactText = "";
@@ -1059,6 +1138,8 @@ microGenerateRouter.post("/", async (req, res) => {
   let detectorParsedText = "";
   let rawOcrText = "";
   let ocrLines: string[] = [];
+  let ocrPrimaryEngine: OcrPrimaryEngine = "none";
+  let localRegexHit = false;
   let decodeDebug: DecodeFallbackDebug = {
     ocr_line_count: 0,
     keyword_hits: 0,
@@ -1068,6 +1149,7 @@ microGenerateRouter.post("/", async (req, res) => {
   const imageBase64 = parsedReq.data.image_base64 ?? "";
   const imageBytes = imageBytesLength(imageBase64);
   const imageMime = hasImageBase64 ? mimeFromInput(imageBase64) : "text/plain";
+  const inputMode: "text" | "image" | "none" = parsedReq.data.text ? "text" : hasImageBase64 ? "image" : "none";
 
   console.log(
     JSON.stringify({
@@ -1083,57 +1165,126 @@ microGenerateRouter.post("/", async (req, res) => {
   let compareSignals: CompareSignals;
   let timesSignals: TimesSignals;
   if (parsedReq.data.text) {
-    parseStageSelected = "ocr";
+    ocrPrimaryEngine = "vision";
     rawOcrText = parsedReq.data.text;
-    ocrLines = parsedReq.data.text.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+    ocrLines = splitOcrLines(parsedReq.data.text);
     const det = detectFamily(parsedReq.data.text);
     detected = det.detected;
     compareSignals = det.compare;
     timesSignals = det.times;
   } else {
-    selectedDetectorPath = "image_gemini_detector";
-    parseStageSelected = "image";
-    const started = Date.now();
-    const firstAttempt = await detectFamilyFromImage(imageBase64);
-    let vision = firstAttempt;
-    modelHttpStatus = firstAttempt.status;
+    const primaryOcr = await extractPrimaryOcrFromImage(imageBase64);
+    ocrPrimaryEngine = primaryOcr.engine;
+    ocrLines = primaryOcr.lines;
+    rawOcrText = primaryOcr.raw;
+    decodeDebug = buildDecodeFallbackDebug(primaryOcr.raw);
 
-    if (!firstAttempt.ok && firstAttempt.retriable && (firstAttempt.error_reason === "model_timeout" || firstAttempt.error_reason === "model_429" || firstAttempt.error_reason === "model_5xx" || firstAttempt.error_reason === "empty_parse")) {
-      fallbackCount += 1;
-      await sleep(150);
-      const secondAttempt = await detectFamilyFromImage(imageBase64);
-      vision = secondAttempt;
-      modelHttpStatus = secondAttempt.status ?? modelHttpStatus;
-    }
-    detectorParsedText = vision.detector_text ?? detectorParsedText;
-
-    inferenceLatencyMs = Date.now() - started;
-
-    if (vision.ok && vision.detected && vision.compare && vision.times) {
-      detectorParsedText = vision.detector_text ?? "";
-      detected = vision.detected;
-      compareSignals = vision.compare;
-      timesSignals = vision.times;
+    const localCandidate = buildEquationCandidateText({
+      ocr_lines: ocrLines,
+      raw_ocr: rawOcrText
+    });
+    if (localCandidate.text) {
+      const localParsed = equationFallbackParser(localCandidate.text);
+      if (localParsed) {
+        localRegexHit = true;
+        equationRegexHit = true;
+        equationCandidateSource = localCandidate.source;
+        equationCandidateLength = localCandidate.text.length;
+        equationNormalizedText = localParsed.normalized_text;
+        equationCompactText = localParsed.compact_text;
+        parseStageSelected = "local_ocr_regex";
+        detected = {
+          family: localParsed.parsed.family,
+          confidence: 0.95,
+          parsed_example: localParsed.parsed,
+          block_fallback: false,
+          intent: intentFromFamily(localParsed.parsed.family)
+        };
+        const det = detectFamily(localParsed.normalized_text);
+        compareSignals = det.compare;
+        timesSignals = det.times;
+      } else {
+        selectedDetectorPath = "image_gemini_detector";
+        const started = Date.now();
+        const firstAttempt = await detectFamilyFromImage(imageBase64);
+        let vision = firstAttempt;
+        modelHttpStatus = firstAttempt.status;
+        if (
+          !firstAttempt.ok &&
+          firstAttempt.retriable &&
+          (firstAttempt.error_reason === "model_timeout" ||
+            firstAttempt.error_reason === "model_429" ||
+            firstAttempt.error_reason === "model_5xx" ||
+            firstAttempt.error_reason === "empty_parse")
+        ) {
+          fallbackCount += 1;
+          await sleep(jitterMs(250, 600));
+          const secondAttempt = await detectFamilyFromImage(imageBase64);
+          vision = secondAttempt;
+          modelHttpStatus = secondAttempt.status ?? modelHttpStatus;
+        }
+        inferenceLatencyMs = Date.now() - started;
+        detectorParsedText = vision.detector_text ?? "";
+        if (vision.ok && vision.detected && vision.compare && vision.times) {
+          parseStageSelected = "ai_refine";
+          detected = vision.detected;
+          compareSignals = vision.compare;
+          timesSignals = vision.times;
+        } else {
+          detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
+          selectedDetectorPath = "image_base64_decode_text_detector";
+          const det = detectFamily("");
+          compareSignals = det.compare;
+          timesSignals = det.times;
+          detected = {
+            family: "unknown",
+            confidence: 0.35,
+            parsed_example: null,
+            block_fallback: true,
+            intent: "unknown_intent"
+          };
+        }
+      }
     } else {
-      detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
-      selectedDetectorPath = "image_base64_decode_text_detector";
-      parseStageSelected = "ocr";
-      decodeDebug = buildDecodeFallbackDebug("");
-      const det = detectFamily("");
-      compareSignals = det.compare;
-      timesSignals = det.times;
-
-      // Fail closed: decode fallback is observational only.
-      detected = {
-        family: "unknown",
-        confidence: 0.35,
-        parsed_example: null,
-        block_fallback: true,
-        intent: "unknown_intent"
-      };
-
-      if (decodeDebug.parse_candidates_count === 0 && !detectorFallbackReason) {
-        detectorFallbackReason = "decode_text_fallback_failed";
+      selectedDetectorPath = "image_gemini_detector";
+      const started = Date.now();
+      const firstAttempt = await detectFamilyFromImage(imageBase64);
+      let vision = firstAttempt;
+      modelHttpStatus = firstAttempt.status;
+      if (
+        !firstAttempt.ok &&
+        firstAttempt.retriable &&
+        (firstAttempt.error_reason === "model_timeout" ||
+          firstAttempt.error_reason === "model_429" ||
+          firstAttempt.error_reason === "model_5xx" ||
+          firstAttempt.error_reason === "empty_parse")
+      ) {
+        fallbackCount += 1;
+        await sleep(jitterMs(250, 600));
+        const secondAttempt = await detectFamilyFromImage(imageBase64);
+        vision = secondAttempt;
+        modelHttpStatus = secondAttempt.status ?? modelHttpStatus;
+      }
+      inferenceLatencyMs = Date.now() - started;
+      detectorParsedText = vision.detector_text ?? "";
+      if (vision.ok && vision.detected && vision.compare && vision.times) {
+        parseStageSelected = "ai_refine";
+        detected = vision.detected;
+        compareSignals = vision.compare;
+        timesSignals = vision.times;
+      } else {
+        detectorFallbackReason = vision.error_reason ?? "decode_text_fallback_failed";
+        selectedDetectorPath = "image_base64_decode_text_detector";
+        const det = detectFamily("");
+        compareSignals = det.compare;
+        timesSignals = det.times;
+        detected = {
+          family: "unknown",
+          confidence: 0.35,
+          parsed_example: null,
+          block_fallback: true,
+          intent: "unknown_intent"
+        };
       }
     }
   }
@@ -1162,12 +1313,13 @@ microGenerateRouter.post("/", async (req, res) => {
   }
 
   // Required pass before unknown: equation regex fallback over OCR-like candidates.
-  const fallback = eqCandidate.text && !binaryCandidateRejected ? equationFallbackParser(eqCandidate.text) : null;
+  const fallback = !localRegexHit && eqCandidate.text && !binaryCandidateRejected ? equationFallbackParser(eqCandidate.text) : null;
   if (fallback) {
+    localRegexHit = true;
     equationRegexHit = true;
     equationNormalizedText = fallback.normalized_text;
     equationCompactText = fallback.compact_text;
-    parseStageSelected = "equation_regex_fallback";
+    parseStageSelected = "local_ocr_regex";
     detected = {
       family: fallback.parsed.family,
       confidence: 0.92,
@@ -1180,13 +1332,13 @@ microGenerateRouter.post("/", async (req, res) => {
     timesSignals = det.times;
   } else if (detected.family === "unknown") {
     if (binaryCandidateRejected) upstreamUnknownReason = "binary_candidate_rejected";
-    else if (detectorFallbackReason === "model_429" || detectorFallbackReason === "model_timeout" || detectorFallbackReason === "model_5xx" || detectorFallbackReason === "model_http_error") {
-      upstreamUnknownReason = detectorFallbackReason;
-    }
+    else if (normalizeInputEmpty && hasImageBase64) upstreamUnknownReason = "ocr_empty_after_fallback";
+    else if (detectorFallbackReason === "model_429" || detectorFallbackReason === "model_timeout" || detectorFallbackReason === "model_5xx" || detectorFallbackReason === "model_http_error") upstreamUnknownReason = detectorFallbackReason;
     else if (normalizeInputEmpty) upstreamUnknownReason = "ocr_empty";
     else if (detectorFallbackReason === "empty_parse") upstreamUnknownReason = "empty_parse_upstream";
     else if (detectorFallbackReason) upstreamUnknownReason = detectorFallbackReason;
     else upstreamUnknownReason = "equation_regex_miss";
+    parseStageSelected = "unknown";
   }
 
   const detectedFamilyBeforeFallback = detected.family;
@@ -1297,6 +1449,7 @@ microGenerateRouter.post("/", async (req, res) => {
     debug: {
       deploy_commit: DEPLOY_COMMIT,
       build_timestamp: BUILD_TIMESTAMP,
+      input_mode: inputMode,
       selected_detector_path: selectedDetectorPath,
       detector_fallback_reason: detectorFallbackReason,
       image_bytes_length: imageBytes,
@@ -1304,12 +1457,15 @@ microGenerateRouter.post("/", async (req, res) => {
       model_name: GEMINI_MODEL,
       model_http_status: modelHttpStatus,
       ocr_line_count: decodeDebug.ocr_line_count,
+      ocr_primary_engine: ocrPrimaryEngine,
+      ocr_primary_line_count: ocrLines.length,
       keyword_hits: decodeDebug.keyword_hits,
       parse_candidates_count: decodeDebug.parse_candidates_count,
       prompt_verb: selectedTheme?.verb_exist ?? null,
       prompt_unit: selectedTheme?.unit ?? null,
       lexicon_version: LEXICON_VERSION,
       parse_stage_selected: parseStageSelected,
+      local_regex_hit: localRegexHit,
       equation_regex_hit: equationRegexHit,
       equation_normalized_text: equationNormalizedText,
       equation_compact_text: equationCompactText,
