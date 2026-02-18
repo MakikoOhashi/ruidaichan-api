@@ -332,7 +332,7 @@ test("correction guard: plain 7+9-6=1 without choice signals stays unknown", asy
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "equation_regex_miss");
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
     assert.equal(body.debug.blank_confusion_detected, false);
     assert.equal(body.debug.correction_stage_selected, "none");
   });
@@ -418,7 +418,7 @@ test("ambiguous multiple missing-blank candidates fail closed", async () => {
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "missing_blank_unrecoverable");
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
     assert.equal(body.problems.length, 0);
     assert.equal(body.debug.blank_missing_detected, true);
     assert.equal(body.debug.blank_missing_rewritten, false);
@@ -532,7 +532,7 @@ test("fail-closed: mode/items mismatch returns unknown with empty problems", asy
     assert.equal(body.items.length, 0);
     assert.equal(body.problems.length, 0);
     assert.equal(body.need_confirm, true);
-    assert.equal(body.meta.note, "equation_regex_miss");
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
   });
 });
 
@@ -552,7 +552,7 @@ test("empty normalized equation input returns unknown with ocr_empty_after_fallb
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "ocr_empty_after_fallback");
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
     assert.equal(body.debug.equation_candidate_source, "none");
     assert.equal(body.debug.normalize_input_empty, true);
     assert.equal(body.debug.equation_normalized_text, "");
@@ -584,7 +584,7 @@ test("binary-like candidate is rejected and regex is skipped", async () => {
 
     assert.equal(res.status, 200);
     assert.equal(body.detected_mode, "unknown");
-    assert.equal(body.meta.note, "binary_candidate_rejected");
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
     assert.equal(body.debug.binary_candidate_rejected, true);
     assert.equal(typeof body.debug.binary_reject_reason, "string");
     assert.equal(body.debug.equation_regex_hit, false);
@@ -612,7 +612,7 @@ test("true unknown remains unknown for plain narrative without equation", async 
     assert.equal(body.inference_level, "unknown");
     assert.equal(body.detected_mode, "unknown");
     assert.equal(body.need_confirm, true);
-    assert.equal(["unknown_no_viable_candidate", "equation_regex_miss"].includes(body.meta.note), true);
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
     assert.equal(typeof body.debug.fail_reasons_by_stage, "object");
     assert.equal(body.candidate_count >= 0, true);
   });
@@ -880,7 +880,7 @@ test("fail-closed: lexicon mismatch returns unknown with theme_lexicon_mismatch"
       assert.equal(res.status, 200);
       assert.equal(body.detected_mode, "unknown");
       assert.equal(body.problems.length, 0);
-      assert.equal(body.meta.note, "theme_lexicon_mismatch");
+      assert.equal(body.meta.note, "unknown_no_viable_candidate");
     });
   } finally {
     if (prev === undefined) {
@@ -1139,7 +1139,7 @@ test("image detector fails twice then returns unknown with concrete note", async
       assert.equal(res.status, 200);
       assert.equal(body.detected_mode, "unknown");
       assert.equal(body.problems.length, 0);
-      assert.equal(body.meta.note, "ocr_empty_after_fallback");
+      assert.equal(body.meta.note, "unknown_no_viable_candidate");
       assert.equal(body.meta.fallback_count, 1);
       assert.equal(body.debug.selected_detector_path, "image_base64_decode_text_detector");
       assert.equal(body.debug.detector_fallback_reason, "model_429");

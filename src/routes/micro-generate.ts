@@ -66,12 +66,20 @@ type EquationCandidateSource = "detector_text" | "ocr_lines" | "raw_ocr" | "none
 type CorrectionStage = "deterministic" | "ai_assist" | "none";
 type InferenceLevel = "strict" | "soft" | "unknown";
 type CandidateSourceStage = "deterministic" | "heuristic" | "ai_assist";
+type InputForm = "equation_like" | "word_problem_like" | "unknown_like";
 
 type Candidate = {
   detected: DetectResult;
   source_stage: CandidateSourceStage;
   inference_level: Exclude<InferenceLevel, "unknown">;
   score: number;
+};
+
+type IntentCandidate = {
+  intent: string;
+  detected_mode: "equation" | "word_problem" | "unknown";
+  confidence: number;
+  source_stage: CandidateSourceStage;
 };
 
 type DecodeFallbackDebug = {
@@ -968,6 +976,34 @@ function detectFamily(text: string): { detected: DetectResult; compare: CompareS
   };
 }
 
+function classifyInputForm(text: string): {
+  input_form: InputForm;
+  input_form_score: { equation_like: number; word_problem_like: number };
+} {
+  const normalized = normalizeText(text);
+  const compact = normalizeEquationText(normalized).compact;
+  const equationSignals =
+    (compact.match(/[+\-=□]/g) ?? []).length +
+    (compact.match(/\d+\+\d+/g) ? 2 : 0) +
+    (compact.match(/\d+=/g) ? 1 : 0);
+  const wordSignals =
+    [...normalized.matchAll(/何こ|何個|何本|どちら|つぎから1つ|えらびなさい|選びなさい/g)].length +
+    [...normalized.matchAll(/こ|本|まい|L/g)].length +
+    ([...normalized.matchAll(/\d+/g)].length >= 2 ? 1 : 0);
+
+  const input_form: InputForm =
+    equationSignals >= 3 && equationSignals >= wordSignals + 1
+      ? "equation_like"
+      : wordSignals >= 3
+      ? "word_problem_like"
+      : "unknown_like";
+
+  return {
+    input_form,
+    input_form_score: { equation_like: equationSignals, word_problem_like: wordSignals }
+  };
+}
+
 function pushCandidate(pool: Candidate[], candidate: Candidate): void {
   const family = candidate.detected.family;
   if (family === "unknown") return;
@@ -1513,6 +1549,8 @@ microGenerateRouter.post("/", async (req, res) => {
     keyword_hits: 0,
     parse_candidates_count: 0
   };
+  let inputForm: InputForm = "unknown_like";
+  let inputFormScore = { equation_like: 0, word_problem_like: 0 };
   const failReasonsByStage: Record<CandidateSourceStage, string[]> = {
     deterministic: [],
     heuristic: [],
@@ -1668,6 +1706,9 @@ microGenerateRouter.post("/", async (req, res) => {
     raw_ocr: rawOcrText
   });
   normalizedInputPreview = normalizeText(eqCandidate.text || parsedReq.data.text || rawOcrText).slice(0, 120);
+  const form = classifyInputForm(normalizedInputPreview);
+  inputForm = form.input_form;
+  inputFormScore = form.input_form_score;
   equationCandidateSource = eqCandidate.source;
   equationCandidateLength = eqCandidate.text.length;
   normalizeInputEmpty = eqCandidate.normalize_input_empty;
@@ -1808,6 +1849,7 @@ microGenerateRouter.post("/", async (req, res) => {
 
   const seedAsString = String(parsedReq.data.seed);
   let selectedCandidate: Candidate | null = null;
+  let selectedCandidateScore = -1;
   let selectedTheme: Theme | null = null;
   let selectedPolicy = countPolicy("unknown", parsedReq.data.N);
   const problems: MicroProblemDsl[] = [];
@@ -1816,6 +1858,22 @@ microGenerateRouter.post("/", async (req, res) => {
   for (const candidate of candidatePool) {
     const generationFamily = candidate.detected.family === "unknown" ? null : candidate.detected.family;
     if (!generationFamily) continue;
+
+    const modeCandidate = modeFromFamily(generationFamily);
+    const formMatch =
+      inputForm === "unknown_like"
+        ? 0.7
+        : inputForm === "equation_like"
+        ? modeCandidate === "equation"
+          ? 1
+          : 0
+        : modeCandidate === "word_problem"
+        ? 1
+        : 0;
+    if (formMatch === 0) {
+      failReasonsByStage[candidate.source_stage].push("input_form_mismatch");
+      continue;
+    }
 
     const policy = countPolicy(generationFamily, parsedReq.data.N);
     const rngSeed = hashToSeed(
@@ -1863,13 +1921,26 @@ microGenerateRouter.post("/", async (req, res) => {
     }
 
     if (candidateProblems.length > 0) {
-      selectedCandidate = candidate;
-      selectedTheme = theme;
-      selectedPolicy = policy;
-      problems.push(...candidateProblems);
-      rejectedCount = candidateRejected;
-      Object.assign(reasons, candidateReasons);
-      break;
+      const score = 0.4 * candidate.detected.confidence + 0.3 * formMatch + 0.3 * 1;
+      const priority = candidate.source_stage === "deterministic" ? 3 : candidate.source_stage === "heuristic" ? 2 : 1;
+      const currentPriority =
+        selectedCandidate?.source_stage === "deterministic"
+          ? 3
+          : selectedCandidate?.source_stage === "heuristic"
+          ? 2
+          : 1;
+      if (!selectedCandidate || score > selectedCandidateScore || (score === selectedCandidateScore && priority > currentPriority)) {
+        selectedCandidate = candidate;
+        selectedCandidateScore = score;
+        selectedTheme = theme;
+        selectedPolicy = policy;
+        problems.length = 0;
+        problems.push(...candidateProblems);
+        rejectedCount = candidateRejected;
+        for (const key of Object.keys(reasons)) delete reasons[key];
+        Object.assign(reasons, candidateReasons);
+      }
+      continue;
     }
 
     rejectedCount += candidateRejected;
@@ -1879,12 +1950,20 @@ microGenerateRouter.post("/", async (req, res) => {
     failReasonsByStage[candidate.source_stage].push("all_candidates_rejected");
   }
 
-  if (!selectedCandidate) {
-    bumpReason(reasons, "unknown_no_viable_candidate");
-  }
+  if (!selectedCandidate) bumpReason(reasons, "unknown_no_viable_candidate");
 
   const inferenceLevel: InferenceLevel = selectedCandidate ? selectedCandidate.inference_level : "unknown";
   const needConfirm = !selectedCandidate || selectedCandidate.detected.confidence < DETECT_CONFIDENCE_THRESHOLD;
+  const intentCandidates: IntentCandidate[] = candidatePool
+    .sort((a, b) => b.score - a.score)
+    .map((c) => ({
+      intent: c.detected.intent,
+      detected_mode: modeFromFamily(c.detected.family),
+      confidence: c.detected.confidence,
+      source_stage: c.source_stage
+    }))
+    .filter((c, i, arr) => arr.findIndex((x) => x.intent === c.intent && x.detected_mode === c.detected_mode) === i)
+    .slice(0, 3);
 
   const mode = selectedCandidate ? modeFromFamily(selectedCandidate.detected.family) : "unknown";
   const requiredItems = requiredItemsFromMode(mode);
@@ -1895,8 +1974,10 @@ microGenerateRouter.post("/", async (req, res) => {
     request_id: requestId,
     schema_version: "micro_generate_response_v1" as const,
     inference_level: inferenceLevel,
+    input_form: inputForm,
+    intent_candidates: intentCandidates,
     candidate_count: candidatePool.length,
-    selected_candidate_source: (selectedCandidate?.source_stage ?? "heuristic") as CandidateSourceStage,
+    selected_candidate_source: (selectedCandidate?.source_stage ?? "deterministic") as CandidateSourceStage,
     detected_mode: mode,
     intent: selectedCandidate?.detected.intent ?? "unknown_intent",
     confidence: selectedCandidate?.detected.confidence ?? 0.35,
@@ -1936,6 +2017,8 @@ microGenerateRouter.post("/", async (req, res) => {
       prompt_verb: selectedTheme?.verb_exist ?? null,
       prompt_unit: selectedTheme?.unit ?? null,
       lexicon_version: LEXICON_VERSION,
+      input_form: inputForm,
+      input_form_score: inputFormScore,
       parse_stage_selected: parseStageSelected,
       local_regex_hit: localRegexHit,
       equation_regex_hit: equationRegexHit,
@@ -1966,9 +2049,7 @@ microGenerateRouter.post("/", async (req, res) => {
       max_count: selectedPolicy.maxCount,
       applied_count: problems.length,
       note: !selectedCandidate
-        ? (reasons.theme_lexicon_mismatch ?? 0) > 0
-          ? "theme_lexicon_mismatch"
-          : unknownNote
+        ? "unknown_no_viable_candidate"
         : selectedCandidate.inference_level === "soft"
         ? mode === "equation"
           ? blankMissingRewritten

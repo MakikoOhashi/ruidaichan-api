@@ -14,6 +14,7 @@ export const difficultySchema = z.enum(["easy", "same", "hard"]);
 export const detectedModeSchema = z.enum(["equation", "word_problem", "unknown"]);
 const inferenceLevelSchema = z.enum(["strict", "soft", "unknown"]);
 const candidateSourceSchema = z.enum(["deterministic", "heuristic", "ai_assist"]);
+const inputFormSchema = z.enum(["equation_like", "word_problem_like", "unknown_like"]);
 
 export const renderItemSchema = z.union([
   z
@@ -94,6 +95,17 @@ export const microGenerateResponseSchema = z
     request_id: z.string().min(1),
     schema_version: z.literal("micro_generate_response_v1"),
     inference_level: inferenceLevelSchema,
+    input_form: inputFormSchema,
+    intent_candidates: z.array(
+      z
+        .object({
+          intent: z.string().min(1),
+          detected_mode: detectedModeSchema,
+          confidence: z.number().min(0).max(1),
+          source_stage: candidateSourceSchema
+        })
+        .strict()
+    ),
     candidate_count: z.number().int().nonnegative(),
     selected_candidate_source: candidateSourceSchema,
     detected_mode: detectedModeSchema,
@@ -126,6 +138,13 @@ export const microGenerateResponseSchema = z
         prompt_verb: z.string().nullable(),
         prompt_unit: z.string().nullable(),
         lexicon_version: z.string(),
+        input_form: inputFormSchema,
+        input_form_score: z
+          .object({
+            equation_like: z.number(),
+            word_problem_like: z.number()
+          })
+          .strict(),
         parse_stage_selected: z.enum(["local_ocr_regex", "ai_refine", "unknown"]),
         local_regex_hit: z.boolean(),
         equation_regex_hit: z.boolean(),
