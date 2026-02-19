@@ -55,6 +55,11 @@ const llmSolveSchema = z
   })
   .strict();
 
+type GenerationDraft = {
+  prompt: string;
+  choices: string[];
+};
+
 function sha(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
@@ -104,6 +109,89 @@ function parseJsonLoose(raw: string): unknown {
     }
     throw new Error("json_parse_failed");
   }
+}
+
+function extractPromptValue(item: Record<string, unknown>): string {
+  const keys = ["prompt", "question", "stem", "text", "problem"];
+  for (const key of keys) {
+    const v = item[key];
+    if (typeof v === "string" && normalizeSpaces(v)) return normalizeSpaces(v);
+  }
+  return "";
+}
+
+function normalizeChoiceValue(v: unknown): string[] {
+  if (Array.isArray(v)) {
+    return v
+      .flatMap((x) => {
+        if (typeof x === "string") return [normalizeSpaces(x)];
+        if (x && typeof x === "object") {
+          const t = (x as Record<string, unknown>).text;
+          if (typeof t === "string") return [normalizeSpaces(t)];
+        }
+        return [];
+      })
+      .filter(Boolean);
+  }
+  if (typeof v === "string") {
+    const normalized = v.normalize("NFKC");
+    return normalized
+      .split(/\n|,|、|;|；|\|/)
+      .map((x) => normalizeSpaces(x.replace(/^[①-⑩\d\.\)\(]+\s*/, "")))
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function salvageGenerationPayload(raw: unknown): GenerationDraft[] {
+  const pickArray = (obj: Record<string, unknown>): unknown[] => {
+    const keys = ["problems", "items", "questions", "tasks", "outputs", "data"];
+    for (const key of keys) {
+      const v = obj[key];
+      if (Array.isArray(v)) return v;
+    }
+    return [];
+  };
+
+  const source =
+    Array.isArray(raw) ? raw : raw && typeof raw === "object" ? pickArray(raw as Record<string, unknown>) : [];
+  if (!Array.isArray(source)) return [];
+
+  const out: GenerationDraft[] = [];
+  for (const row of source) {
+    if (!row || typeof row !== "object") continue;
+    const obj = row as Record<string, unknown>;
+    const prompt = extractPromptValue(obj);
+    const choiceKeys = ["choices", "options", "candidates", "answers", "select_options"];
+    let choices: string[] = [];
+    for (const key of choiceKeys) {
+      choices = normalizeChoiceValue(obj[key]);
+      if (choices.length > 0) break;
+    }
+    const dedup = Array.from(new Set(choices.map((x) => normalizeSpaces(x).toLowerCase()))).map((x) => {
+      const original = choices.find((c) => normalizeSpaces(c).toLowerCase() === x);
+      return original ?? x;
+    });
+    if (!prompt || dedup.length < 5) continue;
+    out.push({ prompt, choices: dedup.slice(0, 5) });
+  }
+  return out;
+}
+
+function repairGenerationPrompt(language: string, raw: unknown): string {
+  const rawText = typeof raw === "string" ? raw : JSON.stringify(raw);
+  return [
+    "ROLE: json_repair_v1",
+    `Language: ${language}`,
+    "Convert the following output into STRICT JSON only.",
+    'Target schema: {"problems":[{"prompt":"...","choices":["...","...","...","...","..."]}]}',
+    "Rules:",
+    "- Keep only usable problems.",
+    "- choices must be exactly 5 strings per problem.",
+    "- Remove all markdown or commentary.",
+    "Input:",
+    rawText
+  ].join("\n");
 }
 
 async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; status: number | null; data?: unknown; error?: string }> {
@@ -235,8 +323,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     const batchTarget = Math.min(batches[batchIndex], count - accepted.length);
     if (batchTarget <= 0) break;
 
-    let parsedGenData: z.infer<typeof llmGenSchema> | null = null;
-    for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && !parsedGenData; attempt += 1) {
+    let generationDrafts: GenerationDraft[] = [];
+    for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && generationDrafts.length === 0; attempt += 1) {
       generationCalls += 1;
       const genResp = await callGeminiJson(
         generationPrompt({
@@ -258,18 +346,40 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
 
       const parsedGen = llmGenSchema.safeParse(genResp.data);
-      if (!parsedGen.success) {
+      if (parsedGen.success) {
+        generationDrafts = parsedGen.data.problems.map((p) => ({
+          prompt: normalizeSpaces(p.prompt),
+          choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
+        }));
+      } else {
+        generationDrafts = salvageGenerationPayload(genResp.data);
+        if (generationDrafts.length === 0) {
+          const repaired = await callGeminiJson(repairGenerationPrompt(language, genResp.data));
+          if (repaired.ok && repaired.data) {
+            const repairedStrict = llmGenSchema.safeParse(repaired.data);
+            if (repairedStrict.success) {
+              generationDrafts = repairedStrict.data.problems.map((p) => ({
+                prompt: normalizeSpaces(p.prompt),
+                choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
+              }));
+            } else {
+              generationDrafts = salvageGenerationPayload(repaired.data);
+            }
+          }
+        }
+      }
+
+      if (generationDrafts.length === 0) {
         reasons.generation_schema_invalid = (reasons.generation_schema_invalid ?? 0) + 1;
         continue;
       }
-      parsedGenData = parsedGen.data;
     }
 
-    if (!parsedGenData) {
+    if (generationDrafts.length === 0) {
       continue;
     }
 
-    for (const draft of parsedGenData.problems) {
+    for (const draft of generationDrafts) {
       if (accepted.length >= count) break;
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: draft.prompt, choices: draft.choices.slice(0, 5), language }));
