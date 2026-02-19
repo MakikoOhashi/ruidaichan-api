@@ -1788,11 +1788,6 @@ function equationCandidatesFromFrame(frame: SemanticFrameV1 | null): string[] {
   return [];
 }
 
-function frameSignature(frame: SemanticFrameV1 | null): string | null {
-  if (!frame || frame.relations.length === 0) return null;
-  return frame.relations.map((r) => r.type).join("+");
-}
-
 function bumpReason(reasons: Record<string, number>, key: string): void {
   reasons[key] = (reasons[key] ?? 0) + 1;
 }
@@ -2193,7 +2188,6 @@ microGenerateRouter.post("/", async (req, res) => {
     );
     const rng = mulberry32(rngSeed);
     const candidateFrame = candidate.detected.parsed_example ? frameFromProblem(candidate.detected.parsed_example, candidate.detected.confidence) : null;
-    const candidateFrameSignature = frameSignature(candidateFrame);
     const relationHint = candidateFrame?.relations[0]?.type ?? null;
     if (relationHint === "repeat_multiply") {
       dateCountRule = "inclusive";
@@ -2218,12 +2212,14 @@ microGenerateRouter.post("/", async (req, res) => {
         continue;
       }
 
-      if (candidateFrameSignature) {
+      // Soft inference policy: keep safety gates light and only block clear intent drift.
+      // We avoid strict full-frame equivalence to keep generation flexible for K-3 variation.
+      if (relationHint && modeCandidate === "word_problem") {
         const generatedFrame = frameFromProblem(problem, candidate.detected.confidence);
-        const generatedSignature = frameSignature(generatedFrame);
-        if (!generatedSignature || generatedSignature !== candidateFrameSignature) {
+        const generatedRelation = generatedFrame?.relations[0]?.type ?? null;
+        if (!generatedRelation || generatedRelation !== relationHint) {
           candidateRejected += 1;
-          bumpReason(candidateReasons, "semantic_frame_mismatch");
+          bumpReason(candidateReasons, "intent_drift");
           continue;
         }
       }
