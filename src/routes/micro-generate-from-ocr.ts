@@ -1,6 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
+import {
+  checkKanjiGuard,
+  estimateGradeBand,
+  normalizeRequestedGradeBand,
+  sameNumberTokens,
+  type GradeBandApplied
+} from "../guards/kanji-guard.js";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = 15000;
@@ -25,7 +32,7 @@ const requestSchema = z
   .object({
     ocr_text: z.string().min(1),
     count: z.union([z.literal(4), z.literal(5), z.literal(10)]),
-    grade_band: z.string().default("g1_g3"),
+    grade_band: z.enum(["g1", "g2_g3", "g1_g3"]).optional(),
     language: z.string().default("ja"),
     seed: z.union([z.string().min(1), z.number().int()])
   })
@@ -59,6 +66,13 @@ type GenerationDraft = {
   prompt: string;
   choices: string[];
 };
+
+const llmRewriteSchema = z
+  .object({
+    prompt: z.string().min(1),
+    choices: z.array(z.string().min(1)).length(5)
+  })
+  .strict();
 
 function sha(input: string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -276,6 +290,28 @@ function solvePrompt(input: { prompt: string; choices: string[]; language: strin
   ].join("\n");
 }
 
+function rewriteForKanjiPrompt(input: {
+  gradeBand: GradeBandApplied;
+  prompt: string;
+  choices: string[];
+}): string {
+  return [
+    "ROLE: text_normalizer_v1",
+    "You are a text normalizer for Japanese elementary math worksheets.",
+    `grade_band: ${input.gradeBand}`,
+    "Task:",
+    "- Rewrite prompt and choices to reduce hard kanji (use hiragana/katakana where needed).",
+    "- Do NOT change any numbers, units, meaning, or which choice is correct.",
+    "- Keep choice order unchanged.",
+    "Output STRICT JSON only:",
+    '{\"prompt\":\"...\",\"choices\":[\"...\",\"...\",\"...\",\"...\",\"...\"]}',
+    "Given prompt:",
+    input.prompt,
+    "Given choices:",
+    input.choices.map((c, i) => `${i}: ${c}`).join("\n")
+  ].join("\n");
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -294,6 +330,99 @@ function generationBatches(count: 4 | 5 | 10): number[] {
   return [count];
 }
 
+type DraftFetchResult = {
+  drafts: GenerationDraft[];
+  calls: number;
+  status: number | null;
+  errors: string[];
+};
+
+async function fetchGenerationDrafts(input: {
+  ocrText: string;
+  count: number;
+  gradeBand: string;
+  language: string;
+  seed: string;
+}): Promise<DraftFetchResult> {
+  let calls = 0;
+  let status: number | null = null;
+  const errors: string[] = [];
+  let drafts: GenerationDraft[] = [];
+
+  for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && drafts.length === 0; attempt += 1) {
+    calls += 1;
+    const genResp = await callGeminiJson(
+      generationPrompt({
+        ocrText: input.ocrText,
+        count: input.count,
+        gradeBand: input.gradeBand,
+        language: input.language,
+        seed: `${input.seed}:a${attempt}`
+      })
+    );
+    status = genResp.status;
+    if (!genResp.ok || !genResp.data) {
+      errors.push(genResp.error ?? "generation_failed");
+      if (attempt < MAX_GENERATION_RETRIES - 1 && isRetriableGenError(genResp.error)) {
+        await sleep(jitterMs(250, 600));
+      }
+      continue;
+    }
+
+    const parsedGen = llmGenSchema.safeParse(genResp.data);
+    if (parsedGen.success) {
+      drafts = parsedGen.data.problems.map((p) => ({
+        prompt: normalizeSpaces(p.prompt),
+        choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
+      }));
+    } else {
+      drafts = salvageGenerationPayload(genResp.data);
+      if (drafts.length === 0) {
+        const repaired = await callGeminiJson(repairGenerationPrompt(input.language, genResp.data));
+        if (repaired.ok && repaired.data) {
+          const repairedStrict = llmGenSchema.safeParse(repaired.data);
+          if (repairedStrict.success) {
+            drafts = repairedStrict.data.problems.map((p) => ({
+              prompt: normalizeSpaces(p.prompt),
+              choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
+            }));
+          } else {
+            drafts = salvageGenerationPayload(repaired.data);
+          }
+        }
+      }
+    }
+
+    if (drafts.length === 0) {
+      errors.push("generation_schema_invalid");
+    }
+  }
+
+  return { drafts, calls, status, errors };
+}
+
+async function rewriteDraftForKanji(input: {
+  draft: GenerationDraft;
+  gradeBand: GradeBandApplied;
+}): Promise<GenerationDraft | null> {
+  const rewritten = await callGeminiJson(
+    rewriteForKanjiPrompt({
+      gradeBand: input.gradeBand,
+      prompt: input.draft.prompt,
+      choices: input.draft.choices
+    })
+  );
+  if (!rewritten.ok || !rewritten.data) return null;
+  const parsed = llmRewriteSchema.safeParse(rewritten.data);
+  if (!parsed.success) return null;
+  const candidate: GenerationDraft = {
+    prompt: normalizeSpaces(parsed.data.prompt),
+    choices: parsed.data.choices.map((c) => normalizeSpaces(c))
+  };
+  if (!sameNumberTokens(input.draft, candidate)) return null;
+  return candidate;
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -310,6 +439,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const { ocr_text, count, grade_band, language, seed } = parsed.data;
   const seedText = String(seed);
   const start = Date.now();
+  const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
 
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
@@ -317,72 +447,92 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let solverCalls = 0;
   let generationStatus: number | null = null;
   let solverStatus: number | null = null;
+  let violationsCount = 0;
+  let rewriteAttempts = 0;
+  let gradeBandApplied: GradeBandApplied = requestedGradeBand ?? "g1";
+  let gradeBandEstimated = requestedGradeBand !== null;
 
   const batches = generationBatches(count);
   for (let batchIndex = 0; batchIndex < batches.length && accepted.length < count; batchIndex += 1) {
     const batchTarget = Math.min(batches[batchIndex], count - accepted.length);
     if (batchTarget <= 0) break;
 
-    let generationDrafts: GenerationDraft[] = [];
-    for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && generationDrafts.length === 0; attempt += 1) {
-      generationCalls += 1;
-      const genResp = await callGeminiJson(
-        generationPrompt({
-          ocrText: ocr_text,
-          count: batchTarget,
-          gradeBand: grade_band,
-          language,
-          seed: `${seedText}:b${batchIndex}:a${attempt}`
-        })
-      );
-      generationStatus = genResp.status;
-      if (!genResp.ok || !genResp.data) {
-        const key = genResp.error ?? "generation_failed";
-        reasons[key] = (reasons[key] ?? 0) + 1;
-        if (attempt < MAX_GENERATION_RETRIES - 1 && isRetriableGenError(genResp.error)) {
-          await sleep(jitterMs(250, 600));
-        }
-        continue;
-      }
-
-      const parsedGen = llmGenSchema.safeParse(genResp.data);
-      if (parsedGen.success) {
-        generationDrafts = parsedGen.data.problems.map((p) => ({
-          prompt: normalizeSpaces(p.prompt),
-          choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
-        }));
-      } else {
-        generationDrafts = salvageGenerationPayload(genResp.data);
-        if (generationDrafts.length === 0) {
-          const repaired = await callGeminiJson(repairGenerationPrompt(language, genResp.data));
-          if (repaired.ok && repaired.data) {
-            const repairedStrict = llmGenSchema.safeParse(repaired.data);
-            if (repairedStrict.success) {
-              generationDrafts = repairedStrict.data.problems.map((p) => ({
-                prompt: normalizeSpaces(p.prompt),
-                choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
-              }));
-            } else {
-              generationDrafts = salvageGenerationPayload(repaired.data);
-            }
-          }
-        }
-      }
-
-      if (generationDrafts.length === 0) {
-        reasons.generation_schema_invalid = (reasons.generation_schema_invalid ?? 0) + 1;
-        continue;
-      }
+    const generated = await fetchGenerationDrafts({
+      ocrText: ocr_text,
+      count: batchTarget,
+      gradeBand: grade_band ?? "g1_g3",
+      language,
+      seed: `${seedText}:b${batchIndex}`
+    });
+    generationCalls += generated.calls;
+    generationStatus = generated.status;
+    for (const error of generated.errors) {
+      reasons[error] = (reasons[error] ?? 0) + 1;
     }
+    const generationDrafts = generated.drafts;
 
     if (generationDrafts.length === 0) {
       continue;
     }
 
+    if (!gradeBandEstimated) {
+      gradeBandApplied = estimateGradeBand({ ocrText: ocr_text, drafts: generationDrafts });
+      gradeBandEstimated = true;
+    }
+
     for (const draft of generationDrafts) {
       if (accepted.length >= count) break;
+      let workingDraft: GenerationDraft | null = draft;
+      let guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+      violationsCount += guard.violations_count;
+
+      if (!guard.ok) {
+        rewriteAttempts += 1;
+        const rewritten = await rewriteDraftForKanji({ draft: workingDraft, gradeBand: gradeBandApplied });
+        if (rewritten) {
+          workingDraft = rewritten;
+          guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+          violationsCount += guard.violations_count;
+        }
+      }
+
+      let regenTry = 0;
+      while ((!workingDraft || !guard.ok) && regenTry < 2) {
+        regenTry += 1;
+        const regen = await fetchGenerationDrafts({
+          ocrText: ocr_text,
+          count: 1,
+          gradeBand: gradeBandApplied,
+          language,
+          seed: `${seedText}:regen:b${batchIndex}:r${regenTry}:${accepted.length}`
+        });
+        generationCalls += regen.calls;
+        generationStatus = regen.status;
+        for (const error of regen.errors) {
+          reasons[error] = (reasons[error] ?? 0) + 1;
+        }
+        if (regen.drafts.length === 0) continue;
+        workingDraft = regen.drafts[0];
+        guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+        violationsCount += guard.violations_count;
+        if (!guard.ok) {
+          rewriteAttempts += 1;
+          const rewritten = await rewriteDraftForKanji({ draft: workingDraft, gradeBand: gradeBandApplied });
+          if (rewritten) {
+            workingDraft = rewritten;
+            guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+            violationsCount += guard.violations_count;
+          }
+        }
+      }
+
+      if (!workingDraft || !guard.ok) {
+        reasons.kanji_guard_failed = (reasons.kanji_guard_failed ?? 0) + 1;
+        continue;
+      }
+
       solverCalls += 1;
-      const solveResp = await callGeminiJson(solvePrompt({ prompt: draft.prompt, choices: draft.choices.slice(0, 5), language }));
+      const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
       solverStatus = solveResp.status;
       if (!solveResp.ok || !solveResp.data) {
         reasons[solveResp.error ?? "solver_failed"] = (reasons[solveResp.error ?? "solver_failed"] ?? 0) + 1;
@@ -396,8 +546,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
 
       const light = validateLight({
-        prompt: draft.prompt,
-        choices: draft.choices.slice(0, 5),
+        prompt: workingDraft.prompt,
+        choices: workingDraft.choices.slice(0, 5),
         correct_index: parsedSolve.data.correct_index,
         answer_value: parsedSolve.data.answer_value
       });
@@ -408,20 +558,20 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
 
       accepted.push({
-        prompt: normalizeSpaces(draft.prompt),
-        choices: draft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
+        prompt: normalizeSpaces(workingDraft.prompt),
+        choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
         correct_index: parsedSolve.data.correct_index,
         answer_value: parsedSolve.data.answer_value,
         equation: parsedSolve.data.equation,
         check_trace: parsedSolve.data.check_trace,
         required_items: ["prompt", "choices"],
         items: [
-          { type: "prompt", slot: "stem", text: normalizeSpaces(draft.prompt) },
+          { type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) },
           {
             type: "choices",
             slot: "options",
             style: "mc",
-            choices: draft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
+            choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
             correct_index: parsedSolve.data.correct_index
           }
         ]
@@ -450,6 +600,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     meta: {
       note: appliedCount === 0 ? "unknown_no_viable_candidate" : appliedCount < count ? "partial_success" : "ok",
       seed: seedText,
+      grade_band_applied: gradeBandApplied,
       request_hash: sha(normalizeSpaces(ocr_text)),
       inference_latency_ms: Date.now() - start
     },
@@ -461,7 +612,12 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       generation_status: generationStatus,
       solver_status: solverStatus,
       language,
-      grade_band
+      grade_band,
+      kanji_guard: {
+        checked: true,
+        violations_count: violationsCount,
+        rewrite_attempts: rewriteAttempts
+      }
     }
   };
 

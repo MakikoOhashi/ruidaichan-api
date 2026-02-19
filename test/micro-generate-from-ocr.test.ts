@@ -107,7 +107,8 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
         requested_count: number;
         need_confirm: boolean;
         problems: Array<{ prompt: string; choices: string[]; correct_index: number; answer_value: number }>;
-        meta: { note: string };
+        meta: { note: string; grade_band_applied: string };
+        debug: { kanji_guard: { checked: boolean; violations_count: number; rewrite_attempts: number } };
       };
 
       assert.equal(res.status, 200);
@@ -119,6 +120,8 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
       assert.equal(body.requested_count, 4);
       assert.equal(body.need_confirm, false);
       assert.equal(body.problems.length > 0, true);
+      assert.equal(body.meta.grade_band_applied === "g1" || body.meta.grade_band_applied === "g2_g3", true);
+      assert.equal(body.debug.kanji_guard.checked, true);
       assert.equal(body.meta.note === "ok" || body.meta.note === "partial_success", true);
     });
   });
@@ -183,6 +186,67 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
       if (body.applied_count === 0) {
         assert.equal(body.need_confirm, true);
       }
+    });
+  });
+});
+
+test("/micro/generate_from_ocr rewrites disallowed kanji for g1 and preserves numbers", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "毎日2個ずつ練習問題をします。5日で何個ですか。",
+            choices: ["6個", "8個", "10個", "12個", "14個"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: text_normalizer_v1")) {
+      return geminiResponse({
+        prompt: "まいにち2こずつれんしゅうもんだいをします。5にちでなんこですか。",
+        choices: ["6こ", "8こ", "10こ", "12こ", "14こ"]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 10, correct_index: 2, equation: "2*5", check_trace: "2を5かいたす" });
+    }
+    return geminiResponse({ answer_value: 10, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "まいにち2こずつ 5にち",
+          count: 4,
+          grade_band: "g1",
+          language: "ja",
+          seed: "rewrite-g1"
+        })
+      });
+      const body = (await res.json()) as {
+        applied_count: number;
+        problems: Array<{ prompt: string; choices: string[] }>;
+        meta: { grade_band_applied: string };
+        debug: { kanji_guard: { rewrite_attempts: number; violations_count: number } };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count > 0, true);
+      assert.equal(body.meta.grade_band_applied, "g1");
+      assert.equal(body.debug.kanji_guard.rewrite_attempts > 0, true);
+      assert.equal(body.debug.kanji_guard.violations_count > 0, true);
+      assert.equal(body.problems[0].prompt.includes("練"), false);
+      assert.equal(body.problems[0].choices[2].includes("10"), true);
     });
   });
 });
