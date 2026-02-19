@@ -186,9 +186,10 @@ test("word_problem days x per-day text is salvaged without new family", async ()
       inference_level: string;
       detected: { family: string };
       candidate_count: number;
-      meta: { note: string };
+      meta: { note: string; theme_id?: string; date_count_rule?: string | null };
+      debug: { date_count_rule: string | null };
       required_items: string[];
-      items: Array<{ type: string }>;
+      items: Array<{ type: string; text?: string }>;
     };
     assert.equal(res.status, 200);
     assert.equal(body.input_form, "word_problem_like");
@@ -197,8 +198,14 @@ test("word_problem days x per-day text is salvaged without new family", async ()
     assert.equal(body.detected.family, "times_scale_mc");
     assert.equal(body.candidate_count > 0, true);
     assert.equal(body.meta.note, "inferred_soft_word_problem");
+    assert.equal(body.meta.theme_id, undefined);
+    assert.equal(body.meta.date_count_rule, "inclusive");
+    assert.equal(body.debug.date_count_rule, "inclusive");
     assert.equal(body.required_items.includes("prompt"), true);
     assert.equal(body.items.some((i) => i.type === "choices"), true);
+    const prompt = body.items.find((i) => i.type === "prompt")?.text ?? "";
+    assert.equal(prompt.includes("ばい"), false);
+    assert.equal(prompt.includes("ページ"), true);
   });
 });
 

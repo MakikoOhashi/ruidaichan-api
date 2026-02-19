@@ -291,7 +291,13 @@ function requiredItemsFromMode(mode: "equation" | "word_problem" | "unknown"): A
   return [];
 }
 
-function buildProblemBase(family: ProblemFamily, params: Record<string, number | string | string[]>, renderText: string, answer: number): MicroProblemDsl {
+function buildProblemBase(
+  family: ProblemFamily,
+  params: Record<string, number | string | string[]>,
+  renderText: string,
+  answer: number,
+  intentOverride?: string
+): MicroProblemDsl {
   const mode = modeFromFamily(family);
   const required = requiredItemsFromMode(mode);
 
@@ -318,7 +324,7 @@ function buildProblemBase(family: ProblemFamily, params: Record<string, number |
     render_text: renderText,
     answer,
     detected_mode: mode,
-    intent: intentFromFamily(family),
+    intent: intentOverride ?? intentFromFamily(family),
     required_items: required,
     items
   };
@@ -922,13 +928,17 @@ function parseRepeatMultiplyWordProblem(text: string): MicroProblemDsl | null {
       multiplier: days,
       answer,
       unit,
+      per_page_problems: perDay,
+      pages_per_day: 1,
+      days,
       subject_a: "ぜんぶ",
       subject_b: "1にち",
       choices,
       correct_index: correctIndex
     },
     `${days}日間、1日${perDay}${unit}ずつあります。ぜんぶで何${unit}ですか。つぎから1つえらびなさい。`,
-    answer
+    answer,
+    "repeat_multiply_word_problem"
   );
 }
 
@@ -1381,16 +1391,76 @@ function rangeByDifficulty(difficulty: Difficulty, example: MicroProblemDsl | nu
   return { min: Math.max(0, mx - 5), max: mx + 5 };
 }
 
+type BuildProblemOptions = {
+  relation_hint?: SemanticRelationType | null;
+  detected_intent?: string;
+};
+
+function buildRepeatMultiplyProblem(rng: () => number, difficulty: Difficulty, example: MicroProblemDsl | null): MicroProblemDsl {
+  const p = example?.params ?? {};
+  const basePerPage = Number(p.per_page_problems ?? p.base ?? 8);
+  const basePagesPerDay = Number(p.pages_per_day ?? 1);
+  const baseDays = Number(p.days ?? p.multiplier ?? 7);
+
+  const perPage =
+    difficulty === "easy"
+      ? randInt(rng, Math.max(2, basePerPage - 2), Math.max(6, basePerPage + 2))
+      : difficulty === "hard"
+      ? randInt(rng, Math.max(5, basePerPage - 3), Math.max(12, basePerPage + 5))
+      : randInt(rng, Math.max(3, basePerPage - 2), Math.max(10, basePerPage + 3));
+
+  const pagesPerDay =
+    difficulty === "hard" ? randInt(rng, Math.max(1, basePagesPerDay), Math.max(3, basePagesPerDay + 1)) : Math.max(1, basePagesPerDay);
+  const days =
+    difficulty === "easy"
+      ? randInt(rng, Math.max(3, baseDays - 2), Math.max(8, baseDays + 1))
+      : difficulty === "hard"
+      ? randInt(rng, Math.max(5, baseDays - 1), Math.max(12, baseDays + 3))
+      : randInt(rng, Math.max(4, baseDays - 1), Math.max(10, baseDays + 2));
+
+  const base = perPage * pagesPerDay;
+  const multiplier = days;
+  const unit = "問";
+  const answer = base * multiplier;
+  const { choices, correctIndex } = buildEquationChoices(answer, unit);
+
+  return buildProblemBase(
+    "times_scale_mc",
+    {
+      base,
+      multiplier,
+      answer,
+      unit,
+      per_page_problems: perPage,
+      pages_per_day: pagesPerDay,
+      days,
+      subject_a: "ぜんぶ",
+      subject_b: "1にち",
+      choices,
+      correct_index: correctIndex
+    },
+    `${days}日間、1日${pagesPerDay}ページずつ計算練習をします。1ページに${perPage}問あります。ぜんぶで何問ですか。つぎから1つえらびなさい。`,
+    answer,
+    "repeat_multiply_word_problem"
+  );
+}
+
 function buildProblem(
   family: ProblemFamily,
   rng: () => number,
   difficulty: Difficulty,
   example: MicroProblemDsl | null,
-  theme: Theme | null
+  theme: Theme | null,
+  options?: BuildProblemOptions
 ): MicroProblemDsl {
   const range = rangeByDifficulty(difficulty, example);
 
   if (family === "times_scale_mc") {
+    const relationHint = options?.relation_hint ?? null;
+    if (relationHint === "repeat_multiply" || options?.detected_intent === "repeat_multiply_word_problem") {
+      return buildRepeatMultiplyProblem(rng, difficulty, example);
+    }
+
     const baseMin = difficulty === "easy" ? 2 : difficulty === "hard" ? 10 : 5;
     const baseMax = difficulty === "easy" ? 20 : difficulty === "hard" ? 60 : 35;
     const base = randInt(rng, baseMin, baseMax);
@@ -1657,6 +1727,19 @@ function frameFromProblem(problem: MicroProblemDsl, confidence: number): Semanti
   }
   if (problem.family === "times_scale_mc") {
     const unit = typeof p.unit === "string" ? p.unit : undefined;
+    if (problem.intent === "repeat_multiply_word_problem") {
+      return {
+        spec_version: "semantic_frame_v1",
+        givens: [
+          { name: "per_day", value: Number(p.base), unit },
+          { name: "days", value: Number(p.multiplier), unit: "日" }
+        ],
+        relations: [{ type: "repeat_multiply", args: ["per_day", "days", "x"] }],
+        ask: { target: "x", unit },
+        constraints: { grade_band: "g1_g3" },
+        confidence
+      };
+    }
     return {
       spec_version: "semantic_frame_v1",
       givens: [{ name: "base", value: Number(p.base), unit }, { name: "multiplier", value: Number(p.multiplier) }],
@@ -1703,6 +1786,11 @@ function equationCandidatesFromFrame(frame: SemanticFrameV1 | null): string[] {
   }
   if (rel.type === "scale_times") return [`x = ${g.base} × ${g.multiplier}`];
   return [];
+}
+
+function frameSignature(frame: SemanticFrameV1 | null): string | null {
+  if (!frame || frame.relations.length === 0) return null;
+  return frame.relations.map((r) => r.type).join("+");
 }
 
 function bumpReason(reasons: Record<string, number>, key: string): void {
@@ -1761,6 +1849,7 @@ microGenerateRouter.post("/", async (req, res) => {
   let ocrLines: string[] = [];
   let ocrPrimaryEngine: OcrPrimaryEngine = "none";
   let localRegexHit = false;
+  let dateCountRule: "inclusive" | null = null;
   let decodeDebug: DecodeFallbackDebug = {
     ocr_line_count: 0,
     keyword_hits: 0,
@@ -2103,20 +2192,40 @@ microGenerateRouter.post("/", async (req, res) => {
       })
     );
     const rng = mulberry32(rngSeed);
-    const theme = isWordProblemFamily(generationFamily) ? pickTheme(seedAsString, generationFamily) : null;
+    const candidateFrame = candidate.detected.parsed_example ? frameFromProblem(candidate.detected.parsed_example, candidate.detected.confidence) : null;
+    const candidateFrameSignature = frameSignature(candidateFrame);
+    const relationHint = candidateFrame?.relations[0]?.type ?? null;
+    if (relationHint === "repeat_multiply") {
+      dateCountRule = "inclusive";
+    }
+    const theme =
+      isWordProblemFamily(generationFamily) && relationHint !== "repeat_multiply" ? pickTheme(seedAsString, generationFamily) : null;
     const candidateProblems: MicroProblemDsl[] = [];
     const candidateSeen = new Set<string>();
     const candidateReasons: Record<string, number> = {};
     let candidateRejected = 0;
 
     for (let i = 0; i < MAX_REGEN_TRIES && candidateProblems.length < policy.appliedCount; i += 1) {
-      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, candidate.detected.parsed_example, theme);
+      const problem = buildProblem(generationFamily, rng, parsedReq.data.difficulty, candidate.detected.parsed_example, theme, {
+        relation_hint: relationHint,
+        detected_intent: candidate.detected.intent
+      });
       const duplicateKey = JSON.stringify({ render_text: problem.render_text, params: problem.params });
 
       if (candidateSeen.has(duplicateKey)) {
         candidateRejected += 1;
         bumpReason(candidateReasons, "duplicate");
         continue;
+      }
+
+      if (candidateFrameSignature) {
+        const generatedFrame = frameFromProblem(problem, candidate.detected.confidence);
+        const generatedSignature = frameSignature(generatedFrame);
+        if (!generatedSignature || generatedSignature !== candidateFrameSignature) {
+          candidateRejected += 1;
+          bumpReason(candidateReasons, "semantic_frame_mismatch");
+          continue;
+        }
       }
 
       const reason = validateProblem(problem, parsedReq.data.difficulty);
@@ -2245,6 +2354,7 @@ microGenerateRouter.post("/", async (req, res) => {
       prompt_verb: selectedTheme?.verb_exist ?? null,
       prompt_unit: selectedTheme?.unit ?? null,
       lexicon_version: LEXICON_VERSION,
+      date_count_rule: dateCountRule,
       input_form: inputForm,
       input_form_score: inputFormScore,
       parse_stage_selected: parseStageSelected,
@@ -2293,6 +2403,7 @@ microGenerateRouter.post("/", async (req, res) => {
       detector_version: DETECTOR_VERSION,
       fallback_count: fallbackCount,
       inference_latency_ms: inferenceLatencyMs,
+      date_count_rule: dateCountRule,
       ...(selectedTheme && selectedCandidate
         ? {
             theme_id: selectedTheme.id,

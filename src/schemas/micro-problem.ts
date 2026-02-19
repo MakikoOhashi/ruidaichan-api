@@ -170,6 +170,7 @@ export const microGenerateResponseSchema = z
         prompt_verb: z.string().nullable(),
         prompt_unit: z.string().nullable(),
         lexicon_version: z.string(),
+        date_count_rule: z.enum(["inclusive"]).nullable(),
         input_form: inputFormSchema,
         input_form_score: z
           .object({
@@ -216,6 +217,7 @@ export const microGenerateResponseSchema = z
         detector_version: z.string().optional(),
         fallback_count: z.number().int().nonnegative().optional(),
         inference_latency_ms: z.number().int().nonnegative().optional(),
+        date_count_rule: z.enum(["inclusive"]).nullable().optional(),
         theme_id: z.string().optional(),
         theme_candidates: z.array(z.string()).optional(),
         theme_policy: z.literal("seed_deterministic").optional()
