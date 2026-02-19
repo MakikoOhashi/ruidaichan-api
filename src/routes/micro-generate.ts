@@ -82,6 +82,16 @@ type IntentCandidate = {
   source_stage: CandidateSourceStage;
 };
 
+type SemanticRelationType = "add" | "subtract" | "multiply" | "divide" | "repeat_multiply" | "compare_diff" | "scale_times";
+type SemanticFrameV1 = {
+  spec_version: "semantic_frame_v1";
+  givens: Array<{ name: string; value: number; unit?: string }>;
+  relations: Array<{ type: SemanticRelationType; args: string[] }>;
+  ask: { target: string; unit?: string };
+  constraints: { grade_band: "g1_g3" };
+  confidence: number;
+};
+
 type DecodeFallbackDebug = {
   ocr_line_count: number;
   keyword_hits: number;
@@ -834,6 +844,34 @@ function parseTimesScale(text: string): MicroProblemDsl | null {
   );
 }
 
+function parseRepeatMultiplyWordProblem(text: string): MicroProblemDsl | null {
+  const normalized = normalizeText(text);
+  const m = normalized.match(/(\d+)(?:日間|日|回).{0,8}(\d+)(?:こ|個|本|まい|枚|L)/);
+  if (!m) return null;
+  const days = Number(m[1]);
+  const perDay = Number(m[2]);
+  if (!Number.isInteger(days) || !Number.isInteger(perDay) || days <= 0 || perDay <= 0) return null;
+  const unitMatch = normalized.match(/(こ|個|本|まい|枚|L)/);
+  const unit = unitMatch?.[1] === "個" ? "こ" : unitMatch?.[1] === "枚" ? "まい" : unitMatch?.[1] ?? "こ";
+  const answer = days * perDay;
+  const { choices, correctIndex } = buildEquationChoices(answer, unit);
+  return buildProblemBase(
+    "times_scale_mc",
+    {
+      base: perDay,
+      multiplier: days,
+      answer,
+      unit,
+      subject_a: "ぜんぶ",
+      subject_b: "1にち",
+      choices,
+      correct_index: correctIndex
+    },
+    `${days}日間、1日${perDay}${unit}ずつあります。ぜんぶで何${unit}ですか。つぎから1つえらびなさい。`,
+    answer
+  );
+}
+
 function detectCompareTotalsSignals(text: string): CompareSignals {
   const normalized = normalizeText(text);
   const numberCount = [...normalized.matchAll(/\d+/g)].length;
@@ -1076,6 +1114,22 @@ function buildHeuristicSalvageCandidates(inputText: string): Candidate[] {
         score: 0.58
       });
     }
+  }
+
+  const repeatParsed = parseRepeatMultiplyWordProblem(normalized);
+  if (repeatParsed) {
+    pushCandidate(out, {
+      detected: {
+        family: "times_scale_mc",
+        confidence: 0.56,
+        parsed_example: repeatParsed,
+        block_fallback: false,
+        intent: "repeat_multiply_word_problem"
+      },
+      source_stage: "heuristic",
+      inference_level: "soft",
+      score: 0.56
+    });
   }
 
   return out;
@@ -1486,6 +1540,108 @@ function validateProblem(problem: MicroProblemDsl, difficulty: Difficulty): stri
   if (!isInRangeForDifficulty(problem, difficulty)) return "difficulty_out_of_range";
 
   return null;
+}
+
+function frameFromProblem(problem: MicroProblemDsl, confidence: number): SemanticFrameV1 | null {
+  const p = problem.params;
+  if (problem.family === "a_plus_blank_eq_b") {
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "a", value: Number(p.a) }, { name: "b", value: Number(p.b) }],
+      relations: [{ type: "add", args: ["a", "x", "b"] }],
+      ask: { target: "x" },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "blank_plus_a_eq_b") {
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "a", value: Number(p.a) }, { name: "b", value: Number(p.b) }],
+      relations: [{ type: "add", args: ["x", "a", "b"] }],
+      ask: { target: "x" },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "a_plus_b_eq_blank") {
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "a", value: Number(p.a) }, { name: "b", value: Number(p.b) }],
+      relations: [{ type: "add", args: ["a", "b", "x"] }],
+      ask: { target: "x" },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "b_minus_a_eq_blank") {
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "a", value: Number(p.a) }, { name: "b", value: Number(p.b) }],
+      relations: [{ type: "subtract", args: ["b", "a", "x"] }],
+      ask: { target: "x" },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "a_plus_b_minus_c_eq_blank") {
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "a", value: Number(p.a) }, { name: "b", value: Number(p.b) }, { name: "c", value: Number(p.c) }],
+      relations: [{ type: "add", args: ["a", "b", "t"] }, { type: "subtract", args: ["t", "c", "x"] }],
+      ask: { target: "x" },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "times_scale_mc") {
+    const unit = typeof p.unit === "string" ? p.unit : undefined;
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [{ name: "base", value: Number(p.base), unit }, { name: "multiplier", value: Number(p.multiplier) }],
+      relations: [{ type: "scale_times", args: ["base", "multiplier", "x"] }],
+      ask: { target: "x", unit },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  if (problem.family === "compare_totals_diff_mc") {
+    const unit = typeof p.unit === "string" ? p.unit : undefined;
+    return {
+      spec_version: "semantic_frame_v1",
+      givens: [
+        { name: "a", value: Number(p.a), unit },
+        { name: "b", value: Number(p.b), unit },
+        { name: "c", value: Number(p.c), unit },
+        { name: "d", value: Number(p.d), unit }
+      ],
+      relations: [
+        { type: "add", args: ["a", "c", "left_total"] },
+        { type: "add", args: ["b", "d", "right_total"] },
+        { type: "compare_diff", args: ["left_total", "right_total", "x"] }
+      ],
+      ask: { target: "x", unit },
+      constraints: { grade_band: "g1_g3" },
+      confidence
+    };
+  }
+  return null;
+}
+
+function equationCandidatesFromFrame(frame: SemanticFrameV1 | null): string[] {
+  if (!frame) return [];
+  const g = Object.fromEntries(frame.givens.map((x) => [x.name, x.value]));
+  const rel = frame.relations[0];
+  if (!rel) return [];
+  if (rel.type === "add" && rel.args.join(",") === "a,x,b") return [`${g.a} + □ = ${g.b}`];
+  if (rel.type === "add" && rel.args.join(",") === "x,a,b") return [`□ + ${g.a} = ${g.b}`];
+  if (rel.type === "add" && rel.args.join(",") === "a,b,x") return [`${g.a} + ${g.b} = □`];
+  if (rel.type === "subtract" && rel.args.join(",") === "b,a,x") return [`${g.b} - ${g.a} = □`];
+  if (frame.relations.length === 2 && frame.relations[0].type === "add" && frame.relations[1].type === "subtract") {
+    return [`${g.a} + ${g.b} - ${g.c} = □`];
+  }
+  if (rel.type === "scale_times") return [`x = ${g.base} × ${g.multiplier}`];
+  return [];
 }
 
 function bumpReason(reasons: Record<string, number>, key: string): void {
@@ -1964,6 +2120,14 @@ microGenerateRouter.post("/", async (req, res) => {
     }))
     .filter((c, i, arr) => arr.findIndex((x) => x.intent === c.intent && x.detected_mode === c.detected_mode) === i)
     .slice(0, 3);
+  const frameCandidates = candidatePool
+    .map((c) => (c.detected.parsed_example ? frameFromProblem(c.detected.parsed_example, c.detected.confidence) : null))
+    .filter((x): x is SemanticFrameV1 => x !== null);
+  const selectedFrame =
+    selectedCandidate && selectedCandidate.detected.parsed_example
+      ? frameFromProblem(selectedCandidate.detected.parsed_example, selectedCandidate.detected.confidence)
+      : null;
+  const equationCandidates = equationCandidatesFromFrame(selectedFrame);
 
   const mode = selectedCandidate ? modeFromFamily(selectedCandidate.detected.family) : "unknown";
   const requiredItems = requiredItemsFromMode(mode);
@@ -1976,7 +2140,10 @@ microGenerateRouter.post("/", async (req, res) => {
     inference_level: inferenceLevel,
     input_form: inputForm,
     intent_candidates: intentCandidates,
-    candidate_count: candidatePool.length,
+    semantic_frame: selectedFrame,
+    frame_candidates_count: frameCandidates.length,
+    equation_candidates_count: equationCandidates.length,
+    candidate_count: selectedCandidate ? candidatePool.length : 0,
     selected_candidate_source: (selectedCandidate?.source_stage ?? "deterministic") as CandidateSourceStage,
     detected_mode: mode,
     intent: selectedCandidate?.detected.intent ?? "unknown_intent",
@@ -2039,7 +2206,7 @@ microGenerateRouter.post("/", async (req, res) => {
       binary_reject_reason: binaryRejectReason,
       normalize_input_empty: normalizeInputEmpty,
       unknown_reason: selectedCandidate ? null : unknownNote,
-      candidate_count: candidatePool.length,
+      candidate_count: selectedCandidate ? candidatePool.length : 0,
       fail_reasons_by_stage: failReasonsByStage,
       normalized_text: normalizedInputPreview
     },

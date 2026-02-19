@@ -50,6 +50,11 @@ test("equation mode returns expression items", async () => {
     const body = (await res.json()) as {
       spec_version: string;
       inference_level: string;
+      input_form: string;
+      intent_candidates: Array<{ intent: string; detected_mode: string; confidence: number; source_stage: string }>;
+      semantic_frame: unknown;
+      frame_candidates_count: number;
+      equation_candidates_count: number;
       candidate_count: number;
       selected_candidate_source: string;
       detected_mode: string;
@@ -62,8 +67,12 @@ test("equation mode returns expression items", async () => {
     assert.equal(res.status, 200);
     assert.equal(body.spec_version, "micro_problem_render_v1");
     assert.equal(body.inference_level, "strict");
+    assert.equal(body.input_form, "equation_like");
     assert.equal(body.candidate_count > 0, true);
     assert.equal(body.selected_candidate_source, "deterministic");
+    assert.equal(body.intent_candidates.length > 0, true);
+    assert.equal(typeof body.frame_candidates_count, "number");
+    assert.equal(typeof body.equation_candidates_count, "number");
     assert.equal(body.detected_mode, "equation");
     assert.deepEqual(body.required_items, ["expression"]);
     assert.equal(body.items.some((i) => i.type === "expression"), true);
@@ -87,6 +96,7 @@ test("soft inference succeeds for missing-blank equation with noise", async () =
     });
     const body = (await res.json()) as {
       inference_level: string;
+      input_form: string;
       selected_candidate_source: string;
       detected_mode: string;
       meta: { note: string };
@@ -94,6 +104,7 @@ test("soft inference succeeds for missing-blank equation with noise", async () =
     };
     assert.equal(res.status, 200);
     assert.equal(body.inference_level, "soft");
+    assert.equal(body.input_form, "equation_like");
     assert.equal(body.selected_candidate_source, "deterministic");
     assert.equal(body.detected_mode, "equation");
     assert.equal(body.meta.note, "equation_corrected_missing_blank");
@@ -115,6 +126,7 @@ test("soft word_problem inference succeeds with lexical variation", async () => 
     });
     const body = (await res.json()) as {
       inference_level: string;
+      input_form: string;
       detected_mode: string;
       meta: { note: string };
       required_items: string[];
@@ -122,10 +134,37 @@ test("soft word_problem inference succeeds with lexical variation", async () => 
     };
     assert.equal(res.status, 200);
     assert.equal(body.inference_level, "soft");
+    assert.equal(body.input_form, "word_problem_like");
     assert.equal(body.detected_mode, "word_problem");
     assert.equal(body.meta.note, "inferred_soft_word_problem");
     assert.equal(body.required_items.includes("prompt"), true);
     assert.equal(body.items.some((i) => i.type === "choices"), true);
+  });
+});
+
+test("form gate rejects equation-only candidate for word_problem_like input", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "4こ と 9こ で 何こ ですか。つぎから1つえらびなさい。選びなさい。4+9=□",
+        N: 4,
+        difficulty: "same",
+        seed: "form-gate"
+      })
+    });
+    const body = (await res.json()) as {
+      input_form: string;
+      detected_mode: string;
+      candidate_count: number;
+      meta: { note: string };
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.input_form, "word_problem_like");
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.candidate_count, 0);
+    assert.equal(body.meta.note, "unknown_no_viable_candidate");
   });
 });
 

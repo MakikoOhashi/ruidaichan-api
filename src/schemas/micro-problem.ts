@@ -106,6 +106,38 @@ export const microGenerateResponseSchema = z
         })
         .strict()
     ),
+    semantic_frame: z
+      .object({
+        spec_version: z.literal("semantic_frame_v1"),
+        givens: z.array(
+          z
+            .object({
+              name: z.string().min(1),
+              value: z.number(),
+              unit: z.string().optional()
+            })
+            .strict()
+        ),
+        relations: z.array(
+          z
+            .object({
+              type: z.enum(["add", "subtract", "multiply", "divide", "repeat_multiply", "compare_diff", "scale_times"]),
+              args: z.array(z.string().min(1))
+            })
+            .strict()
+        ),
+        ask: z
+          .object({
+            target: z.string().min(1),
+            unit: z.string().optional()
+          })
+          .strict(),
+        constraints: z.object({ grade_band: z.literal("g1_g3") }).strict(),
+        confidence: z.number().min(0).max(1)
+      })
+      .nullable(),
+    frame_candidates_count: z.number().int().nonnegative(),
+    equation_candidates_count: z.number().int().nonnegative(),
     candidate_count: z.number().int().nonnegative(),
     selected_candidate_source: candidateSourceSchema,
     detected_mode: detectedModeSchema,
