@@ -3,7 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
-const GEMINI_TIMEOUT_MS = 8000;
+const GEMINI_TIMEOUT_MS = 15000;
+const MAX_GENERATION_RETRIES = 2;
 
 type RenderItem =
   | { type: "prompt"; slot: "stem"; text: string }
@@ -187,6 +188,24 @@ function solvePrompt(input: { prompt: string; choices: string[]; language: strin
   ].join("\n");
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitterMs(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isRetriableGenError(error?: string): boolean {
+  if (!error) return false;
+  return error === "gemini_timeout" || error === "gemini_transport_error" || error === "gemini_http_429" || error === "gemini_http_500" || error === "gemini_http_503";
+}
+
+function generationBatches(count: 4 | 5 | 10): number[] {
+  if (count === 10) return [5, 5];
+  return [count];
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -211,30 +230,46 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let generationStatus: number | null = null;
   let solverStatus: number | null = null;
 
-  for (let round = 0; round < 2 && accepted.length < count; round += 1) {
-    generationCalls += 1;
-    const genResp = await callGeminiJson(
-      generationPrompt({
-        ocrText: ocr_text,
-        count: count - accepted.length,
-        gradeBand: grade_band,
-        language,
-        seed: `${seedText}:${round}`
-      })
-    );
-    generationStatus = genResp.status;
-    if (!genResp.ok || !genResp.data) {
-      reasons[genResp.error ?? "generation_failed"] = (reasons[genResp.error ?? "generation_failed"] ?? 0) + 1;
+  const batches = generationBatches(count);
+  for (let batchIndex = 0; batchIndex < batches.length && accepted.length < count; batchIndex += 1) {
+    const batchTarget = Math.min(batches[batchIndex], count - accepted.length);
+    if (batchTarget <= 0) break;
+
+    let parsedGenData: z.infer<typeof llmGenSchema> | null = null;
+    for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && !parsedGenData; attempt += 1) {
+      generationCalls += 1;
+      const genResp = await callGeminiJson(
+        generationPrompt({
+          ocrText: ocr_text,
+          count: batchTarget,
+          gradeBand: grade_band,
+          language,
+          seed: `${seedText}:b${batchIndex}:a${attempt}`
+        })
+      );
+      generationStatus = genResp.status;
+      if (!genResp.ok || !genResp.data) {
+        const key = genResp.error ?? "generation_failed";
+        reasons[key] = (reasons[key] ?? 0) + 1;
+        if (attempt < MAX_GENERATION_RETRIES - 1 && isRetriableGenError(genResp.error)) {
+          await sleep(jitterMs(250, 600));
+        }
+        continue;
+      }
+
+      const parsedGen = llmGenSchema.safeParse(genResp.data);
+      if (!parsedGen.success) {
+        reasons.generation_schema_invalid = (reasons.generation_schema_invalid ?? 0) + 1;
+        continue;
+      }
+      parsedGenData = parsedGen.data;
+    }
+
+    if (!parsedGenData) {
       continue;
     }
 
-    const parsedGen = llmGenSchema.safeParse(genResp.data);
-    if (!parsedGen.success) {
-      reasons.generation_schema_invalid = (reasons.generation_schema_invalid ?? 0) + 1;
-      continue;
-    }
-
-    for (const draft of parsedGen.data.problems) {
+    for (const draft of parsedGenData.problems) {
       if (accepted.length >= count) break;
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: draft.prompt, choices: draft.choices.slice(0, 5), language }));
