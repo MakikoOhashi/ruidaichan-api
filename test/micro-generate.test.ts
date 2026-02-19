@@ -168,6 +168,66 @@ test("form gate rejects equation-only candidate for word_problem_like input", as
   });
 });
 
+test("word_problem days x per-day text is salvaged without new family", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "ゆうすけくんは、毎日1ページずつ計算練習をします。1ページに8問ずつあります。6月4日から6月10日までに何問の計算練習をすることになりますか。つぎから1つ選びなさい。①32 ②40 ③48 ④56 ⑤64",
+        N: 4,
+        difficulty: "same",
+        seed: "days-per-day"
+      })
+    });
+    const body = (await res.json()) as {
+      input_form: string;
+      detected_mode: string;
+      inference_level: string;
+      detected: { family: string };
+      candidate_count: number;
+      meta: { note: string };
+      required_items: string[];
+      items: Array<{ type: string }>;
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.input_form, "word_problem_like");
+    assert.equal(body.detected_mode, "word_problem");
+    assert.equal(body.inference_level, "soft");
+    assert.equal(body.detected.family, "times_scale_mc");
+    assert.equal(body.candidate_count > 0, true);
+    assert.equal(body.meta.note, "inferred_soft_word_problem");
+    assert.equal(body.required_items.includes("prompt"), true);
+    assert.equal(body.items.some((i) => i.type === "choices"), true);
+  });
+});
+
+test("word_problem_like unknown uses word_pattern_miss reason", async () => {
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        text: "りんごが4こあります。みかんが2こあります。つぎから1つ選びなさい。",
+        N: 4,
+        difficulty: "same",
+        seed: "word-miss"
+      })
+    });
+    const body = (await res.json()) as {
+      input_form: string;
+      detected_mode: string;
+      candidate_count: number;
+      debug: { unknown_reason: string | null };
+    };
+    assert.equal(res.status, 200);
+    assert.equal(body.input_form, "word_problem_like");
+    assert.equal(body.detected_mode, "unknown");
+    assert.equal(body.candidate_count, 0);
+    assert.equal(body.debug.unknown_reason, "word_pattern_miss");
+  });
+});
+
 test("image/ocr equation fallback detects 7 + 9 - 6 = □ as equation", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

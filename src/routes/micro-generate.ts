@@ -442,6 +442,24 @@ function stripQuestionNumberNoise(text: string): string {
   return text.replace(/[（(]\d+[）)]/g, " ").replace(/\b\d+\./g, " ");
 }
 
+function stripChoiceNoise(text: string): string {
+  return (
+    text
+      // trim fixed choice instruction tails
+      .replace(/つぎから[1１一]?つ[^。]*?(?:えらびなさい|選びなさい)[。.]?/g, " ")
+      // remove circled choice blocks
+      .replace(/[①-⑩][^①-⑩]{0,24}(?=(?:[①-⑩]|$))/g, " ")
+      // remove OCR-ed simple numeric options like "1 32 2 40 ..."
+      .replace(/(?:^|\s)[1-5]\s+\d{1,3}(?=\s|$)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+function sanitizeWordProblemText(text: string): string {
+  return normalizeText(stripChoiceNoise(stripQuestionNumberNoise(text)));
+}
+
 function extractEquationCandidates(text: string): string[] {
   const cleaned = stripQuestionNumberNoise(splitChoiceText(text).mainText);
   const compact = normalizeEquationText(cleaned).compact;
@@ -845,14 +863,56 @@ function parseTimesScale(text: string): MicroProblemDsl | null {
 }
 
 function parseRepeatMultiplyWordProblem(text: string): MicroProblemDsl | null {
-  const normalized = normalizeText(text);
-  const m = normalized.match(/(\d+)(?:日間|日|回).{0,8}(\d+)(?:こ|個|本|まい|枚|L)/);
-  if (!m) return null;
-  const days = Number(m[1]);
-  const perDay = Number(m[2]);
-  if (!Number.isInteger(days) || !Number.isInteger(perDay) || days <= 0 || perDay <= 0) return null;
-  const unitMatch = normalized.match(/(こ|個|本|まい|枚|L)/);
-  const unit = unitMatch?.[1] === "個" ? "こ" : unitMatch?.[1] === "枚" ? "まい" : unitMatch?.[1] ?? "こ";
+  const normalized = sanitizeWordProblemText(text);
+  if (!normalized) return null;
+
+  const unitFrom = (u?: string): string => {
+    if (!u) return "問";
+    if (u === "個") return "こ";
+    if (u === "枚") return "まい";
+    return u;
+  };
+
+  let perDay: number | null = null;
+  let unit = "問";
+
+  const perPage = normalized.match(/(?:1|１)(?:ペ-?ジ|ページ)に(\d+)(問|こ|個|本|まい|枚|L)/);
+  if (perPage) {
+    perDay = Number(perPage[1]);
+    unit = unitFrom(perPage[2]);
+  } else {
+    const daily = normalized.match(/毎日(\d+)(問|こ|個|本|まい|枚|L)/);
+    if (daily) {
+      perDay = Number(daily[1]);
+      unit = unitFrom(daily[2]);
+    }
+  }
+
+  if (!perDay || !Number.isInteger(perDay) || perDay <= 0) return null;
+
+  let days: number | null = null;
+  const explicitDays = normalized.match(/(\d+)(?:日間|日で|日つづけて|日続けて)/);
+  if (explicitDays) {
+    days = Number(explicitDays[1]);
+  } else {
+    const dateNormalized = normalized.replace(/月[。．・、,\s]+(?=\d+日)/g, "月");
+    const matches = [...dateNormalized.matchAll(/(\d{1,2})月(\d{1,2})日/g)];
+    if (matches.length >= 2) {
+      const startM = Number(matches[0][1]);
+      const startD = Number(matches[0][2]);
+      const endM = Number(matches[1][1]);
+      const endD = Number(matches[1][2]);
+      const start = new Date(Date.UTC(2026, startM - 1, startD));
+      const end = new Date(Date.UTC(2026, endM - 1, endD));
+      const diff = Math.floor((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000));
+      if (Number.isFinite(diff) && diff >= 0 && diff <= 40) {
+        days = diff + 1; // include both start and end dates
+      }
+    }
+  }
+
+  if (!days || !Number.isInteger(days) || days <= 0) return null;
+
   const answer = days * perDay;
   const { choices, correctIndex } = buildEquationChoices(answer, unit);
   return buildProblemBase(
@@ -1055,6 +1115,7 @@ function pushCandidate(pool: Candidate[], candidate: Candidate): void {
 function buildHeuristicSalvageCandidates(inputText: string): Candidate[] {
   const out: Candidate[] = [];
   const normalized = normalizeText(inputText);
+  const sanitizedWord = sanitizeWordProblemText(inputText);
   if (!normalized) return out;
 
   const eqCandidates = extractEquationCandidates(normalized);
@@ -1116,12 +1177,12 @@ function buildHeuristicSalvageCandidates(inputText: string): Candidate[] {
     }
   }
 
-  const repeatParsed = parseRepeatMultiplyWordProblem(normalized);
+  const repeatParsed = parseRepeatMultiplyWordProblem(sanitizedWord || normalized);
   if (repeatParsed) {
     pushCandidate(out, {
       detected: {
         family: "times_scale_mc",
-        confidence: 0.56,
+        confidence: 0.58,
         parsed_example: repeatParsed,
         block_fallback: false,
         intent: "repeat_multiply_word_problem"
@@ -1946,7 +2007,7 @@ microGenerateRouter.post("/", async (req, res) => {
     else if (normalizeInputEmpty) upstreamUnknownReason = "ocr_empty";
     else if (detectorFallbackReason === "empty_parse") upstreamUnknownReason = "empty_parse_upstream";
     else if (detectorFallbackReason) upstreamUnknownReason = detectorFallbackReason;
-    else upstreamUnknownReason = "equation_regex_miss";
+    else upstreamUnknownReason = inputForm === "word_problem_like" ? "word_pattern_miss" : "equation_regex_miss";
     parseStageSelected = "unknown";
   }
 
