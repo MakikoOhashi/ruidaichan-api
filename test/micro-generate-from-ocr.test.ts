@@ -572,6 +572,74 @@ test("/micro/generate_from_ocr keeps unit-conversion domain locked by source exa
   });
 });
 
+test("/micro/generate_from_ocr length conversion includes meter in mixed set for count=10", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let generatorCalls = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      generatorCalls += 1;
+      if (generatorCalls <= 2) {
+        return geminiResponse({
+          problems: [
+            { prompt: "10 mm = □ cm", choices: ["0.1", "1", "10", "100", "1000"] },
+            { prompt: "20 mm = □ cm", choices: ["0.2", "2", "20", "200", "2000"] },
+            { prompt: "30 mm = □ cm", choices: ["0.3", "3", "30", "300", "3000"] },
+            { prompt: "40 mm = □ cm", choices: ["0.4", "4", "40", "400", "4000"] },
+            { prompt: "50 mm = □ cm", choices: ["0.5", "5", "50", "500", "5000"] }
+          ]
+        });
+      }
+      return geminiResponse({
+        problems: [{ prompt: "2 m = □ cm", choices: ["2", "20", "200", "2000", "20000"] }]
+      });
+    }
+
+    if (prompt.includes("ROLE: solver_v1")) {
+      if (prompt.includes("10 mm")) return geminiResponse({ answer_value: 1, correct_index: 1, equation: "10/10" });
+      if (prompt.includes("20 mm")) return geminiResponse({ answer_value: 2, correct_index: 1, equation: "20/10" });
+      if (prompt.includes("30 mm")) return geminiResponse({ answer_value: 3, correct_index: 1, equation: "30/10" });
+      if (prompt.includes("40 mm")) return geminiResponse({ answer_value: 4, correct_index: 1, equation: "40/10" });
+      if (prompt.includes("50 mm")) return geminiResponse({ answer_value: 5, correct_index: 1, equation: "50/10" });
+      if (prompt.includes("2 m")) return geminiResponse({ answer_value: 200, correct_index: 2, equation: "2*100" });
+    }
+
+    return geminiResponse({ answer_value: 1, correct_index: 0, equation: "fallback" });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "4 mm = □ cm",
+          count: 10,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "length-meter-diversity"
+        })
+      });
+
+      const body = (await res.json()) as {
+        applied_count: number;
+        problems: Array<{ prompt: string }>;
+        reasons: Record<string, number>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count, 10);
+      assert.equal(body.problems.some((p) => p.prompt.includes(" m =")), true);
+      assert.equal((body.reasons.unit_diversity_need_meter ?? 0) > 0, true);
+      assert.equal(generatorCalls >= 3, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr defaults ambiguous short text to equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

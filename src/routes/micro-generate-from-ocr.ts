@@ -74,6 +74,11 @@ function normalizeSpaces(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+function hashInt(input: string): number {
+  const hex = sha(input).slice(0, 8);
+  return Number.parseInt(hex, 16);
+}
+
 function extractFirstNumber(s: string): number | null {
   const normalized = s.normalize("NFKC").replace(/,/g, "");
   const m = normalized.match(/-?\d+(?:\.\d+)?/);
@@ -187,6 +192,10 @@ function isConversionInDomain(parsed: UnitConversionParsed, lock: UnitDomainLock
     lock.allowedUnits.includes(parsed.fromUnit) &&
     lock.allowedUnits.includes(parsed.toUnit)
   );
+}
+
+function includesMeterUnit(parsed: UnitConversionParsed): boolean {
+  return parsed.fromUnit === "m" || parsed.toUnit === "m";
 }
 
 function validateLight(problem: { prompt: string; choices: string[]; correct_index: number; answer_value: number }): { ok: boolean; reason?: string } {
@@ -407,7 +416,13 @@ function generationPrompt(input: {
                   ? [
                       `- Unit domain lock: ${input.unitDomainLock.domain} only.`,
                       `- Allowed units in this request: ${input.unitDomainLock.allowedUnits.join(", ")}.`,
-                      "- Do NOT generate conversion problems outside this unit domain."
+                      "- Do NOT generate conversion problems outside this unit domain.",
+                      ...(input.unitDomainLock.domain === "length"
+                        ? [
+                            "- Include a mix of length units, not only mm and cm.",
+                            "- Include at least one problem that uses m (meter)."
+                          ]
+                        : [])
                     ]
                   : [])
               ]
@@ -618,6 +633,39 @@ function shouldStopEarly(
   return targetCount >= 5 && acceptedCount >= EARLY_SATISFY_COUNT;
 }
 
+function buildLengthMeterFallbackProblem(seedText: string): GeneratedProblem {
+  const meters = (hashInt(`${seedText}:meter`) % 9) + 1; // 1..9 m
+  const answer = meters * 100;
+  const distractors = [answer - 100, answer + 100, answer + 200, answer - 200]
+    .filter((v) => v >= 0)
+    .slice(0, 4);
+  while (distractors.length < 4) {
+    distractors.push(answer + (distractors.length + 1) * 300);
+  }
+  const all = [answer, ...distractors];
+  const unique = Array.from(new Set(all)).slice(0, 5);
+  while (unique.length < 5) {
+    unique.push(answer + (unique.length + 1) * 500);
+  }
+  const correctIndex = unique.indexOf(answer);
+  const choices = unique.map((v) => String(v));
+  const prompt = `${meters} m = □ cm`;
+
+  return {
+    prompt,
+    choices,
+    correct_index: correctIndex,
+    answer_value: answer,
+    equation: `${meters}*100`,
+    check_trace: `${meters}m = ${answer}cm`,
+    required_items: ["prompt", "choices"],
+    items: [
+      { type: "prompt", slot: "stem", text: prompt },
+      { type: "choices", slot: "options", style: "mc", choices, correct_index: correctIndex }
+    ]
+  };
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -653,6 +701,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let gradeBandApplied: GradeBandApplied = requestedGradeBand ?? "g1";
   let gradeBandEstimated = requestedGradeBand !== null;
   let hitTimeBudget = false;
+  let acceptedLengthHasMeter = false;
 
   const batches = generationBatches(targetCount);
   for (let batchIndex = 0; batchIndex < batches.length && accepted.length < targetCount; batchIndex += 1) {
@@ -715,6 +764,13 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
           continue;
+        }
+        if (parsedDraftConversion !== null && unitDomainLock.domain === "length" && targetCount >= 10) {
+          const remainingSlots = targetCount - accepted.length;
+          if (!acceptedLengthHasMeter && remainingSlots <= 1 && !includesMeterUnit(parsedDraftConversion)) {
+            reasons.unit_diversity_need_meter = (reasons.unit_diversity_need_meter ?? 0) + 1;
+            continue;
+          }
         }
       }
 
@@ -779,6 +835,12 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           }
         ]
       });
+      if (unitDomainLock?.domain === "length") {
+        const acceptedConversion = parseUnitConversion(workingDraft.prompt);
+        if (acceptedConversion !== null && includesMeterUnit(acceptedConversion)) {
+          acceptedLengthHasMeter = true;
+        }
+      }
 
       if (shouldStopEarly(targetCount, accepted.length, inputMode)) {
         break;
@@ -839,6 +901,13 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
             continue;
+          }
+          if (parsedDraftConversion !== null && unitDomainLock.domain === "length" && targetCount >= 10) {
+            const remainingSlots = targetCount - accepted.length;
+            if (!acceptedLengthHasMeter && remainingSlots <= 1 && !includesMeterUnit(parsedDraftConversion)) {
+              reasons.unit_diversity_need_meter = (reasons.unit_diversity_need_meter ?? 0) + 1;
+              continue;
+            }
           }
         }
 
@@ -905,12 +974,29 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             }
           ]
         });
+        if (unitDomainLock?.domain === "length") {
+          const acceptedConversion = parseUnitConversion(workingDraft.prompt);
+          if (acceptedConversion !== null && includesMeterUnit(acceptedConversion)) {
+            acceptedLengthHasMeter = true;
+          }
+        }
 
         if (shouldStopEarly(targetCount, accepted.length, inputMode)) {
           break;
         }
       }
     }
+  }
+
+  if (unitDomainLock?.domain === "length" && targetCount >= 10 && !acceptedLengthHasMeter && accepted.length > 0) {
+    const fallback = buildLengthMeterFallbackProblem(seedText);
+    if (accepted.length < targetCount) {
+      accepted.push(fallback);
+    } else {
+      accepted[accepted.length - 1] = fallback;
+    }
+    acceptedLengthHasMeter = true;
+    reasons.unit_diversity_fallback_meter = (reasons.unit_diversity_fallback_meter ?? 0) + 1;
   }
 
   const appliedCount = accepted.length;
