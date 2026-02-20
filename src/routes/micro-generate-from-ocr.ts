@@ -305,6 +305,14 @@ function isRetriableGenError(error?: string): boolean {
   return error === "gemini_timeout" || error === "gemini_transport_error" || error === "gemini_http_429" || error === "gemini_http_500" || error === "gemini_http_503";
 }
 
+function detectInputMode(ocrText: string): "equation" | "word_problem" {
+  const normalized = ocrText.normalize("NFKC");
+  const hasEquationPattern =
+    /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) ||
+    /[0-9]\s*=\s*[0-9□口ロ_]/.test(normalized);
+  return hasEquationPattern ? "equation" : "word_problem";
+}
+
 function generationBatches(count: 4 | 5 | 10): number[] {
   if (count === 10) return [5, 5];
   return [count];
@@ -451,6 +459,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const seedText = String(seed);
   const start = Date.now();
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
+  const inputMode = detectInputMode(ocr_text);
+  const maxCount = inputMode === "word_problem" ? 5 : 10;
+  const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
+  const cappedByPolicy = targetCount < count;
 
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
@@ -464,14 +476,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let gradeBandEstimated = requestedGradeBand !== null;
   let hitTimeBudget = false;
 
-  const batches = generationBatches(count);
-  for (let batchIndex = 0; batchIndex < batches.length && accepted.length < count; batchIndex += 1) {
+  const batches = generationBatches(targetCount);
+  for (let batchIndex = 0; batchIndex < batches.length && accepted.length < targetCount; batchIndex += 1) {
     if (Date.now() - start >= REQUEST_TIME_BUDGET_MS) {
       reasons.time_budget_exceeded = (reasons.time_budget_exceeded ?? 0) + 1;
       hitTimeBudget = true;
       break;
     }
-    const batchTarget = Math.min(batches[batchIndex], count - accepted.length);
+    const batchTarget = Math.min(batches[batchIndex], targetCount - accepted.length);
     if (batchTarget <= 0) break;
 
     const generated = await fetchGenerationDrafts({
@@ -503,7 +515,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         hitTimeBudget = true;
         break;
       }
-      if (accepted.length >= count) break;
+      if (accepted.length >= targetCount) break;
       const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
       localReplacements += normalized.replacements;
       const workingDraft = normalized.draft;
@@ -566,8 +578,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ? "unknown_no_viable_candidate"
       : hitTimeBudget
         ? "partial_success_timeout"
-        : appliedCount < count
+        : appliedCount < targetCount
           ? "partial_success"
+          : cappedByPolicy
+            ? "ok_count_capped_by_policy"
           : "ok";
 
   const response = {
@@ -588,6 +602,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       note,
       seed: seedText,
       grade_band_applied: gradeBandApplied,
+      count_policy: "server_enforced",
+      max_count: maxCount,
+      target_count: targetCount,
       request_hash: sha(normalizeSpaces(ocr_text)),
       inference_latency_ms: Date.now() - start
     },
@@ -600,6 +617,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       solver_status: solverStatus,
       language,
       grade_band,
+      input_mode: inputMode,
       kanji_guard: {
         checked: true,
         violations_count: violationsCount,

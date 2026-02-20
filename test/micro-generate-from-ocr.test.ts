@@ -190,6 +190,114 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
   });
 });
 
+test("/micro/generate_from_ocr caps word_problem count=10 to max 5", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let generatorCalls = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      generatorCalls += 1;
+      return geminiResponse({
+        problems: Array.from({ length: 5 }, (_, i) => ({
+          prompt: `まいにち${i + 1}こずつあつめます。5にちでなんこですか。`,
+          choices: ["5", "10", "15", "20", "25"]
+        }))
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 5, correct_index: 0, equation: "1*5" });
+    }
+    return geminiResponse({ answer_value: 5, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "まいにち けいさん れんしゅう",
+          count: 10,
+          grade_band: "g1",
+          language: "ja",
+          seed: "cap-word"
+        })
+      });
+
+      const body = (await res.json()) as {
+        requested_count: number;
+        applied_count: number;
+        meta: { max_count: number; target_count: number };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.requested_count, 10);
+      assert.equal(body.meta.max_count, 5);
+      assert.equal(body.meta.target_count, 5);
+      assert.equal(body.applied_count <= 5, true);
+      assert.equal(generatorCalls, 1);
+    });
+  });
+});
+
+test("/micro/generate_from_ocr keeps equation count=10", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let generatorCalls = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      generatorCalls += 1;
+      return geminiResponse({
+        problems: Array.from({ length: 5 }, (_, i) => ({
+          prompt: `${i + 1} + 4 = □`,
+          choices: ["5", "6", "7", "8", "9"]
+        }))
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 5, correct_index: 0, equation: "1+4" });
+    }
+    return geminiResponse({ answer_value: 5, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "7 + 9 - 6 = □",
+          count: 10,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "keep-equation"
+        })
+      });
+
+      const body = (await res.json()) as {
+        requested_count: number;
+        applied_count: number;
+        meta: { max_count: number; target_count: number };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.requested_count, 10);
+      assert.equal(body.meta.max_count, 10);
+      assert.equal(body.meta.target_count, 10);
+      assert.equal(body.applied_count, 10);
+      assert.equal(generatorCalls, 2);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
