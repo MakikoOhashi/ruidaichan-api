@@ -298,6 +298,57 @@ test("/micro/generate_from_ocr keeps equation count=10", async () => {
   });
 });
 
+test("/micro/generate_from_ocr rejects word-problemized output for equation input", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "8+5-3はいくつですか。つぎから1つえらびなさい。",
+            choices: ["6", "8", "10", "12", "14"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 10, correct_index: 2, equation: "8+5-3" });
+    }
+    return geminiResponse({ answer_value: 10, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "8+5-3=□",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "equation-guard"
+        })
+      });
+      const body = (await res.json()) as {
+        applied_count: number;
+        detected_mode: string;
+        reasons: Record<string, number>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count, 0);
+      assert.equal(body.detected_mode, "unknown");
+      assert.equal((body.reasons.equation_style_miss ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

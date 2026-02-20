@@ -97,6 +97,11 @@ function validateLight(problem: { prompt: string; choices: string[]; correct_ind
   return { ok: true };
 }
 
+function isEquationStylePrompt(prompt: string): boolean {
+  const normalized = prompt.normalize("NFKC");
+  return /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) && /=|□|口|ロ|_/.test(normalized);
+}
+
 function parseJsonLoose(raw: string): unknown {
   const t = raw.trim();
   try {
@@ -243,7 +248,14 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
   }
 }
 
-function generationPrompt(input: { ocrText: string; count: number; gradeBand: string; language: string; seed: string }): string {
+function generationPrompt(input: {
+  ocrText: string;
+  count: number;
+  gradeBand: string;
+  language: string;
+  seed: string;
+  inputMode: "equation" | "word_problem";
+}): string {
   const gradeInstructions =
     input.gradeBand === "g1"
       ? [
@@ -260,6 +272,7 @@ function generationPrompt(input: { ocrText: string; count: number; gradeBand: st
     "ROLE: generator_v1",
     `Language: ${input.language}`,
     `Grade band: ${input.gradeBand}`,
+    `Input mode: ${input.inputMode}`,
     `Requested count: ${input.count}`,
     `Seed: ${input.seed}`,
     "Task: Read the source problem and generate similar elementary math multiple-choice problems.",
@@ -268,6 +281,12 @@ function generationPrompt(input: { ocrText: string; count: number; gradeBand: st
     "Rules:",
     "- Keep difficulty around grade 1-3.",
     "- Each problem must be answerable with one correct option.",
+    ...(input.inputMode === "equation"
+      ? [
+          "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
+          "- Do NOT convert equations into story/word problems."
+        ]
+      : ["- Return short Japanese word-problem style prompts."]),
     "- No explanations.",
     ...gradeInstructions,
     "Source OCR:",
@@ -331,6 +350,7 @@ async function fetchGenerationDrafts(input: {
   gradeBand: string;
   language: string;
   seed: string;
+  inputMode: "equation" | "word_problem";
 }): Promise<DraftFetchResult> {
   let calls = 0;
   let status: number | null = null;
@@ -345,7 +365,8 @@ async function fetchGenerationDrafts(input: {
         count: input.count,
         gradeBand: input.gradeBand,
         language: input.language,
-        seed: `${input.seed}:a${attempt}`
+        seed: `${input.seed}:a${attempt}`,
+        inputMode: input.inputMode
       })
     );
     status = genResp.status;
@@ -491,7 +512,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       count: batchTarget,
       gradeBand: grade_band ?? "g1_g3",
       language,
-      seed: `${seedText}:b${batchIndex}`
+      seed: `${seedText}:b${batchIndex}`,
+      inputMode
     });
     generationCalls += generated.calls;
     generationStatus = generated.status;
@@ -521,6 +543,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       const workingDraft = normalized.draft;
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
       violationsCount += guard.violations_count;
+      if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
+        reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+        continue;
+      }
 
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
@@ -588,7 +614,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     spec_version: "micro_problem_render_v1" as const,
     request_id: requestId,
     schema_version: "micro_generate_from_ocr_response_v1" as const,
-    detected_mode: appliedCount > 0 ? ("word_problem" as const) : ("unknown" as const),
+    detected_mode: appliedCount > 0 ? (inputMode as "equation" | "word_problem") : ("unknown" as const),
     intent: appliedCount > 0 ? "llm_free_generation" : "unknown_intent",
     confidence: appliedCount > 0 ? 0.78 : 0.2,
     required_items: appliedCount > 0 ? (["prompt", "choices"] as const) : ([] as const),
