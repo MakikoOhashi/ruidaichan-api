@@ -1,17 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
-import {
-  checkKanjiGuard,
-  estimateGradeBand,
-  normalizeRequestedGradeBand,
-  sameNumberTokens,
-  type GradeBandApplied
-} from "../guards/kanji-guard.js";
+import { checkKanjiGuard, estimateGradeBand, normalizeRequestedGradeBand, type GradeBandApplied } from "../guards/kanji-guard.js";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = 15000;
 const MAX_GENERATION_RETRIES = 2;
+const DEFAULT_COUNT = 5;
+const REQUEST_TIME_BUDGET_MS = 45_000;
 
 type RenderItem =
   | { type: "prompt"; slot: "stem"; text: string }
@@ -31,7 +27,7 @@ type GeneratedProblem = {
 const requestSchema = z
   .object({
     ocr_text: z.string().min(1),
-    count: z.union([z.literal(4), z.literal(5), z.literal(10)]),
+    count: z.union([z.literal(4), z.literal(5), z.literal(10)]).default(DEFAULT_COUNT),
     grade_band: z.enum(["g1", "g2_g3", "g1_g3"]).optional(),
     language: z.string().default("ja"),
     seed: z.union([z.string().min(1), z.number().int()])
@@ -66,13 +62,6 @@ type GenerationDraft = {
   prompt: string;
   choices: string[];
 };
-
-const llmRewriteSchema = z
-  .object({
-    prompt: z.string().min(1),
-    choices: z.array(z.string().min(1)).length(5)
-  })
-  .strict();
 
 function sha(input: string): string {
   return createHash("sha256").update(input).digest("hex");
@@ -255,6 +244,18 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
 }
 
 function generationPrompt(input: { ocrText: string; count: number; gradeBand: string; language: string; seed: string }): string {
+  const gradeInstructions =
+    input.gradeBand === "g1"
+      ? [
+          "小学1年生向けです。",
+          "漢字はできるだけ使わず、数字以外はひらがなを基本にしてください。",
+          "どうしても必要な場合のみ、小1で習うかんたんな漢字を使ってください。"
+        ]
+      : [
+          "小学2〜3年生向けです。",
+          "かんたんな漢字は使ってよいですが、むずかしい漢字はひらがなにしてください。"
+        ];
+
   return [
     "ROLE: generator_v1",
     `Language: ${input.language}`,
@@ -268,6 +269,7 @@ function generationPrompt(input: { ocrText: string; count: number; gradeBand: st
     "- Keep difficulty around grade 1-3.",
     "- Each problem must be answerable with one correct option.",
     "- No explanations.",
+    ...gradeInstructions,
     "Source OCR:",
     input.ocrText
   ].join("\n");
@@ -286,28 +288,6 @@ function solvePrompt(input: { prompt: string; choices: string[]; language: strin
     "Problem:",
     input.prompt,
     "Choices:",
-    input.choices.map((c, i) => `${i}: ${c}`).join("\n")
-  ].join("\n");
-}
-
-function rewriteForKanjiPrompt(input: {
-  gradeBand: GradeBandApplied;
-  prompt: string;
-  choices: string[];
-}): string {
-  return [
-    "ROLE: text_normalizer_v1",
-    "You are a text normalizer for Japanese elementary math worksheets.",
-    `grade_band: ${input.gradeBand}`,
-    "Task:",
-    "- Rewrite prompt and choices to reduce hard kanji (use hiragana/katakana where needed).",
-    "- Do NOT change any numbers, units, meaning, or which choice is correct.",
-    "- Keep choice order unchanged.",
-    "Output STRICT JSON only:",
-    '{\"prompt\":\"...\",\"choices\":[\"...\",\"...\",\"...\",\"...\",\"...\"]}',
-    "Given prompt:",
-    input.prompt,
-    "Given choices:",
     input.choices.map((c, i) => `${i}: ${c}`).join("\n")
   ].join("\n");
 }
@@ -401,26 +381,57 @@ async function fetchGenerationDrafts(input: {
   return { drafts, calls, status, errors };
 }
 
-async function rewriteDraftForKanji(input: {
-  draft: GenerationDraft;
-  gradeBand: GradeBandApplied;
-}): Promise<GenerationDraft | null> {
-  const rewritten = await callGeminiJson(
-    rewriteForKanjiPrompt({
-      gradeBand: input.gradeBand,
-      prompt: input.draft.prompt,
-      choices: input.draft.choices
-    })
-  );
-  if (!rewritten.ok || !rewritten.data) return null;
-  const parsed = llmRewriteSchema.safeParse(rewritten.data);
-  if (!parsed.success) return null;
-  const candidate: GenerationDraft = {
-    prompt: normalizeSpaces(parsed.data.prompt),
-    choices: parsed.data.choices.map((c) => normalizeSpaces(c))
+function applyReplaceDict(text: string, dict: ReadonlyArray<[string, string]>): { text: string; changed: number } {
+  let out = text;
+  let changed = 0;
+  for (const [from, to] of dict) {
+    const next = out.split(from).join(to);
+    if (next !== out) {
+      changed += 1;
+      out = next;
+    }
+  }
+  return { text: out, changed };
+}
+
+function applyGradeBandLexicon(draft: GenerationDraft, gradeBand: GradeBandApplied): { draft: GenerationDraft; replacements: number } {
+  const g1Dict: Array<[string, string]> = [
+    ["練習", "れんしゅう"],
+    ["問題", "もんだい"],
+    ["開始", "はじめ"],
+    ["終了", "おわり"],
+    ["合計", "ごうけい"],
+    ["計算", "けいさん"],
+    ["選択", "せんたく"],
+    ["文字", "もじ"],
+    ["時間", "じかん"],
+    ["分間", "ふんかん"],
+    ["毎日", "まいにち"],
+    ["数量", "すうりょう"],
+    ["確認", "かくにん"]
+  ];
+  const g23Dict: Array<[string, string]> = [
+    ["難しい", "むずかしい"],
+    ["開始", "はじめ"],
+    ["終了", "おわり"]
+  ];
+  const dict = gradeBand === "g1" ? g1Dict : g23Dict;
+
+  const promptApplied = applyReplaceDict(draft.prompt, dict);
+  let replacements = promptApplied.changed;
+  const nextChoices = draft.choices.map((c) => {
+    const applied = applyReplaceDict(c, dict);
+    replacements += applied.changed;
+    return normalizeSpaces(applied.text);
+  });
+
+  return {
+    draft: {
+      prompt: normalizeSpaces(promptApplied.text),
+      choices: nextChoices
+    },
+    replacements
   };
-  if (!sameNumberTokens(input.draft, candidate)) return null;
-  return candidate;
 }
 
 export const microGenerateFromOcrRouter = Router();
@@ -448,12 +459,18 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let generationStatus: number | null = null;
   let solverStatus: number | null = null;
   let violationsCount = 0;
-  let rewriteAttempts = 0;
+  let localReplacements = 0;
   let gradeBandApplied: GradeBandApplied = requestedGradeBand ?? "g1";
   let gradeBandEstimated = requestedGradeBand !== null;
+  let hitTimeBudget = false;
 
   const batches = generationBatches(count);
   for (let batchIndex = 0; batchIndex < batches.length && accepted.length < count; batchIndex += 1) {
+    if (Date.now() - start >= REQUEST_TIME_BUDGET_MS) {
+      reasons.time_budget_exceeded = (reasons.time_budget_exceeded ?? 0) + 1;
+      hitTimeBudget = true;
+      break;
+    }
     const batchTarget = Math.min(batches[batchIndex], count - accepted.length);
     if (batchTarget <= 0) break;
 
@@ -481,55 +498,17 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     }
 
     for (const draft of generationDrafts) {
+      if (Date.now() - start >= REQUEST_TIME_BUDGET_MS) {
+        reasons.time_budget_exceeded = (reasons.time_budget_exceeded ?? 0) + 1;
+        hitTimeBudget = true;
+        break;
+      }
       if (accepted.length >= count) break;
-      let workingDraft: GenerationDraft | null = draft;
-      let guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+      const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
+      localReplacements += normalized.replacements;
+      const workingDraft = normalized.draft;
+      const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
       violationsCount += guard.violations_count;
-
-      if (!guard.ok) {
-        rewriteAttempts += 1;
-        const rewritten = await rewriteDraftForKanji({ draft: workingDraft, gradeBand: gradeBandApplied });
-        if (rewritten) {
-          workingDraft = rewritten;
-          guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
-          violationsCount += guard.violations_count;
-        }
-      }
-
-      let regenTry = 0;
-      while ((!workingDraft || !guard.ok) && regenTry < 2) {
-        regenTry += 1;
-        const regen = await fetchGenerationDrafts({
-          ocrText: ocr_text,
-          count: 1,
-          gradeBand: gradeBandApplied,
-          language,
-          seed: `${seedText}:regen:b${batchIndex}:r${regenTry}:${accepted.length}`
-        });
-        generationCalls += regen.calls;
-        generationStatus = regen.status;
-        for (const error of regen.errors) {
-          reasons[error] = (reasons[error] ?? 0) + 1;
-        }
-        if (regen.drafts.length === 0) continue;
-        workingDraft = regen.drafts[0];
-        guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
-        violationsCount += guard.violations_count;
-        if (!guard.ok) {
-          rewriteAttempts += 1;
-          const rewritten = await rewriteDraftForKanji({ draft: workingDraft, gradeBand: gradeBandApplied });
-          if (rewritten) {
-            workingDraft = rewritten;
-            guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
-            violationsCount += guard.violations_count;
-          }
-        }
-      }
-
-      if (!workingDraft || !guard.ok) {
-        reasons.kanji_guard_failed = (reasons.kanji_guard_failed ?? 0) + 1;
-        continue;
-      }
 
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
@@ -582,6 +561,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const appliedCount = accepted.length;
   const topItems = accepted[0]?.items ?? [];
   const needConfirm = appliedCount === 0;
+  const note =
+    appliedCount === 0
+      ? "unknown_no_viable_candidate"
+      : hitTimeBudget
+        ? "partial_success_timeout"
+        : appliedCount < count
+          ? "partial_success"
+          : "ok";
 
   const response = {
     spec_version: "micro_problem_render_v1" as const,
@@ -598,7 +585,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     need_confirm: needConfirm,
     reasons,
     meta: {
-      note: appliedCount === 0 ? "unknown_no_viable_candidate" : appliedCount < count ? "partial_success" : "ok",
+      note,
       seed: seedText,
       grade_band_applied: gradeBandApplied,
       request_hash: sha(normalizeSpaces(ocr_text)),
@@ -616,7 +603,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       kanji_guard: {
         checked: true,
         violations_count: violationsCount,
-        rewrite_attempts: rewriteAttempts
+        rewrite_attempts: 0,
+        local_replacements: localReplacements
       }
     }
   };

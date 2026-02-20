@@ -190,7 +190,7 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
   });
 });
 
-test("/micro/generate_from_ocr rewrites disallowed kanji for g1 and preserves numbers", async () => {
+test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
   await withMockFetch(async (original, input, init) => {
@@ -209,12 +209,6 @@ test("/micro/generate_from_ocr rewrites disallowed kanji for g1 and preserves nu
             choices: ["6個", "8個", "10個", "12個", "14個"]
           }
         ]
-      });
-    }
-    if (prompt.includes("ROLE: text_normalizer_v1")) {
-      return geminiResponse({
-        prompt: "まいにち2こずつれんしゅうもんだいをします。5にちでなんこですか。",
-        choices: ["6こ", "8こ", "10こ", "12こ", "14こ"]
       });
     }
     if (prompt.includes("ROLE: solver_v1")) {
@@ -238,13 +232,14 @@ test("/micro/generate_from_ocr rewrites disallowed kanji for g1 and preserves nu
         applied_count: number;
         problems: Array<{ prompt: string; choices: string[] }>;
         meta: { grade_band_applied: string };
-        debug: { kanji_guard: { rewrite_attempts: number; violations_count: number } };
+        debug: { kanji_guard: { rewrite_attempts: number; violations_count: number; local_replacements: number } };
       };
       assert.equal(res.status, 200);
       assert.equal(body.applied_count > 0, true);
       assert.equal(body.meta.grade_band_applied, "g1");
-      assert.equal(body.debug.kanji_guard.rewrite_attempts > 0, true);
+      assert.equal(body.debug.kanji_guard.rewrite_attempts, 0);
       assert.equal(body.debug.kanji_guard.violations_count > 0, true);
+      assert.equal(body.debug.kanji_guard.local_replacements > 0, true);
       assert.equal(body.problems[0].prompt.includes("練"), false);
       assert.equal(body.problems[0].choices[2].includes("10"), true);
     });
