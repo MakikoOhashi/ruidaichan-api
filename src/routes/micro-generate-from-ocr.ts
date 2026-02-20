@@ -79,6 +79,77 @@ function extractFirstNumber(s: string): number | null {
   return Number.isFinite(v) ? v : null;
 }
 
+type CanonicalUnit = "mm" | "cm" | "m" | "km" | "mL" | "dL" | "L" | "g" | "kg";
+
+const unitAlias: Record<string, CanonicalUnit> = {
+  mm: "mm",
+  ミリメートル: "mm",
+  cm: "cm",
+  センチメートル: "cm",
+  m: "m",
+  メートル: "m",
+  km: "km",
+  キロメートル: "km",
+  ml: "mL",
+  mL: "mL",
+  ミリリットル: "mL",
+  dl: "dL",
+  dL: "dL",
+  デシリットル: "dL",
+  l: "L",
+  L: "L",
+  リットル: "L",
+  g: "g",
+  グラム: "g",
+  kg: "kg",
+  キログラム: "kg"
+};
+
+const conversionRatio: Partial<Record<`${CanonicalUnit}->${CanonicalUnit}`, number>> = {
+  "mm->cm": 0.1,
+  "cm->mm": 10,
+  "cm->m": 0.01,
+  "m->cm": 100,
+  "m->km": 0.001,
+  "km->m": 1000,
+  "mL->dL": 0.1,
+  "dL->mL": 10,
+  "dL->L": 0.1,
+  "L->dL": 10,
+  "g->kg": 0.001,
+  "kg->g": 1000
+};
+
+type UnitConversionParsed = {
+  value: number;
+  fromUnit: CanonicalUnit;
+  toUnit: CanonicalUnit;
+};
+
+function normalizeUnitToken(token: string): CanonicalUnit | null {
+  const normalized = token.normalize("NFKC");
+  return unitAlias[normalized] ?? null;
+}
+
+function parseUnitConversion(text: string): UnitConversionParsed | null {
+  const normalized = text.normalize("NFKC");
+  const m = normalized.match(
+    /(\d+(?:\.\d+)?)\s*(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)\s*=\s*(?:□|口|ロ|_|\?)?\s*(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)/i
+  );
+  if (!m) return null;
+  const value = Number(m[1]);
+  const fromUnit = normalizeUnitToken(m[2]);
+  const toUnit = normalizeUnitToken(m[3]);
+  if (!Number.isFinite(value) || fromUnit === null || toUnit === null) return null;
+  return { value, fromUnit, toUnit };
+}
+
+function convertUnitValue(parsed: UnitConversionParsed): number | null {
+  const ratio = conversionRatio[`${parsed.fromUnit}->${parsed.toUnit}`];
+  if (ratio === undefined) return null;
+  return parsed.value * ratio;
+}
+
 function validateLight(problem: { prompt: string; choices: string[]; correct_index: number; answer_value: number }): { ok: boolean; reason?: string } {
   const choices = problem.choices.map((c) => normalizeSpaces(c));
   if (!problem.prompt || normalizeSpaces(problem.prompt).length < 5) return { ok: false, reason: "prompt_too_short" };
@@ -99,7 +170,9 @@ function validateLight(problem: { prompt: string; choices: string[]; correct_ind
 
 function isEquationStylePrompt(prompt: string): boolean {
   const normalized = prompt.normalize("NFKC");
-  return /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) && /=|□|口|ロ|_/.test(normalized);
+  const arithmeticStyle = /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) && /=|□|口|ロ|_/.test(normalized);
+  const conversionStyle = parseUnitConversion(normalized) !== null;
+  return arithmeticStyle || conversionStyle;
 }
 
 function parseJsonLoose(raw: string): unknown {
@@ -255,6 +328,7 @@ function generationPrompt(input: {
   language: string;
   seed: string;
   inputMode: "equation" | "word_problem";
+  conversionHint: boolean;
 }): string {
   const gradeInstructions =
     input.gradeBand === "g1"
@@ -284,7 +358,13 @@ function generationPrompt(input: {
     ...(input.inputMode === "equation"
       ? [
           "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
-          "- Do NOT convert equations into story/word problems."
+          "- Do NOT convert equations into story/word problems.",
+          ...(input.conversionHint
+            ? [
+                "- Keep unit-conversion equation style (e.g. 40mm = □cm, 3L = □dL).",
+                "- Allowed elementary conversions: mm/cm, cm/m, m/km, mL/dL, dL/L, g/kg."
+              ]
+            : [])
         ]
       : ["- Return short Japanese word-problem style prompts."]),
     "- No explanations.",
@@ -328,7 +408,8 @@ function detectInputMode(ocrText: string): "equation" | "word_problem" {
   const normalized = ocrText.normalize("NFKC");
   const hasEquationPattern =
     /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) ||
-    /[0-9]\s*=\s*[0-9□口ロ_]/.test(normalized);
+    /[0-9][^=\n]{0,16}=\s*[0-9□口ロ_]/.test(normalized) ||
+    parseUnitConversion(normalized) !== null;
   return hasEquationPattern ? "equation" : "word_problem";
 }
 
@@ -351,6 +432,7 @@ async function fetchGenerationDrafts(input: {
   language: string;
   seed: string;
   inputMode: "equation" | "word_problem";
+  conversionHint: boolean;
 }): Promise<DraftFetchResult> {
   let calls = 0;
   let status: number | null = null;
@@ -366,7 +448,8 @@ async function fetchGenerationDrafts(input: {
         gradeBand: input.gradeBand,
         language: input.language,
         seed: `${input.seed}:a${attempt}`,
-        inputMode: input.inputMode
+        inputMode: input.inputMode,
+        conversionHint: input.conversionHint
       })
     );
     status = genResp.status;
@@ -481,6 +564,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const start = Date.now();
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
+  const sourceConversion = parseUnitConversion(ocr_text);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -513,7 +597,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       gradeBand: grade_band ?? "g1_g3",
       language,
       seed: `${seedText}:b${batchIndex}`,
-      inputMode
+      inputMode,
+      conversionHint: sourceConversion !== null
     });
     generationCalls += generated.calls;
     generationStatus = generated.status;
@@ -547,6 +632,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
         continue;
       }
+      if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+        reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
+        continue;
+      }
 
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
@@ -572,6 +661,18 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         const key = light.reason ?? "light_validation_failed";
         reasons[key] = (reasons[key] ?? 0) + 1;
         continue;
+      }
+      const parsedConversion = parseUnitConversion(workingDraft.prompt);
+      if (parsedConversion !== null) {
+        const expected = convertUnitValue(parsedConversion);
+        if (expected === null) {
+          reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
+          continue;
+        }
+        if (Math.abs(expected - parsedSolve.data.answer_value) > 1e-9) {
+          reasons.unit_conversion_answer_mismatch = (reasons.unit_conversion_answer_mismatch ?? 0) + 1;
+          continue;
+        }
       }
 
       accepted.push({

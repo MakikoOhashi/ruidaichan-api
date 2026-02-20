@@ -298,6 +298,100 @@ test("/micro/generate_from_ocr keeps equation count=10", async () => {
   });
 });
 
+test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "40 mm = □ cm",
+            choices: ["2", "3", "4", "5", "6"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 4, correct_index: 2, equation: "40/10" });
+    }
+    return geminiResponse({ answer_value: 4, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "4 mm = □ cm",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "unit-mm-cm"
+        })
+      });
+
+      const body = (await res.json()) as { applied_count: number; detected_mode: string };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.applied_count > 0, true);
+    });
+  });
+});
+
+test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "3 L = □ dL",
+            choices: ["3", "30", "300", "0.3", "0.03"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 30, correct_index: 1, equation: "3*10" });
+    }
+    return geminiResponse({ answer_value: 30, correct_index: 1 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "3L=□dL",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "unit-l-dl"
+        })
+      });
+
+      const body = (await res.json()) as { applied_count: number; detected_mode: string };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.applied_count > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr rejects word-problemized output for equation input", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
