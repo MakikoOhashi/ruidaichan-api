@@ -345,6 +345,54 @@ test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode"
   });
 });
 
+test("/micro/generate_from_ocr supports noisy OCR unit conversion text", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "40 mm = □ cm",
+            choices: ["2", "3", "4", "5", "6"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 4, correct_index: 2, equation: "40/10" });
+    }
+    return geminiResponse({ answer_value: 4, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "③ 4 mm =。cm。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "unit-mm-cm-noisy"
+        })
+      });
+
+      const body = (await res.json()) as { detected_mode: string; debug: { input_mode: string }; applied_count: number };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.debug.input_mode, "equation");
+      assert.equal(body.applied_count > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

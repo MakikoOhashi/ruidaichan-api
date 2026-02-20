@@ -133,8 +133,13 @@ function normalizeUnitToken(token: string): CanonicalUnit | null {
 
 function parseUnitConversion(text: string): UnitConversionParsed | null {
   const normalized = text.normalize("NFKC");
+  const sep = String.raw`[\s。．、,・]*`;
+  const blank = String.raw`(?:□|口|ロ|_|\?)?`;
   const m = normalized.match(
-    /(\d+(?:\.\d+)?)\s*(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)\s*=\s*(?:□|口|ロ|_|\?)?\s*(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)/i
+    new RegExp(
+      String.raw`(\d+(?:\.\d+)?)${sep}(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)${sep}=${sep}${blank}${sep}(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)`,
+      "i"
+    )
   );
   if (!m) return null;
   const value = Number(m[1]);
