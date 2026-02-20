@@ -198,6 +198,10 @@ function includesMeterUnit(parsed: UnitConversionParsed): boolean {
   return parsed.fromUnit === "m" || parsed.toUnit === "m";
 }
 
+function conversionPairKey(parsed: UnitConversionParsed): string {
+  return `${parsed.fromUnit}->${parsed.toUnit}`;
+}
+
 function validateLight(problem: { prompt: string; choices: string[]; correct_index: number; answer_value: number }): { ok: boolean; reason?: string } {
   const choices = problem.choices.map((c) => normalizeSpaces(c));
   if (!problem.prompt || normalizeSpaces(problem.prompt).length < 5) return { ok: false, reason: "prompt_too_short" };
@@ -666,6 +670,51 @@ function buildLengthMeterFallbackProblem(seedText: string): GeneratedProblem {
   };
 }
 
+function buildLengthConversionFallbackProblem(seedText: string, kind: "cm_to_m" | "m_to_cm"): GeneratedProblem {
+  if (kind === "cm_to_m") {
+    const meters = (hashInt(`${seedText}:cm_to_m`) % 9) + 1;
+    const cm = meters * 100;
+    const answer = meters;
+    const choices = [String(answer), String(answer + 1), String(answer + 2), String(answer + 3), String(answer + 4)];
+    return {
+      prompt: `${cm} cm = □ m`,
+      choices,
+      correct_index: 0,
+      answer_value: answer,
+      equation: `${cm}/100`,
+      check_trace: `${cm}cm = ${answer}m`,
+      required_items: ["prompt", "choices"],
+      items: [
+        { type: "prompt", slot: "stem", text: `${cm} cm = □ m` },
+        { type: "choices", slot: "options", style: "mc", choices, correct_index: 0 }
+      ]
+    };
+  }
+
+  const meters = (hashInt(`${seedText}:m_to_cm`) % 9) + 1;
+  const answer = meters * 100;
+  const distractors = [answer - 100, answer + 100, answer + 200, answer - 200].filter((v) => v >= 0).slice(0, 4);
+  while (distractors.length < 4) distractors.push(answer + (distractors.length + 1) * 300);
+  const raw = [answer, ...distractors];
+  const unique = Array.from(new Set(raw)).slice(0, 5);
+  while (unique.length < 5) unique.push(answer + (unique.length + 1) * 500);
+  const choices = unique.map(String);
+  const correctIndex = unique.indexOf(answer);
+  return {
+    prompt: `${meters} m = □ cm`,
+    choices,
+    correct_index: correctIndex,
+    answer_value: answer,
+    equation: `${meters}*100`,
+    check_trace: `${meters}m = ${answer}cm`,
+    required_items: ["prompt", "choices"],
+    items: [
+      { type: "prompt", slot: "stem", text: `${meters} m = □ cm` },
+      { type: "choices", slot: "options", style: "mc", choices, correct_index: correctIndex }
+    ]
+  };
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -764,13 +813,6 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
           continue;
-        }
-        if (parsedDraftConversion !== null && unitDomainLock.domain === "length" && targetCount >= 10) {
-          const remainingSlots = targetCount - accepted.length;
-          if (!acceptedLengthHasMeter && remainingSlots <= 1 && !includesMeterUnit(parsedDraftConversion)) {
-            reasons.unit_diversity_need_meter = (reasons.unit_diversity_need_meter ?? 0) + 1;
-            continue;
-          }
         }
       }
 
@@ -902,13 +944,6 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
-          if (parsedDraftConversion !== null && unitDomainLock.domain === "length" && targetCount >= 10) {
-            const remainingSlots = targetCount - accepted.length;
-            if (!acceptedLengthHasMeter && remainingSlots <= 1 && !includesMeterUnit(parsedDraftConversion)) {
-              reasons.unit_diversity_need_meter = (reasons.unit_diversity_need_meter ?? 0) + 1;
-              continue;
-            }
-          }
         }
 
         solverCalls += 1;
@@ -988,15 +1023,35 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     }
   }
 
-  if (unitDomainLock?.domain === "length" && targetCount >= 10 && !acceptedLengthHasMeter && accepted.length > 0) {
-    const fallback = buildLengthMeterFallbackProblem(seedText);
-    if (accepted.length < targetCount) {
-      accepted.push(fallback);
-    } else {
+  if (unitDomainLock?.domain === "length" && targetCount >= 10 && accepted.length > 0) {
+    const parsedPairs = accepted
+      .map((p) => parseUnitConversion(p.prompt))
+      .filter((x): x is UnitConversionParsed => x !== null)
+      .map((p) => conversionPairKey(p));
+    const pairSet = new Set(parsedPairs);
+    const hasMeter = accepted
+      .map((p) => parseUnitConversion(p.prompt))
+      .some((p) => p !== null && includesMeterUnit(p));
+
+    let replaced = 0;
+    if (!hasMeter) {
+      const fallback = buildLengthMeterFallbackProblem(seedText);
       accepted[accepted.length - 1] = fallback;
+      replaced += 1;
+      reasons.unit_diversity_fallback_meter = (reasons.unit_diversity_fallback_meter ?? 0) + 1;
+      pairSet.add("m->cm");
     }
-    acceptedLengthHasMeter = true;
-    reasons.unit_diversity_fallback_meter = (reasons.unit_diversity_fallback_meter ?? 0) + 1;
+
+    if (pairSet.size < 2 && accepted.length >= 2) {
+      const fallback2 = buildLengthConversionFallbackProblem(seedText, "cm_to_m");
+      accepted[accepted.length - 2] = fallback2;
+      replaced += 1;
+      reasons.unit_diversity_fallback_pair = (reasons.unit_diversity_fallback_pair ?? 0) + 1;
+    }
+
+    if (replaced > 0) {
+      acceptedLengthHasMeter = true;
+    }
   }
 
   const appliedCount = accepted.length;

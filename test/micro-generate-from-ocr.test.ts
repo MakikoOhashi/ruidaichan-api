@@ -634,8 +634,11 @@ test("/micro/generate_from_ocr length conversion includes meter in mixed set for
       assert.equal(res.status, 200);
       assert.equal(body.applied_count, 10);
       assert.equal(body.problems.some((p) => p.prompt.includes(" m =")), true);
-      assert.equal((body.reasons.unit_diversity_need_meter ?? 0) > 0, true);
-      assert.equal(generatorCalls >= 3, true);
+      assert.equal(
+        (body.reasons.unit_diversity_fallback_meter ?? 0) > 0 || (body.reasons.unit_diversity_fallback_pair ?? 0) > 0,
+        true
+      );
+      assert.equal(generatorCalls >= 2, true);
     });
   });
 });
