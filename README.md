@@ -1,153 +1,165 @@
 # ruidaichan-api
 
-Extract-only stateless API for ruidaichan.
+小学校1〜3年の算数向けに、OCRテキストから類題を生成して返す stateless API です。
 
-## Design Reset (Layer Promotion)
+## Current Focus
 
-ruidaichan ecosystem is moving from fixed-template generation to a
-**layout-DSL–driven worksheet synthesis engine**.
+本線は `POST /micro/generate_from_ocr` です。
 
-This API keeps its role as a stable extraction layer:
-- Legacy(v0): count-based fixed-template flow is kept for regression/reference.
-- New core(v1+): layout DSL is owned by the app-side planning/rendering layer.
+- 入力: iOS Vision OCRの `ocr_text`（画像は補助）
+- 出力: `micro_problem_render_v1` 契約（`detected_mode` / `required_items` / `items` / `problems`）
+- 目的: 「即印刷できるA4問題」を短時間で返す
 
-This is a layer promotion, not a discard of existing assets.
+## Responsibility Boundary
 
-## Responsibilities
-
-- Server: OCR text -> CountExtract (coarse)
-- Client: CountExtract -> CountPlan (constraints) -> PDF
-- No DB / no server state
+- Server: 問題生成・軽量検証・描画向けJSON返却
+- iOS: OCR取得・UI・PDF描画
+- ServerはDBを持たない（stateless）
 
 ## Endpoints
 
-### GET /health
-
-Returns health status.
-
-Response:
+### GET `/health`
 
 ```json
-{ "ok": true }
+{
+  "ok": true,
+  "deploy_commit": "...",
+  "build_timestamp": "..."
+}
 ```
 
-### POST /extract
+### POST `/micro/generate_from_ocr` (main)
 
-Requires header `x-api-key: <API_KEY>`.
-Rate limit: 30 requests per minute per IP.
-Uses Gemini (`GEMINI_API_KEY`) for extraction.
+Header:
+
+- `x-api-key: <API_KEY>`
 
 Request:
 
 ```json
 {
   "ocr_text": "...",
-  "locale": "ja-JP",
-  "hint": { "grade": "nencho" }
+  "count": 5,
+  "grade_band": "g1|g2_g3|g1_g3",
+  "language": "ja",
+  "seed": "12345"
 }
 ```
 
-Response (dummy):
+Response (shape):
 
 ```json
 {
-  "template_id": "nencho_count_multi_v1",
-  "confidence": 0.82,
-  "items": [
-    { "slot": "slot_1", "category": "fruit", "count_range": [3, 10] },
-    { "slot": "slot_2", "category": "stationery", "count_range": [3, 10] }
-  ],
-  "scene": {
-    "categories": ["fruit", "stationery"],
-    "total_count_range": [6, 20]
+  "spec_version": "micro_problem_render_v1",
+  "schema_version": "micro_generate_from_ocr_response_v1",
+  "detected_mode": "equation|word_problem|unknown",
+  "required_items": ["prompt", "choices"],
+  "items": [],
+  "problems": [],
+  "requested_count": 5,
+  "applied_count": 5,
+  "meta": {
+    "count_policy": "server_enforced",
+    "max_count": 10,
+    "target_count": 5,
+    "grade_band_applied": "g1"
   },
-  "debug": {
-    "raw_ocr_hash": "sha256 hex",
-    "normalized_text_hash": "sha256 hex",
-    "model": "gemini-2.0-flash",
-    "prompt_version": "extract_v1_2026-02-15",
-    "raw_template_id": "count_worksheets",
-    "normalized_template_id": "nencho_count_multi_v1",
-    "normalization_reason": "not_allowed_fallback"
-  }
+  "debug": {}
 }
 ```
 
-If Gemini times out/errors/decode fails, API returns `502` with `request_id`.
+### Other endpoints (legacy/aux)
 
-## Local run
+- `POST /extract`
+- `POST /extract_layout`
+- `POST /extract_skeleton_layout`
+- `POST /micro/generate`
 
-1. Install dependencies:
+## Count Policy
+
+- `word_problem`: 最大5問
+- `equation`: 最大10問
+- `count`超過時はサーバー側で強制調整し、`meta.max_count` / `meta.target_count` を返却
+
+## Timeout / Partial Success Policy
+
+- 生成は時間予算内で実行
+- 取り切れない場合は `partial_success` を返す
+- 補充分の追加予算は短く制限（UX優先）
+
+## Scope (Roadmap Gate)
+
+今後の方針決定は以下教材群を基準に進めます。
+
+- [print365 1年計算](https://www.print365.net/2gakkimadekeisan1nen/)
+- [すきるまドリル](https://sukiruma.net/sandrill/)
+
+### 対応対象（1〜3年）
+
+- 図を使って考える（非インタラクティブで表現可能な範囲）
+- グラフ・表の読み取り
+- 作図（円・球）
+- ものさしの読み方（実物操作を除く出題文ベース）
+- 計算ピラミッド（図配置）
+- 単位変換（mm/cm, m, L/dL, g/kg など）
+
+### 除外対象（現時点）
+
+- 百ます計算（専用UIが必要）
+- 筆算
+
+## Definition of Done (家庭利用の合格基準)
+
+次を満たせば「小学1〜3年 家庭用途として完成」と判定します。
+
+- 図を使わない算数問題の **8割以上** を処理できる
+- 入力が **写真1枚 または OCRテキスト** で動作する
+- **類題5問** を安定生成できる
+- **A4で即印刷** できる形式で返せる
+
+この内容チェックが通ったら、UI作成フェーズへ進みます。
+
+## Local Development
+
+1. Install
 
 ```bash
 npm install
 ```
 
-2. Create env:
+2. Env
 
 ```bash
 cp .env.example .env
 ```
 
 Required env vars:
-- `API_KEY`: request auth key (`x-api-key`)
-- `GEMINI_API_KEY`: Gemini API key
-- optional: `GEMINI_MODEL` (default `gemini-2.0-flash`)
-- optional: `GEMINI_TIMEOUT_MS` (default `8000`)
-- optional: `GEMINI_TEMPERATURE` (default `0.1`)
 
-3. Start dev server:
+- `API_KEY`
+- `GEMINI_API_KEY`
+
+Optional env vars:
+
+- `GEMINI_MODEL` (default: `gemini-2.0-flash`)
+- `GEMINI_TIMEOUT_MS`
+- `GEMINI_TEMPERATURE`
+
+3. Run
 
 ```bash
 npm run dev
 ```
 
-## Render deploy
+4. Test
 
-- `render.yaml` included.
-- Set secret env var `API_KEY` in Render dashboard.
-- Log policy: structured logs with `request_id`, `ocr_text_hash`, `template_id`, `confidence`, `latency_ms`, `error` classification.
-- OCR raw text is not logged.
+```bash
+npm test
+npm run build
+```
 
-## Architecture Boundary (Source of Truth)
+## Security / Ops
 
-This API only returns **coarse extraction candidates**.  
-Final planning and layout decisions are owned by the iOS app.
-
-- iOS: OCR, constraints, `CountPlan` finalization, template slot fill, PDF generation
-- API: candidate extraction only (`/extract`)
-- Template: fixed asset for deterministic rendering
-
-See full responsibility flow:
-- [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
-
-## Legacy / New Core Status
-
-- `count`-based extraction contract is **legacy (v0)** and maintained.
-- API remains coarse-candidate output only; it does not finalize worksheet layout.
-- Layout DSL design/finalization is handled outside this API boundary.
-
-Related core issue in app repo:
-- **Define minimal Layout DSL (v1)**
-
-## アーキテクチャ境界（責務の正本）
-
-このAPIは**粗い抽出候補**のみを返します。  
-最終的な設計・レイアウト判断はiOSアプリ側の責務です。
-
-- iOS: OCR、制約適用、`CountPlan` の最終確定、テンプレートスロット充填、PDF生成
-- API: 候補抽出のみ（`/extract`）
-- Template: 決定論的レンダリングのための固定アセット
-
-責務フローの全体像:
-- [ruidaichan architecture](https://github.com/MakikoOhashi/ruidaichan/blob/main/docs/architecture.md)
-
-## Shared Contract
-
-- `contracts/template_ids.json` is the source of truth for:
-  - `contract_version`
-  - `default_template_id`
-  - `allowed_template_ids`
-  - `prompt_version`
-- API normalizes model output template IDs before returning `/extract` response.
-- Startup fails fast if `contract_version` or `prompt_version` is out of sync with server constants.
+- API key auth (`x-api-key`)
+- Rate limit enabled
+- Structured logs (`request_id`, latency, reason)
+- OCR本文は生ログ保存しない方針
