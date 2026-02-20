@@ -129,6 +129,12 @@ type UnitConversionParsed = {
   toUnit: CanonicalUnit;
 };
 
+type UnitDomain = "length" | "volume" | "weight";
+type UnitDomainLock = {
+  domain: UnitDomain;
+  allowedUnits: CanonicalUnit[];
+};
+
 function normalizeUnitToken(token: string): CanonicalUnit | null {
   const normalized = token.normalize("NFKC");
   return unitAlias[normalized] ?? null;
@@ -156,6 +162,31 @@ function convertUnitValue(parsed: UnitConversionParsed): number | null {
   const ratio = conversionRatio[`${parsed.fromUnit}->${parsed.toUnit}`];
   if (ratio === undefined) return null;
   return parsed.value * ratio;
+}
+
+function getUnitDomain(unit: CanonicalUnit): UnitDomain {
+  if (unit === "mm" || unit === "cm" || unit === "m" || unit === "km") return "length";
+  if (unit === "mL" || unit === "dL" || unit === "L") return "volume";
+  return "weight";
+}
+
+function buildUnitDomainLock(parsed: UnitConversionParsed | null): UnitDomainLock | null {
+  if (parsed === null) return null;
+  const fromDomain = getUnitDomain(parsed.fromUnit);
+  const toDomain = getUnitDomain(parsed.toUnit);
+  if (fromDomain !== toDomain) return null;
+  if (fromDomain === "length") return { domain: fromDomain, allowedUnits: ["mm", "cm", "m", "km"] };
+  if (fromDomain === "volume") return { domain: fromDomain, allowedUnits: ["mL", "dL", "L"] };
+  return { domain: fromDomain, allowedUnits: ["g", "kg"] };
+}
+
+function isConversionInDomain(parsed: UnitConversionParsed, lock: UnitDomainLock): boolean {
+  return (
+    getUnitDomain(parsed.fromUnit) === lock.domain &&
+    getUnitDomain(parsed.toUnit) === lock.domain &&
+    lock.allowedUnits.includes(parsed.fromUnit) &&
+    lock.allowedUnits.includes(parsed.toUnit)
+  );
 }
 
 function validateLight(problem: { prompt: string; choices: string[]; correct_index: number; answer_value: number }): { ok: boolean; reason?: string } {
@@ -337,6 +368,7 @@ function generationPrompt(input: {
   seed: string;
   inputMode: "equation" | "word_problem";
   conversionHint: boolean;
+  unitDomainLock: UnitDomainLock | null;
 }): string {
   const gradeInstructions =
     input.gradeBand === "g1"
@@ -370,7 +402,14 @@ function generationPrompt(input: {
           ...(input.conversionHint
             ? [
                 "- Keep unit-conversion equation style (e.g. 40mm = □cm, 3L = □dL).",
-                "- Allowed elementary conversions: mm/cm, cm/m, m/km, mL/dL, dL/L, g/kg."
+                "- Allowed elementary conversions: mm/cm, cm/m, m/km, mL/dL, dL/L, g/kg.",
+                ...(input.unitDomainLock
+                  ? [
+                      `- Unit domain lock: ${input.unitDomainLock.domain} only.`,
+                      `- Allowed units in this request: ${input.unitDomainLock.allowedUnits.join(", ")}.`,
+                      "- Do NOT generate conversion problems outside this unit domain."
+                    ]
+                  : [])
               ]
             : [])
         ]
@@ -454,6 +493,7 @@ async function fetchGenerationDrafts(input: {
   seed: string;
   inputMode: "equation" | "word_problem";
   conversionHint: boolean;
+  unitDomainLock: UnitDomainLock | null;
 }): Promise<DraftFetchResult> {
   let calls = 0;
   let status: number | null = null;
@@ -470,7 +510,8 @@ async function fetchGenerationDrafts(input: {
         language: input.language,
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
-        conversionHint: input.conversionHint
+        conversionHint: input.conversionHint,
+        unitDomainLock: input.unitDomainLock
       })
     );
     status = genResp.status;
@@ -596,6 +637,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
+  const unitDomainLock = buildUnitDomainLock(sourceConversion);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -626,11 +668,12 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ocrText: ocr_text,
       count: batchTarget,
       gradeBand: grade_band ?? "g1_g3",
-      language,
-      seed: `${seedText}:b${batchIndex}`,
-      inputMode,
-      conversionHint: sourceConversion !== null
-    });
+        language,
+        seed: `${seedText}:b${batchIndex}`,
+        inputMode,
+        conversionHint: sourceConversion !== null,
+        unitDomainLock
+      });
     generationCalls += generated.calls;
     generationStatus = generated.status;
     for (const error of generated.errors) {
@@ -667,6 +710,13 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
         continue;
       }
+      if (inputMode === "equation" && sourceConversion !== null && unitDomainLock !== null) {
+        const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
+        if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
+          reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+          continue;
+        }
+      }
 
       solverCalls += 1;
       const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
@@ -695,6 +745,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
       const parsedConversion = parseUnitConversion(workingDraft.prompt);
       if (parsedConversion !== null) {
+        if (unitDomainLock !== null && !isConversionInDomain(parsedConversion, unitDomainLock)) {
+          reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+          continue;
+        }
         const expected = convertUnitValue(parsedConversion);
         if (expected === null) {
           reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
@@ -752,7 +806,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         language,
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
-        conversionHint: sourceConversion !== null
+        conversionHint: sourceConversion !== null,
+        unitDomainLock
       });
       generationCalls += generated.calls;
       generationStatus = generated.status;
@@ -778,6 +833,13 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
           reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
           continue;
+        }
+        if (inputMode === "equation" && sourceConversion !== null && unitDomainLock !== null) {
+          const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
+          if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
+            reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+            continue;
+          }
         }
 
         solverCalls += 1;
@@ -809,6 +871,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         }
         const parsedConversion = parseUnitConversion(workingDraft.prompt);
         if (parsedConversion !== null) {
+          if (unitDomainLock !== null && !isConversionInDomain(parsedConversion, unitDomainLock)) {
+            reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+            continue;
+          }
           const expected = convertUnitValue(parsedConversion);
           if (expected === null) {
             reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
@@ -897,6 +963,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       language,
       grade_band,
       input_mode: inputMode,
+      unit_domain_lock: unitDomainLock,
       kanji_guard: {
         checked: true,
         violations_count: violationsCount,

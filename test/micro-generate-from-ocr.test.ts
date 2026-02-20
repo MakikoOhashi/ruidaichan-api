@@ -516,6 +516,62 @@ test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode",
   });
 });
 
+test("/micro/generate_from_ocr keeps unit-conversion domain locked by source example", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "3 L = □ dL",
+            choices: ["3", "30", "300", "0.3", "0.03"]
+          },
+          {
+            prompt: "40 mm = □ cm",
+            choices: ["2", "3", "4", "5", "6"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1") && prompt.includes("40 mm")) {
+      return geminiResponse({ answer_value: 4, correct_index: 2, equation: "40/10" });
+    }
+    return geminiResponse({ answer_value: 0, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "4 mm = □ cm",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "unit-domain-lock"
+        })
+      });
+
+      const body = (await res.json()) as {
+        applied_count: number;
+        problems: Array<{ prompt: string }>;
+        reasons: Record<string, number>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count > 0, true);
+      assert.equal(body.problems.some((p) => p.prompt.includes(" L = □ dL")), false);
+      assert.equal((body.reasons.unit_domain_mismatch ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr defaults ambiguous short text to equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
