@@ -190,6 +190,82 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
   });
 });
 
+test("/micro/generate_from_ocr uses fill retry to avoid very low applied_count", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  let generationCallCount = 0;
+  let solverCallCount = 0;
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      generationCallCount += 1;
+      if (generationCallCount === 1) {
+        return geminiResponse({
+          problems: [
+            { prompt: "8 + 3 - 2 = □", choices: ["8", "9", "10", "11", "12"] },
+            { prompt: "7 + 2 - 1 = □", choices: ["6", "7", "8", "9", "10"] }
+          ]
+        });
+      }
+      return geminiResponse({
+        problems: [
+          { prompt: "10 + 4 - 3 = □", choices: ["9", "10", "11", "12", "13"] },
+          { prompt: "9 + 5 - 6 = □", choices: ["6", "7", "8", "9", "10"] },
+          { prompt: "12 + 1 - 4 = □", choices: ["7", "8", "9", "10", "11"] }
+        ]
+      });
+    }
+
+    if (prompt.includes("ROLE: solver_v1")) {
+      solverCallCount += 1;
+      if (solverCallCount <= 2) {
+        return geminiResponse({ answer_value: 99, correct_index: 0, equation: "bad" }); // force reject
+      }
+      if (prompt.includes("10 + 4 - 3")) {
+        return geminiResponse({ answer_value: 11, correct_index: 2, equation: "10+4-3" });
+      }
+      if (prompt.includes("9 + 5 - 6")) {
+        return geminiResponse({ answer_value: 8, correct_index: 2, equation: "9+5-6" });
+      }
+      if (prompt.includes("12 + 1 - 4")) {
+        return geminiResponse({ answer_value: 9, correct_index: 2, equation: "12+1-4" });
+      }
+      return geminiResponse({ answer_value: 10, correct_index: 2, equation: "fallback" });
+    }
+
+    return geminiResponse({ answer_value: 11, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "8 + 5 - 3 = □",
+          count: 5,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "fill-retry"
+        })
+      });
+
+      const body = (await res.json()) as { applied_count: number; meta: { note: string } };
+      assert.equal(res.status, 200);
+      assert.equal(generationCallCount >= 2, true);
+      assert.equal(body.applied_count >= 3, true);
+      assert.equal(
+        body.meta.note === "partial_success_filled" || body.meta.note === "partial_success" || body.meta.note === "ok",
+        true
+      );
+    });
+  });
+});
+
 test("/micro/generate_from_ocr caps word_problem count=10 to max 5", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
   let generatorCalls = 0;

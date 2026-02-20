@@ -8,6 +8,9 @@ const GEMINI_TIMEOUT_MS = 15000;
 const MAX_GENERATION_RETRIES = 2;
 const DEFAULT_COUNT = 5;
 const REQUEST_TIME_BUDGET_MS = 45_000;
+const FILL_RETRY_MAX = 1;
+const FILL_EXTRA_BUDGET_MS = 8_000;
+const EARLY_SATISFY_COUNT = 4;
 
 type RenderItem =
   | { type: "prompt"; slot: "stem"; text: string }
@@ -564,6 +567,16 @@ function applyGradeBandLexicon(draft: GenerationDraft, gradeBand: GradeBandAppli
   };
 }
 
+function shouldStopEarly(
+  targetCount: number,
+  acceptedCount: number,
+  inputMode: "equation" | "word_problem"
+): boolean {
+  if (acceptedCount >= targetCount) return true;
+  if (inputMode !== "word_problem") return false;
+  return targetCount >= 5 && acceptedCount >= EARLY_SATISFY_COUNT;
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -640,7 +653,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         hitTimeBudget = true;
         break;
       }
-      if (accepted.length >= targetCount) break;
+      if (shouldStopEarly(targetCount, accepted.length, inputMode)) break;
       const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
       localReplacements += normalized.replacements;
       const workingDraft = normalized.draft;
@@ -712,6 +725,125 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           }
         ]
       });
+
+      if (shouldStopEarly(targetCount, accepted.length, inputMode)) {
+        break;
+      }
+    }
+  }
+
+  if (!shouldStopEarly(targetCount, accepted.length, inputMode)) {
+    const fillDeadline = start + REQUEST_TIME_BUDGET_MS + FILL_EXTRA_BUDGET_MS;
+    for (
+      let fillTry = 0;
+      fillTry < FILL_RETRY_MAX && !shouldStopEarly(targetCount, accepted.length, inputMode);
+      fillTry += 1
+    ) {
+      if (Date.now() >= fillDeadline) {
+        reasons.fill_retry_timeout = (reasons.fill_retry_timeout ?? 0) + 1;
+        break;
+      }
+
+      const needed = targetCount - accepted.length;
+      const generated = await fetchGenerationDrafts({
+        ocrText: ocr_text,
+        count: Math.min(needed, 5),
+        gradeBand: grade_band ?? "g1_g3",
+        language,
+        seed: `${seedText}:fill:${fillTry}`,
+        inputMode,
+        conversionHint: sourceConversion !== null
+      });
+      generationCalls += generated.calls;
+      generationStatus = generated.status;
+      for (const error of generated.errors) {
+        reasons[error] = (reasons[error] ?? 0) + 1;
+      }
+      if (generated.drafts.length === 0) {
+        reasons.fill_retry_empty = (reasons.fill_retry_empty ?? 0) + 1;
+        continue;
+      }
+
+      for (const draft of generated.drafts) {
+        if (shouldStopEarly(targetCount, accepted.length, inputMode) || Date.now() >= fillDeadline) break;
+        const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
+        localReplacements += normalized.replacements;
+        const workingDraft = normalized.draft;
+        const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+        violationsCount += guard.violations_count;
+        if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
+          reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+          continue;
+        }
+        if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+          reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
+          continue;
+        }
+
+        solverCalls += 1;
+        const solveResp = await callGeminiJson(
+          solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language })
+        );
+        solverStatus = solveResp.status;
+        if (!solveResp.ok || !solveResp.data) {
+          reasons[solveResp.error ?? "solver_failed"] = (reasons[solveResp.error ?? "solver_failed"] ?? 0) + 1;
+          continue;
+        }
+
+        const parsedSolve = llmSolveSchema.safeParse(solveResp.data);
+        if (!parsedSolve.success) {
+          reasons.solver_schema_invalid = (reasons.solver_schema_invalid ?? 0) + 1;
+          continue;
+        }
+
+        const light = validateLight({
+          prompt: workingDraft.prompt,
+          choices: workingDraft.choices.slice(0, 5),
+          correct_index: parsedSolve.data.correct_index,
+          answer_value: parsedSolve.data.answer_value
+        });
+        if (!light.ok) {
+          const key = light.reason ?? "light_validation_failed";
+          reasons[key] = (reasons[key] ?? 0) + 1;
+          continue;
+        }
+        const parsedConversion = parseUnitConversion(workingDraft.prompt);
+        if (parsedConversion !== null) {
+          const expected = convertUnitValue(parsedConversion);
+          if (expected === null) {
+            reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
+            continue;
+          }
+          if (Math.abs(expected - parsedSolve.data.answer_value) > 1e-9) {
+            reasons.unit_conversion_answer_mismatch = (reasons.unit_conversion_answer_mismatch ?? 0) + 1;
+            continue;
+          }
+        }
+
+        accepted.push({
+          prompt: normalizeSpaces(workingDraft.prompt),
+          choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
+          correct_index: parsedSolve.data.correct_index,
+          answer_value: parsedSolve.data.answer_value,
+          equation: parsedSolve.data.equation,
+          check_trace: parsedSolve.data.check_trace,
+          required_items: ["prompt", "choices"],
+          items: [
+            { type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) },
+            {
+              type: "choices",
+              slot: "options",
+              style: "mc",
+              choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
+              correct_index: parsedSolve.data.correct_index
+            }
+          ]
+        });
+
+        if (shouldStopEarly(targetCount, accepted.length, inputMode)) {
+          break;
+        }
+      }
     }
   }
 
@@ -724,7 +856,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       : hitTimeBudget
         ? "partial_success_timeout"
         : appliedCount < targetCount
-          ? "partial_success"
+          ? inputMode === "word_problem" && appliedCount >= EARLY_SATISFY_COUNT
+            ? "partial_success_filled"
+            : "partial_success"
           : cappedByPolicy
             ? "ok_count_capped_by_policy"
           : "ok";
