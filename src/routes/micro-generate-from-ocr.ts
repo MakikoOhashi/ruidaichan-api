@@ -406,11 +406,24 @@ function isRetriableGenError(error?: string): boolean {
 
 function detectInputMode(ocrText: string): "equation" | "word_problem" {
   const normalized = ocrText.normalize("NFKC");
-  const hasEquationPattern =
-    /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) ||
-    /[0-9][^=\n]{0,16}=\s*[0-9□口ロ_]/.test(normalized) ||
-    parseUnitConversion(normalized) !== null;
-  return hasEquationPattern ? "equation" : "word_problem";
+  const hasEquals = normalized.includes("=");
+  const hasBlank = /□|＿|_|\[\]|\b空欄\b/.test(normalized);
+  const hasArithmeticPattern = /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized);
+  const hasUnitConversionPattern = parseUnitConversion(normalized) !== null;
+  const hasNumberUnitPair = /\d+\s*(mm|cm|km|mL|dL|L|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
+    normalized
+  );
+  const wordMarkers = /(ですか|なりますか|つぎから|えらびなさい|あげました|のこり|何こ|何本|何人|毎日|きょう|きのう)/;
+  const sentenceLike = /[。！？]/.test(normalized);
+  const wordMarkerCount = (normalized.match(new RegExp(wordMarkers, "g")) ?? []).length;
+
+  if (hasEquals || hasBlank || hasArithmeticPattern || hasUnitConversionPattern || hasNumberUnitPair) {
+    return "equation";
+  }
+  if (sentenceLike && wordMarkerCount >= 2) {
+    return "word_problem";
+  }
+  return "equation";
 }
 
 function generationBatches(count: 4 | 5 | 10): number[] {

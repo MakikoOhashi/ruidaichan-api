@@ -90,7 +90,7 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
         body: JSON.stringify({
-          ocr_text: "毎日1ページずつ。1ページ8問。6/4から6/10まで。",
+          ocr_text: "けいさんのれんしゅうです。つぎから1つえらびなさい。どうなりますか。",
           count: 4,
           grade_band: "g1_g3",
           language: "ja",
@@ -221,7 +221,7 @@ test("/micro/generate_from_ocr caps word_problem count=10 to max 5", async () =>
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
         body: JSON.stringify({
-          ocr_text: "まいにち けいさん れんしゅう",
+          ocr_text: "けいさんのもんだいです。つぎから1つえらびなさい。どうなりますか。",
           count: 10,
           grade_band: "g1",
           language: "ja",
@@ -392,6 +392,98 @@ test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode",
   });
 });
 
+test("/micro/generate_from_ocr defaults ambiguous short text to equation mode", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "8 + 5 - 3 = □",
+            choices: ["8", "9", "10", "11", "12"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 10, correct_index: 2, equation: "8+5-3" });
+    }
+    return geminiResponse({ answer_value: 10, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "8+5-3",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "ambiguous-equation-default"
+        })
+      });
+      const body = (await res.json()) as { detected_mode: string; debug: { input_mode: string } };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.debug.input_mode, "equation");
+    });
+  });
+});
+
+test("/micro/generate_from_ocr keeps clear sentence as word_problem mode", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "えんぴつが7本あります。友だちに3本あげました。のこりは何本ですか。",
+            choices: ["3本", "4本", "5本", "6本", "7本"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 4, correct_index: 1, equation: "7-3" });
+    }
+    return geminiResponse({ answer_value: 4, correct_index: 1 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "えんぴつが7本あります。友だちに3本あげました。のこりは何本ですか。つぎから1つえらびなさい。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "clear-word-problem"
+        })
+      });
+      const body = (await res.json()) as { detected_mode: string; debug: { input_mode: string } };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "word_problem");
+      assert.equal(body.debug.input_mode, "word_problem");
+    });
+  });
+});
+
 test("/micro/generate_from_ocr rejects word-problemized output for equation input", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
@@ -474,7 +566,7 @@ test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () 
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
         body: JSON.stringify({
-          ocr_text: "まいにち2こずつ 5にち",
+          ocr_text: "れんしゅうもんだいです。つぎから1つえらびなさい。どうなりますか。",
           count: 4,
           grade_band: "g1",
           language: "ja",
