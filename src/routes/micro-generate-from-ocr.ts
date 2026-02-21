@@ -110,6 +110,9 @@ const unitAlias: Record<string, CanonicalUnit> = {
   キログラム: "kg"
 };
 
+const UNIT_TOKEN_PATTERN =
+  "(mL|dL|mm|cm|km|kg|L|m|g|ミリリットル|デシリットル|リットル|ミリメートル|センチメートル|キロメートル|メートル|キログラム|グラム)";
+
 const conversionRatio: Partial<Record<`${CanonicalUnit}->${CanonicalUnit}`, number>> = {
   "mm->cm": 0.1,
   "cm->mm": 10,
@@ -170,8 +173,7 @@ function parseUnitConversion(text: string): UnitConversionParsed | null {
 
 function parseUnitConversionLoose(text: string): UnitConversionParsed | null {
   const normalized = text.normalize("NFKC");
-  const unitPattern =
-    "(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
+  const unitPattern = UNIT_TOKEN_PATTERN;
 
   const direct = normalized.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*${unitPattern}\s*(?:を|から)?\s*${unitPattern}\s*(?:に|へ)?`, "i"));
   if (direct) {
@@ -196,8 +198,7 @@ function parseCompositeUnitConversion(text: string): CompositeUnitConversionPars
   const normalized = text.normalize("NFKC");
   const sep = String.raw`[\s。．、,・]*`;
   const blank = String.raw`(?:□|口|ロ|_|\?)?`;
-  const unitPattern =
-    "(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
+  const unitPattern = UNIT_TOKEN_PATTERN;
   const m = normalized.match(new RegExp(String.raw`(\d+)${sep}${unitPattern}${sep}(\d+)${sep}${unitPattern}${sep}=${sep}${blank}${sep}${unitPattern}`, "i"));
   if (!m) return null;
   const firstValue = Number(m[1]);
@@ -259,8 +260,7 @@ function hasPureUnitConversionForm(text: string): boolean {
 
 function extractCanonicalUnits(text: string): CanonicalUnit[] {
   const normalized = text.normalize("NFKC");
-  const pattern =
-    /(mL|dL|mm|cm|km|kg|L|m|g|ミリリットル|デシリットル|リットル|ミリメートル|センチメートル|キロメートル|メートル|キログラム|グラム)/gi;
+  const pattern = new RegExp(UNIT_TOKEN_PATTERN, "gi");
   const out: CanonicalUnit[] = [];
   let m: RegExpExecArray | null;
   while ((m = pattern.exec(normalized)) !== null) {
@@ -312,9 +312,26 @@ function isEquationStylePrompt(prompt: string): boolean {
 }
 
 function hasUnitToken(text: string): boolean {
-  return /(mm|cm|km|mL|dL|L|m|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
-    text.normalize("NFKC")
-  );
+  const normalized = text.normalize("NFKC");
+  return new RegExp(`${UNIT_TOKEN_PATTERN}|円`, "i").test(normalized);
+}
+
+function isExplicitUnitConversionCalc(text: string): boolean {
+  const normalized = text.normalize("NFKC");
+  if (!normalized.includes("=")) return false;
+  const [lhsRaw, rhsRaw = ""] = normalized.split("=");
+  const lhs = lhsRaw ?? "";
+  const rhs = rhsRaw ?? "";
+  if (!/[+\-×÷]/.test(lhs)) return false;
+
+  const lhsNumbers = lhs.match(/\d+(?:\.\d+)?/g) ?? [];
+  const lhsUnitTerms = [...lhs.matchAll(new RegExp(`\\d+(?:\\.\\d+)?\\s*${UNIT_TOKEN_PATTERN}`, "gi"))];
+  if (lhsNumbers.length < 2) return false;
+  if (lhsNumbers.length !== lhsUnitTerms.length) return false;
+
+  const rhsHasUnit = new RegExp(UNIT_TOKEN_PATTERN, "i").test(rhs);
+  const rhsHasTarget = /□|口|ロ|_|\d/.test(rhs);
+  return rhsHasUnit && rhsHasTarget;
 }
 
 function detectEquationTrack(text: string): EquationTrackAnalysis {
@@ -326,6 +343,7 @@ function detectEquationTrack(text: string): EquationTrackAnalysis {
   const hasUnits = hasUnitToken(normalized);
   const unitCount = extractCanonicalUnits(normalized).length;
   const numberCount = (normalized.match(/\d+/g) ?? []).length;
+  const explicitCalc = isExplicitUnitConversionCalc(normalized);
 
   // OCRが崩れて「2L9dL=□dL」が「2- 9α- = dL」のようになるケースを純変換側へ寄せる
   const sparsePureHint = hasEq && hasUnits && unitCount <= 1 && numberCount >= 2;
@@ -333,10 +351,10 @@ function detectEquationTrack(text: string): EquationTrackAnalysis {
   if (pureConversion) {
     return { track: "unit_conversion_pure", decision: "explicit_pure", ambiguous: false, reason: null };
   }
-  if (hasUnits && hasOpPattern && hasEq) {
+  if (explicitCalc) {
     return { track: "unit_conversion_calc", decision: "explicit_calc", ambiguous: false, reason: null };
   }
-  if (sparsePureHint) {
+  if (sparsePureHint || (hasEq && hasUnits && hasOpPattern && !explicitCalc)) {
     return {
       track: "unit_conversion_pure",
       decision: "heuristic_pure",
