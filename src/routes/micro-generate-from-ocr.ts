@@ -325,6 +325,14 @@ function isWordProblemIntentCompatible(prompt: string, intent: WordProblemIntent
   return hasCompareSignal && hasCombineSignal;
 }
 
+function isRelaxedWordProblem(prompt: string): boolean {
+  const normalized = prompt.normalize("NFKC");
+  const sentenceLike = /[。！？?]/.test(normalized);
+  const numberCount = (normalized.match(/\d+/g) ?? []).length;
+  const questionLike = /(いくつ|なんこ|何こ|何本|何人|残|のこり|のこって|全部|ぜんぶ)/.test(normalized);
+  return sentenceLike && numberCount >= 2 && questionLike;
+}
+
 function parseJsonLoose(raw: string): unknown {
   const t = raw.trim();
   try {
@@ -870,9 +878,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
       const generatedCategory = detectSolveCategory(workingDraft.prompt);
       if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
-        reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
-        batchRejectCounts.classification_mismatch = (batchRejectCounts.classification_mismatch ?? 0) + 1;
-        continue;
+        const relaxedWordProblemAccept =
+          inputMode === "word_problem" && sourceWordIntent === "general" && isRelaxedWordProblem(workingDraft.prompt);
+        if (!relaxedWordProblemAccept) {
+          reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
+          batchRejectCounts.classification_mismatch = (batchRejectCounts.classification_mismatch ?? 0) + 1;
+          continue;
+        }
+        reasons.classification_relaxed_accept = (reasons.classification_relaxed_accept ?? 0) + 1;
       }
       if (inputMode === "word_problem" && !isWordProblemIntentCompatible(workingDraft.prompt, sourceWordIntent)) {
         reasons.intent_mismatch = (reasons.intent_mismatch ?? 0) + 1;
@@ -1001,9 +1014,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         }
         const generatedCategory = detectSolveCategory(workingDraft.prompt);
         if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
-          reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
-          fillRejectCounts.classification_mismatch = (fillRejectCounts.classification_mismatch ?? 0) + 1;
-          continue;
+          const relaxedWordProblemAccept =
+            inputMode === "word_problem" && sourceWordIntent === "general" && isRelaxedWordProblem(workingDraft.prompt);
+          if (!relaxedWordProblemAccept) {
+            reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
+            fillRejectCounts.classification_mismatch = (fillRejectCounts.classification_mismatch ?? 0) + 1;
+            continue;
+          }
+          reasons.classification_relaxed_accept = (reasons.classification_relaxed_accept ?? 0) + 1;
         }
         if (inputMode === "word_problem" && !isWordProblemIntentCompatible(workingDraft.prompt, sourceWordIntent)) {
           reasons.intent_mismatch = (reasons.intent_mismatch ?? 0) + 1;
