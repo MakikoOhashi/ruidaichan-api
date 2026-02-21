@@ -21,6 +21,7 @@ type GeneratedProblem = {
 
 type InputMode = "equation" | "word_problem";
 type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_calc";
+type WordProblemIntent = "compare_diff" | "general";
 
 const requestSchema = z
   .object({
@@ -301,6 +302,25 @@ function isCategoryCompatible(source: SolveCategory, generated: SolveCategory): 
   return false;
 }
 
+function detectWordProblemIntent(text: string): WordProblemIntent {
+  const normalized = text.normalize("NFKC");
+  const hasCompareSignal = /(どちら|より)/.test(normalized) && /(多い|少ない|差)/.test(normalized);
+  const hasCombineSignal = /(合わせる|あわせる|合計)/.test(normalized);
+  const numberCount = (normalized.match(/\d+/g) ?? []).length;
+  if (hasCompareSignal && hasCombineSignal && numberCount >= 3) {
+    return "compare_diff";
+  }
+  return "general";
+}
+
+function isWordProblemIntentCompatible(prompt: string, intent: WordProblemIntent): boolean {
+  if (intent === "general") return true;
+  const normalized = prompt.normalize("NFKC");
+  const hasCompareSignal = /(どちら|より)/.test(normalized) && /(多い|少ない|差)/.test(normalized);
+  const hasCombineSignal = /(合わせる|あわせる|合計)/.test(normalized);
+  return hasCompareSignal && hasCombineSignal;
+}
+
 function parseJsonLoose(raw: string): unknown {
   const t = raw.trim();
   try {
@@ -421,6 +441,7 @@ function generationPrompt(input: {
   seed: string;
   inputMode: InputMode;
   equationTrack: EquationTrack | null;
+  wordProblemIntent: WordProblemIntent;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
 }): string {
@@ -492,7 +513,15 @@ function generationPrompt(input: {
               ]
             : [])
         ]
-      : ["- Return short Japanese word-problem style prompts."]),
+      : [
+          ...(input.wordProblemIntent === "compare_diff"
+            ? [
+                "- Return ONLY compare-difference word problems.",
+                "- Keep the pattern: combine two groups, then ask which side is more and by how much.",
+                "- Do NOT switch to simple total-sum-only questions."
+              ]
+            : ["- Return short Japanese word-problem style prompts."])
+        ]),
     "- No explanations.",
     ...gradeInstructions,
     "Source OCR:",
@@ -560,6 +589,7 @@ async function fetchGenerationDrafts(input: {
   seed: string;
   inputMode: InputMode;
   equationTrack: EquationTrack | null;
+  wordProblemIntent: WordProblemIntent;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
 }): Promise<DraftFetchResult> {
@@ -579,6 +609,7 @@ async function fetchGenerationDrafts(input: {
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
         equationTrack: input.equationTrack,
+        wordProblemIntent: input.wordProblemIntent,
         conversionHint: input.conversionHint,
         unitDomainLock: input.unitDomainLock
       })
@@ -724,6 +755,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
   const equationTrack = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
+  const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocr_text) : "general";
   const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
   const unitDomainLock = buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text));
@@ -773,6 +805,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: `${seedText}:b${batchIndex}`,
         inputMode,
         equationTrack,
+        wordProblemIntent: sourceWordIntent,
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
@@ -828,6 +861,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
         reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
         batchRejectCounts.classification_mismatch = (batchRejectCounts.classification_mismatch ?? 0) + 1;
+        continue;
+      }
+      if (inputMode === "word_problem" && !isWordProblemIntentCompatible(workingDraft.prompt, sourceWordIntent)) {
+        reasons.intent_mismatch = (reasons.intent_mismatch ?? 0) + 1;
+        batchRejectCounts.intent_mismatch = (batchRejectCounts.intent_mismatch ?? 0) + 1;
         continue;
       }
       if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
@@ -912,6 +950,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
         equationTrack,
+        wordProblemIntent: sourceWordIntent,
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
@@ -953,6 +992,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
           reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
           fillRejectCounts.classification_mismatch = (fillRejectCounts.classification_mismatch ?? 0) + 1;
+          continue;
+        }
+        if (inputMode === "word_problem" && !isWordProblemIntentCompatible(workingDraft.prompt, sourceWordIntent)) {
+          reasons.intent_mismatch = (reasons.intent_mismatch ?? 0) + 1;
+          fillRejectCounts.intent_mismatch = (fillRejectCounts.intent_mismatch ?? 0) + 1;
           continue;
         }
         if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
@@ -1096,6 +1140,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       grade_band,
       input_mode: inputMode,
       source_category: sourceCategory,
+      source_word_intent: sourceWordIntent,
       equation_track: equationTrack,
       generation_timeline: generationTimeline,
       equation_style_miss_samples: equationStyleMissSamples,
@@ -1117,6 +1162,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       request_id: requestId,
       input_mode: inputMode,
       equation_track: equationTrack,
+      source_word_intent: sourceWordIntent,
       requested_count: count,
       target_count: targetCount,
       applied_count: appliedCount,
