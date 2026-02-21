@@ -124,6 +124,14 @@ type UnitConversionParsed = {
   toUnit: CanonicalUnit;
 };
 
+type CompositeUnitConversionParsed = {
+  firstValue: number;
+  firstUnit: CanonicalUnit;
+  secondValue: number;
+  secondUnit: CanonicalUnit;
+  toUnit: CanonicalUnit;
+};
+
 type UnitDomain = "length" | "volume" | "weight";
 type UnitDomainLock = {
   domain: UnitDomain;
@@ -177,6 +185,29 @@ function parseUnitConversionLoose(text: string): UnitConversionParsed | null {
   return { value, fromUnit, toUnit };
 }
 
+function parseCompositeUnitConversion(text: string): CompositeUnitConversionParsed | null {
+  const normalized = text.normalize("NFKC");
+  const sep = String.raw`[\s。．、,・]*`;
+  const blank = String.raw`(?:□|口|ロ|_|\?)?`;
+  const unitPattern =
+    "(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
+  const m = normalized.match(new RegExp(String.raw`(\d+)${sep}${unitPattern}${sep}(\d+)${sep}${unitPattern}${sep}=${sep}${blank}${sep}${unitPattern}`, "i"));
+  if (!m) return null;
+  const firstValue = Number(m[1]);
+  const firstUnit = normalizeUnitToken(m[2]);
+  const secondValue = Number(m[3]);
+  const secondUnit = normalizeUnitToken(m[4]);
+  const toUnit = normalizeUnitToken(m[5]);
+  if (!Number.isFinite(firstValue) || !Number.isFinite(secondValue) || firstUnit === null || secondUnit === null || toUnit === null) {
+    return null;
+  }
+  const d1 = getUnitDomain(firstUnit);
+  const d2 = getUnitDomain(secondUnit);
+  const d3 = getUnitDomain(toUnit);
+  if (!(d1 === d2 && d2 === d3)) return null;
+  return { firstValue, firstUnit, secondValue, secondUnit, toUnit };
+}
+
 function formatCanonicalUnit(unit: CanonicalUnit): string {
   return unit;
 }
@@ -205,6 +236,18 @@ function buildUnitDomainLock(parsed: UnitConversionParsed | null): UnitDomainLoc
   if (fromDomain === "length") return { domain: fromDomain, allowedUnits: ["mm", "cm", "m", "km"] };
   if (fromDomain === "volume") return { domain: fromDomain, allowedUnits: ["mL", "dL", "L"] };
   return { domain: fromDomain, allowedUnits: ["g", "kg"] };
+}
+
+function buildUnitDomainLockFromComposite(parsed: CompositeUnitConversionParsed | null): UnitDomainLock | null {
+  if (parsed === null) return null;
+  const domain = getUnitDomain(parsed.firstUnit);
+  if (domain === "length") return { domain, allowedUnits: ["mm", "cm", "m", "km"] };
+  if (domain === "volume") return { domain, allowedUnits: ["mL", "dL", "L"] };
+  return { domain, allowedUnits: ["g", "kg"] };
+}
+
+function hasPureUnitConversionForm(text: string): boolean {
+  return parseUnitConversion(text) !== null || parseUnitConversionLoose(text) !== null || parseCompositeUnitConversion(text) !== null;
 }
 
 function isConversionInDomain(parsed: UnitConversionParsed, lock: UnitDomainLock): boolean {
@@ -241,7 +284,8 @@ function detectEquationTrack(text: string): EquationTrack {
   const normalized = text.normalize("NFKC");
   const hasOp = /[\+\-\*×÷]/.test(normalized);
   const hasEq = /=/.test(normalized) || /□|口|ロ|_|\[\]/.test(normalized);
-  const pureConversion = parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null;
+  const pureConversion =
+    parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null || parseCompositeUnitConversion(normalized) !== null;
   const hasUnits = hasUnitToken(normalized);
 
   if (pureConversion) return "unit_conversion_pure";
@@ -254,7 +298,11 @@ function isPromptCompatibleWithTrack(prompt: string, track: EquationTrack): bool
   if (!isEquationStylePrompt(normalized)) return false;
 
   if (track === "unit_conversion_pure") {
-    return parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null;
+    return (
+      parseUnitConversion(normalized) !== null ||
+      parseUnitConversionLoose(normalized) !== null ||
+      parseCompositeUnitConversion(normalized) !== null
+    );
   }
 
   if (track === "unit_conversion_calc") {
@@ -777,7 +825,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocr_text) : "general";
   const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
-  const unitDomainLock = buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text));
+  const sourceCompositeConversion = parseCompositeUnitConversion(ocr_text);
+  const unitDomainLock =
+    buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text)) ?? buildUnitDomainLockFromComposite(sourceCompositeConversion);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -861,7 +911,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       let workingDraft = normalized.draft;
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
       violationsCount += guard.violations_count;
-      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
+      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
         const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
         if (looseParsed !== null) {
           workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
@@ -892,7 +942,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         batchRejectCounts.intent_mismatch = (batchRejectCounts.intent_mismatch ?? 0) + 1;
         continue;
       }
-      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
+      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
         reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
         batchRejectCounts.unit_conversion_style_miss = (batchRejectCounts.unit_conversion_style_miss ?? 0) + 1;
         continue;
@@ -918,7 +968,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           batchRejectCounts.unit_domain_mismatch = (batchRejectCounts.unit_domain_mismatch ?? 0) + 1;
           continue;
         }
-        if (convertUnitValue(parsedConversion) === null) {
+        if (equationTrack === "unit_conversion_pure" && convertUnitValue(parsedConversion) === null) {
           reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
           batchRejectCounts.unit_conversion_pair_unsupported = (batchRejectCounts.unit_conversion_pair_unsupported ?? 0) + 1;
           continue;
@@ -997,7 +1047,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         let workingDraft = normalized.draft;
         const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
         violationsCount += guard.violations_count;
-        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
+        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
           const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
           if (looseParsed !== null) {
             workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
@@ -1028,7 +1078,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           fillRejectCounts.intent_mismatch = (fillRejectCounts.intent_mismatch ?? 0) + 1;
           continue;
         }
-        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
+        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
           reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
           fillRejectCounts.unit_conversion_style_miss = (fillRejectCounts.unit_conversion_style_miss ?? 0) + 1;
           continue;
@@ -1054,7 +1104,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             fillRejectCounts.unit_domain_mismatch = (fillRejectCounts.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
-          if (convertUnitValue(parsedConversion) === null) {
+          if (equationTrack === "unit_conversion_pure" && convertUnitValue(parsedConversion) === null) {
             reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
             fillRejectCounts.unit_conversion_pair_unsupported = (fillRejectCounts.unit_conversion_pair_unsupported ?? 0) + 1;
             continue;
