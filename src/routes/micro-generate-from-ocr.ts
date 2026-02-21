@@ -541,6 +541,11 @@ function generationBatches(count: 4 | 5 | 10): number[] {
   return [count];
 }
 
+function generationDraftTarget(batchTarget: number, inputMode: InputMode): number {
+  if (inputMode !== "word_problem") return batchTarget;
+  return Math.min(10, Math.max(batchTarget + 3, batchTarget));
+}
+
 type DraftFetchResult = {
   drafts: GenerationDraft[];
   calls: number;
@@ -759,10 +764,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     }
     const batchTarget = Math.min(batches[batchIndex], targetCount - accepted.length);
     if (batchTarget <= 0) break;
+    const draftTarget = generationDraftTarget(batchTarget, inputMode);
 
     const generated = await fetchGenerationDrafts({
       ocrText: ocr_text,
-      count: batchTarget,
+      count: draftTarget,
       gradeBand: grade_band ?? "g1_g3",
         language,
         seed: `${seedText}:b${batchIndex}`,
@@ -877,7 +883,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     generationTimeline.push({
       phase: "batch",
       index: batchIndex,
-      requested: batchTarget,
+      requested: draftTarget,
       drafts: generationDrafts.length,
       accepted: accepted.length - acceptedBeforeBatch,
       rejected: Object.values(batchRejectCounts).reduce((sum, v) => sum + v, 0),
@@ -898,9 +904,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
 
       const needed = targetCount - accepted.length;
+      const fillTarget = generationDraftTarget(Math.min(needed, 5), inputMode);
       const generated = await fetchGenerationDrafts({
         ocrText: ocr_text,
-        count: Math.min(needed, 5),
+        count: fillTarget,
         gradeBand: grade_band ?? "g1_g3",
         language,
         seed: `${seedText}:fill:${fillTry}`,
@@ -1001,7 +1008,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       generationTimeline.push({
         phase: "fill",
         index: fillTry,
-        requested: Math.min(needed, 5),
+        requested: fillTarget,
         drafts: generated.drafts.length,
         accepted: accepted.length - acceptedBeforeFill,
         rejected: Object.values(fillRejectCounts).reduce((sum, v) => sum + v, 0),
