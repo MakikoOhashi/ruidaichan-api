@@ -259,6 +259,38 @@ function isEquationStylePrompt(prompt: string): boolean {
   return arithmeticStyle || conversionStyle;
 }
 
+type SolveCategory = "simple_calc" | "reverse_blank" | "repeat_or_times" | "split_equal" | "unit_conversion" | "unknown";
+
+function detectSolveCategory(text: string): SolveCategory {
+  const normalized = text.normalize("NFKC");
+  if (parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null) {
+    return "unit_conversion";
+  }
+  if (/□|口|ロ|_/.test(normalized) && /[\+\-\*×÷]/.test(normalized)) {
+    return "reverse_blank";
+  }
+  if (/[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized)) {
+    return "simple_calc";
+  }
+  if (/(同じ数|分け|1人分|何人分|あまり|配る)/.test(normalized)) {
+    return "split_equal";
+  }
+  if (/(毎日|ずつ|日間|何日|倍|ばい|何倍|何分|何本|何こ|合計)/.test(normalized)) {
+    return "repeat_or_times";
+  }
+  return "unknown";
+}
+
+function isCategoryCompatible(source: SolveCategory, generated: SolveCategory): boolean {
+  if (source === "unknown") return generated !== "unknown";
+  if (source === "unit_conversion") return generated === "unit_conversion";
+  if (source === "reverse_blank") return generated === "reverse_blank" || generated === "simple_calc";
+  if (source === "simple_calc") return generated === "simple_calc" || generated === "reverse_blank";
+  if (source === "repeat_or_times") return generated === "repeat_or_times";
+  if (source === "split_equal") return generated === "split_equal";
+  return false;
+}
+
 function parseJsonLoose(raw: string): unknown {
   const t = raw.trim();
   try {
@@ -765,6 +797,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const start = Date.now();
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
+  const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
   const unitDomainLock = buildUnitDomainLock(sourceConversion);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
@@ -841,6 +874,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
       if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
         reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+        continue;
+      }
+      const generatedCategory = detectSolveCategory(workingDraft.prompt);
+      if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
+        reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
         continue;
       }
       if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
@@ -978,6 +1016,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         }
         if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
           reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+          continue;
+        }
+        const generatedCategory = detectSolveCategory(workingDraft.prompt);
+        if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
+          reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
           continue;
         }
         if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
@@ -1150,6 +1193,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       language,
       grade_band,
       input_mode: inputMode,
+      source_category: sourceCategory,
       unit_domain_lock: unitDomainLock,
       kanji_guard: {
         checked: true,

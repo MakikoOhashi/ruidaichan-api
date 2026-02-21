@@ -521,6 +521,53 @@ test("/micro/generate_from_ocr recovers loose unit-conversion prose into equatio
   });
 });
 
+test("/micro/generate_from_ocr rejects category mismatch after free generation", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "えんぴつが7本あります。3本あげました。のこりは何本ですか。",
+            choices: ["2本", "3本", "4本", "5本", "6本"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 4, correct_index: 2, equation: "7-3" });
+    }
+    return geminiResponse({ answer_value: 4, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "4 mm = □ cm",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "classification-filter"
+        })
+      });
+
+      const body = (await res.json()) as { applied_count: number; reasons: Record<string, number> };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count, 0);
+      assert.equal((body.reasons.classification_mismatch ?? 0) > 0 || (body.reasons.equation_style_miss ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
