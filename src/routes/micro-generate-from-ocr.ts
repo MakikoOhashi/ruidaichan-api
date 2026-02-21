@@ -286,7 +286,11 @@ function detectSolveCategory(text: string): SolveCategory {
   if (/(同じ数|分け|1人分|何人分|あまり|配る)/.test(normalized)) {
     return "split_equal";
   }
-  if (/(毎日|ずつ|日間|何日|倍|ばい|何倍|何分|何本|何こ|合計|合わせる|あわせる|どちら|多い|少ない|色|あめ玉)/.test(normalized)) {
+  if (
+    /(毎日|ずつ|日間|何日|倍|ばい|何倍|何分|何本|何こ|なんこ|いくつ|全部|ぜんぶ|合計|合わせる|あわせる|どちら|多い|少ない|色|あめ玉|もらいました|もらう)/.test(
+      normalized
+    )
+  ) {
     return "repeat_or_times";
   }
   return "unknown";
