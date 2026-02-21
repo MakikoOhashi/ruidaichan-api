@@ -20,6 +20,9 @@ type GeneratedProblem = {
   items: RenderItem[];
 };
 
+type InputMode = "equation" | "word_problem";
+type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_calc";
+
 const requestSchema = z
   .object({
     ocr_text: z.string().min(1),
@@ -223,11 +226,50 @@ function isEquationStylePrompt(prompt: string): boolean {
   return arithmeticStyle || conversionStyle;
 }
 
+function hasUnitToken(text: string): boolean {
+  return /(mm|cm|km|mL|dL|L|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
+    text.normalize("NFKC")
+  );
+}
+
+function detectEquationTrack(text: string): EquationTrack {
+  const normalized = text.normalize("NFKC");
+  const hasOp = /[\+\-\*×÷]/.test(normalized);
+  const hasEq = /=/.test(normalized) || /□|口|ロ|_|\[\]/.test(normalized);
+  const pureConversion = parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null;
+  const hasUnits = hasUnitToken(normalized);
+
+  if (pureConversion) return "unit_conversion_pure";
+  if (hasUnits && hasOp && hasEq) return "unit_conversion_calc";
+  return "arithmetic";
+}
+
+function isPromptCompatibleWithTrack(prompt: string, track: EquationTrack): boolean {
+  const normalized = prompt.normalize("NFKC");
+  if (!isEquationStylePrompt(normalized)) return false;
+
+  if (track === "unit_conversion_pure") {
+    return parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null;
+  }
+
+  if (track === "unit_conversion_calc") {
+    const hasOp = /[\+\-\*×÷]/.test(normalized);
+    const hasEq = /=/.test(normalized) || /□|口|ロ|_|\[\]/.test(normalized);
+    return hasUnitToken(normalized) && hasOp && hasEq;
+  }
+
+  return true;
+}
+
 type SolveCategory = "simple_calc" | "reverse_blank" | "repeat_or_times" | "split_equal" | "unit_conversion" | "unknown";
 
 function detectSolveCategory(text: string): SolveCategory {
   const normalized = text.normalize("NFKC");
-  if (parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null) {
+  if (
+    parseUnitConversion(normalized) !== null ||
+    parseUnitConversionLoose(normalized) !== null ||
+    (hasUnitToken(normalized) && /[\+\-\*×÷]/.test(normalized) && (normalized.includes("=") || /□|口|ロ|_|\[\]/.test(normalized)))
+  ) {
     return "unit_conversion";
   }
   if (/□|口|ロ|_/.test(normalized) && /[\+\-\*×÷]/.test(normalized)) {
@@ -373,7 +415,8 @@ function generationPrompt(input: {
   gradeBand: string;
   language: string;
   seed: string;
-  inputMode: "equation" | "word_problem";
+  inputMode: InputMode;
+  equationTrack: EquationTrack | null;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
 }): string {
@@ -394,8 +437,12 @@ function generationPrompt(input: {
     `Language: ${input.language}`,
     `Grade band: ${input.gradeBand}`,
     `Input mode: ${input.inputMode}`,
+    ...(input.inputMode === "equation" && input.equationTrack !== null ? [`Equation track: ${input.equationTrack}`] : []),
     `Requested count: ${input.count}`,
     `Seed: ${input.seed}`,
+    "Target learners: Japanese elementary school students (grades 1 to 3).",
+    "Subject scope: Japanese elementary mathematics only (up to grade 3 curriculum).",
+    "Use natural Japanese suitable for Japanese children and parents.",
     "Task: Read the source problem and generate similar elementary math problems.",
     "Output STRICT JSON only:",
     '{"problems":[{"prompt":"..."}]}',
@@ -405,11 +452,25 @@ function generationPrompt(input: {
     "- Do not include option labels like ①②③.",
     ...(input.inputMode === "equation"
       ? [
-          "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
-          "- Do NOT convert equations into story/word problems.",
+          ...(input.equationTrack === "unit_conversion_pure"
+            ? [
+                "- Return ONLY pure unit-conversion equations (e.g. 40mm = □cm, 3L = □dL).",
+                "- Do NOT generate story problems.",
+                "- Do NOT generate arithmetic-only equations without unit conversion."
+              ]
+            : input.equationTrack === "unit_conversion_calc"
+              ? [
+                  "- Return ONLY unit-conversion arithmetic equations (e.g. 2cm + 3mm = □mm).",
+                  "- Keep equations with units and operators (+, -, ×, ÷) and a blank answer.",
+                  "- Do NOT convert into story/word problems."
+                ]
+              : [
+                  "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
+                  "- Do NOT convert equations into story/word problems.",
+                  "- Do NOT include unit-conversion constraints unless source clearly uses units."
+                ]),
           ...(input.conversionHint
             ? [
-                "- Keep unit-conversion equation style (e.g. 40mm = □cm, 3L = □dL).",
                 "- Allowed elementary conversions: mm/cm, cm/m, m/km, mL/dL, dL/L, g/kg.",
                 ...(input.unitDomainLock
                   ? [
@@ -448,7 +509,7 @@ function isRetriableGenError(error?: string): boolean {
   return error === "gemini_timeout" || error === "gemini_transport_error" || error === "gemini_http_429" || error === "gemini_http_500" || error === "gemini_http_503";
 }
 
-function detectInputMode(ocrText: string): "equation" | "word_problem" {
+function detectInputMode(ocrText: string): InputMode {
   const normalized = ocrText.normalize("NFKC");
   const hasEquals = normalized.includes("=");
   const hasBlank = /□|＿|_|\[\]|\b空欄\b/.test(normalized);
@@ -488,7 +549,8 @@ async function fetchGenerationDrafts(input: {
   gradeBand: string;
   language: string;
   seed: string;
-  inputMode: "equation" | "word_problem";
+  inputMode: InputMode;
+  equationTrack: EquationTrack | null;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
 }): Promise<DraftFetchResult> {
@@ -507,6 +569,7 @@ async function fetchGenerationDrafts(input: {
         language: input.language,
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
+        equationTrack: input.equationTrack,
         conversionHint: input.conversionHint,
         unitDomainLock: input.unitDomainLock
       })
@@ -596,7 +659,7 @@ function applyGradeBandLexicon(draft: GenerationDraft, gradeBand: GradeBandAppli
 function shouldStopEarly(
   targetCount: number,
   acceptedCount: number,
-  inputMode: "equation" | "word_problem"
+  inputMode: InputMode
 ): boolean {
   if (acceptedCount >= targetCount) return true;
   if (inputMode !== "word_problem") return false;
@@ -651,9 +714,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const start = Date.now();
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
+  const equationTrack = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
   const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
-  const unitDomainLock = buildUnitDomainLock(sourceConversion);
+  const unitDomainLock = buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text));
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -688,7 +752,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         language,
         seed: `${seedText}:b${batchIndex}`,
         inputMode,
-        conversionHint: sourceConversion !== null,
+        equationTrack,
+        conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
     generationCalls += generated.calls;
@@ -722,14 +787,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       let workingDraft = normalized.draft;
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
       violationsCount += guard.violations_count;
-      if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
         const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
         if (looseParsed !== null) {
           workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
           reasons.unit_conversion_loose_recovered = (reasons.unit_conversion_loose_recovered ?? 0) + 1;
         }
       }
-      if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
+      if (inputMode === "equation" && !isPromptCompatibleWithTrack(workingDraft.prompt, equationTrack ?? "arithmetic")) {
         reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
         continue;
       }
@@ -738,11 +803,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
         continue;
       }
-      if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+      if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
         reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
         continue;
       }
-      if (inputMode === "equation" && sourceConversion !== null && unitDomainLock !== null) {
+      if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
         const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
         if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
@@ -804,7 +869,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         language,
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
-        conversionHint: sourceConversion !== null,
+        equationTrack,
+        conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
       generationCalls += generated.calls;
@@ -824,14 +890,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         let workingDraft = normalized.draft;
         const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
         violationsCount += guard.violations_count;
-        if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
           const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
           if (looseParsed !== null) {
             workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
             reasons.unit_conversion_loose_recovered = (reasons.unit_conversion_loose_recovered ?? 0) + 1;
           }
         }
-        if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
+        if (inputMode === "equation" && !isPromptCompatibleWithTrack(workingDraft.prompt, equationTrack ?? "arithmetic")) {
           reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
           continue;
         }
@@ -840,11 +906,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
           continue;
         }
-        if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+        if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
           reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
           continue;
         }
-        if (inputMode === "equation" && sourceConversion !== null && unitDomainLock !== null) {
+        if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
           const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
           if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
@@ -969,6 +1035,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       grade_band,
       input_mode: inputMode,
       source_category: sourceCategory,
+      equation_track: equationTrack,
       unit_domain_lock: unitDomainLock,
       choices_disabled: true,
       choice_generation_via_ai: false,
