@@ -469,6 +469,58 @@ test("/micro/generate_from_ocr supports noisy OCR unit conversion text", async (
   });
 });
 
+test("/micro/generate_from_ocr recovers loose unit-conversion prose into equation style", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "4mmをcmになおしましょう。つぎから1つえらびなさい。",
+            choices: ["0.4", "4", "40", "400", "0.04"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 0.4, correct_index: 0, equation: "4/10" });
+    }
+    return geminiResponse({ answer_value: 0.4, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "4 mm = □ cm",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "unit-loose-recover"
+        })
+      });
+
+      const body = (await res.json()) as {
+        applied_count: number;
+        problems: Array<{ prompt: string }>;
+        reasons: Record<string, number>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count > 0, true);
+      assert.equal(body.problems[0].prompt.includes("= □"), true);
+      assert.equal((body.reasons.unit_conversion_loose_recovered ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

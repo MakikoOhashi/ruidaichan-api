@@ -163,6 +163,38 @@ function parseUnitConversion(text: string): UnitConversionParsed | null {
   return { value, fromUnit, toUnit };
 }
 
+function parseUnitConversionLoose(text: string): UnitConversionParsed | null {
+  const normalized = text.normalize("NFKC");
+  const unitPattern =
+    "(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
+
+  const direct = normalized.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*${unitPattern}\s*(?:を|から)?\s*${unitPattern}\s*(?:に|へ)?`, "i"));
+  if (direct) {
+    const value = Number(direct[1]);
+    const fromUnit = normalizeUnitToken(direct[2]);
+    const toUnit = normalizeUnitToken(direct[3]);
+    if (Number.isFinite(value) && fromUnit !== null && toUnit !== null) {
+      return { value, fromUnit, toUnit };
+    }
+  }
+
+  const fallback = normalized.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*${unitPattern}[\s\S]{0,24}${unitPattern}`, "i"));
+  if (!fallback) return null;
+  const value = Number(fallback[1]);
+  const fromUnit = normalizeUnitToken(fallback[2]);
+  const toUnit = normalizeUnitToken(fallback[3]);
+  if (!Number.isFinite(value) || fromUnit === null || toUnit === null) return null;
+  return { value, fromUnit, toUnit };
+}
+
+function formatCanonicalUnit(unit: CanonicalUnit): string {
+  return unit;
+}
+
+function toCanonicalUnitConversionPrompt(parsed: UnitConversionParsed): string {
+  return `${parsed.value} ${formatCanonicalUnit(parsed.fromUnit)} = □ ${formatCanonicalUnit(parsed.toUnit)}`;
+}
+
 function convertUnitValue(parsed: UnitConversionParsed): number | null {
   const ratio = conversionRatio[`${parsed.fromUnit}->${parsed.toUnit}`];
   if (ratio === undefined) return null;
@@ -797,9 +829,16 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       if (shouldStopEarly(targetCount, accepted.length, inputMode)) break;
       const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
       localReplacements += normalized.replacements;
-      const workingDraft = normalized.draft;
+      let workingDraft = normalized.draft;
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
       violationsCount += guard.violations_count;
+      if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+        const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
+        if (looseParsed !== null) {
+          workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
+          reasons.unit_conversion_loose_recovered = (reasons.unit_conversion_loose_recovered ?? 0) + 1;
+        }
+      }
       if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
         reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
         continue;
@@ -927,9 +966,16 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (shouldStopEarly(targetCount, accepted.length, inputMode) || Date.now() >= fillDeadline) break;
         const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
         localReplacements += normalized.replacements;
-        const workingDraft = normalized.draft;
+        let workingDraft = normalized.draft;
         const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
         violationsCount += guard.violations_count;
+        if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
+          const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
+          if (looseParsed !== null) {
+            workingDraft = { ...workingDraft, prompt: toCanonicalUnitConversionPrompt(looseParsed) };
+            reasons.unit_conversion_loose_recovered = (reasons.unit_conversion_loose_recovered ?? 0) + 1;
+          }
+        }
         if (inputMode === "equation" && !isEquationStylePrompt(workingDraft.prompt)) {
           reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
           continue;
