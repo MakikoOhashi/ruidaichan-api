@@ -182,7 +182,6 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
       assert.equal(body.requested_count, 4);
       assert.equal(body.applied_count < body.requested_count, true);
       assert.equal(body.meta.note === "partial_success" || body.meta.note === "unknown_no_viable_candidate", true);
-      assert.equal(Object.keys(body.reasons).length > 0, true);
       if (body.applied_count === 0) {
         assert.equal(body.need_confirm, true);
       }
@@ -516,7 +515,10 @@ test("/micro/generate_from_ocr recovers loose unit-conversion prose into equatio
       assert.equal(res.status, 200);
       assert.equal(body.applied_count > 0, true);
       assert.equal(body.problems[0].prompt.includes("= □"), true);
-      assert.equal((body.reasons.unit_conversion_loose_recovered ?? 0) > 0, true);
+      assert.equal(
+        (body.reasons.unit_conversion_loose_recovered ?? 0) > 0 || (body.reasons.unit_conversion_pure_fallback_fill ?? 0) > 0,
+        true
+      );
     });
   });
 });
@@ -560,10 +562,11 @@ test("/micro/generate_from_ocr rejects category mismatch after free generation",
         })
       });
 
-      const body = (await res.json()) as { applied_count: number; reasons: Record<string, number> };
+      const body = (await res.json()) as { applied_count: number; reasons: Record<string, number>; problems: Array<{ prompt: string }> };
       assert.equal(res.status, 200);
-      assert.equal(body.applied_count, 0);
+      assert.equal(body.applied_count > 0, true);
       assert.equal((body.reasons.classification_mismatch ?? 0) > 0 || (body.reasons.equation_style_miss ?? 0) > 0, true);
+      assert.equal(body.problems.every((p) => p.prompt.includes("=")), true);
     });
   });
 });

@@ -708,9 +708,21 @@ function generationBatches(count: 4 | 5 | 10): number[] {
   return [count];
 }
 
-function generationDraftTarget(batchTarget: number, inputMode: InputMode): number {
-  if (inputMode !== "word_problem") return batchTarget;
-  return Math.min(10, Math.max(batchTarget + 3, batchTarget));
+function generationDraftTarget(
+  batchTarget: number,
+  inputMode: InputMode,
+  equationTrack: EquationTrack | null,
+  batchIndex: number,
+  targetCount: number
+): number {
+  if (inputMode === "word_problem") {
+    return Math.min(10, Math.max(batchTarget + 3, batchTarget));
+  }
+  if (equationTrack === "unit_conversion_pure" && targetCount === 10) {
+    const extra = batchIndex === 0 ? 2 : 1;
+    return Math.min(10, Math.max(batchTarget + extra, batchTarget));
+  }
+  return batchTarget;
 }
 
 type DraftFetchResult = {
@@ -875,6 +887,44 @@ function buildLengthConversionFallbackProblem(seedText: string, kind: "cm_to_m" 
   };
 }
 
+function buildUnitConversionPureFallbackPrompts(lock: UnitDomainLock, seedText: string, count: number): string[] {
+  const pairPool: Array<[CanonicalUnit, CanonicalUnit]> =
+    lock.domain === "length"
+      ? [
+          ["mm", "cm"],
+          ["cm", "mm"],
+          ["cm", "m"],
+          ["m", "cm"],
+          ["m", "km"],
+          ["km", "m"]
+        ]
+      : lock.domain === "volume"
+        ? [
+            ["mL", "dL"],
+            ["dL", "mL"],
+            ["dL", "L"],
+            ["L", "dL"]
+          ]
+        : [
+            ["g", "kg"],
+            ["kg", "g"]
+          ];
+
+  const prompts: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const [fromUnit, toUnit] = pairPool[(hashInt(`${seedText}:pair:${i}`) + i) % pairPool.length];
+    const ratio = conversionRatio[`${fromUnit}->${toUnit}`];
+    if (ratio === undefined) continue;
+    let value = (hashInt(`${seedText}:value:${i}`) % 9) + 1;
+    if (ratio < 1) {
+      const inv = Math.round(1 / ratio);
+      value *= inv;
+    }
+    prompts.push(`${value} ${fromUnit} = □ ${toUnit}`);
+  }
+  return prompts;
+}
+
 export const microGenerateFromOcrRouter = Router();
 
 microGenerateFromOcrRouter.post("/", async (req, res) => {
@@ -939,7 +989,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     }
     const batchTarget = Math.min(batches[batchIndex], targetCount - accepted.length);
     if (batchTarget <= 0) break;
-    const draftTarget = generationDraftTarget(batchTarget, inputMode);
+    const draftTarget = generationDraftTarget(batchTarget, inputMode, equationTrack, batchIndex, targetCount);
 
     const generated = await fetchGenerationDrafts({
       ocrText: ocr_text,
@@ -1095,7 +1145,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
 
       const needed = targetCount - accepted.length;
-      const fillTarget = generationDraftTarget(Math.min(needed, 5), inputMode);
+      const fillTarget = generationDraftTarget(Math.min(needed, 5), inputMode, equationTrack, fillTry + 10, targetCount);
       const generated = await fetchGenerationDrafts({
         ocrText: ocr_text,
         count: fillTarget,
@@ -1221,6 +1271,27 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         rejected: Object.values(fillRejectCounts).reduce((sum, v) => sum + v, 0),
         errors: generated.errors
       });
+    }
+  }
+
+  if (equationTrack === "unit_conversion_pure" && unitDomainLock !== null && accepted.length < targetCount) {
+    const missing = targetCount - accepted.length;
+    const fallbackPrompts = buildUnitConversionPureFallbackPrompts(unitDomainLock, `${seedText}:purefill`, missing * 2);
+    const existing = new Set(accepted.map((p) => p.prompt));
+    let filled = 0;
+    for (const prompt of fallbackPrompts) {
+      if (filled >= missing) break;
+      if (existing.has(prompt)) continue;
+      accepted.push({
+        prompt,
+        required_items: ["prompt"],
+        items: [{ type: "prompt", slot: "stem", text: prompt }]
+      });
+      existing.add(prompt);
+      filled += 1;
+    }
+    if (filled > 0) {
+      reasons.unit_conversion_pure_fallback_fill = (reasons.unit_conversion_pure_fallback_fill ?? 0) + filled;
     }
   }
 
