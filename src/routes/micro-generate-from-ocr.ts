@@ -555,17 +555,24 @@ function detectInputMode(ocrText: string): InputMode {
   const hasNumberUnitPair = /\d+\s*(mm|cm|km|mL|dL|L|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
     normalized
   );
-  const wordMarkers = /(ですか|なりますか|つぎから|えらびなさい|あげました|のこり|何こ|何本|何人|毎日|きょう|きのう)/;
+  const wordMarkers = /(ですか|なりますか|つぎから|えらびなさい|あげました|もらいました|もっていきました|のこり|のこっています|何こ|なんこ|何本|何人|毎日|きょう|きのう|しき|こたえ)/;
   const sentenceLike = /[。！？]/.test(normalized);
   const wordMarkerCount = (normalized.match(new RegExp(wordMarkers, "g")) ?? []).length;
+  const hasEquationHardSignal = hasEquals || hasBlank || hasArithmeticPattern || hasUnitConversionPattern;
 
-  if (hasEquals || hasBlank || hasArithmeticPattern || hasUnitConversionPattern || hasNumberUnitPair) {
+  if (hasEquationHardSignal) {
     return "equation";
+  }
+  if (hasNumberUnitPair && !sentenceLike) {
+    return "equation";
+  }
+  if (sentenceLike && wordMarkerCount >= 1) {
+    return "word_problem";
   }
   if (sentenceLike && wordMarkerCount >= 2) {
     return "word_problem";
   }
-  return "equation";
+  return "word_problem";
 }
 
 function generationBatches(count: 4 | 5 | 10): number[] {
