@@ -22,6 +22,13 @@ type GeneratedProblem = {
 type InputMode = "equation" | "word_problem";
 type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_calc";
 type WordProblemIntent = "compare_diff" | "general";
+type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic";
+type EquationTrackAnalysis = {
+  track: EquationTrack;
+  decision: EquationTrackDecision;
+  ambiguous: boolean;
+  reason: string | null;
+};
 
 const requestSchema = z
   .object({
@@ -310,17 +317,34 @@ function hasUnitToken(text: string): boolean {
   );
 }
 
-function detectEquationTrack(text: string): EquationTrack {
+function detectEquationTrack(text: string): EquationTrackAnalysis {
   const normalized = text.normalize("NFKC");
-  const hasOp = /[\+\-\*×÷]/.test(normalized);
+  const hasOpPattern = /[0-9]\s*[\+\-×÷]\s*[0-9]/.test(normalized);
   const hasEq = /=/.test(normalized) || /□|口|ロ|_|\[\]/.test(normalized);
   const pureConversion =
     parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null || parseCompositeUnitConversion(normalized) !== null;
   const hasUnits = hasUnitToken(normalized);
+  const unitCount = extractCanonicalUnits(normalized).length;
+  const numberCount = (normalized.match(/\d+/g) ?? []).length;
 
-  if (pureConversion) return "unit_conversion_pure";
-  if (hasUnits && hasOp && hasEq) return "unit_conversion_calc";
-  return "arithmetic";
+  // OCRが崩れて「2L9dL=□dL」が「2- 9α- = dL」のようになるケースを純変換側へ寄せる
+  const sparsePureHint = hasEq && hasUnits && unitCount <= 1 && numberCount >= 2;
+
+  if (pureConversion) {
+    return { track: "unit_conversion_pure", decision: "explicit_pure", ambiguous: false, reason: null };
+  }
+  if (hasUnits && hasOpPattern && hasEq) {
+    return { track: "unit_conversion_calc", decision: "explicit_calc", ambiguous: false, reason: null };
+  }
+  if (sparsePureHint) {
+    return {
+      track: "unit_conversion_pure",
+      decision: "heuristic_pure",
+      ambiguous: true,
+      reason: "ambiguous_unit_conversion_ocr"
+    };
+  }
+  return { track: "arithmetic", decision: "default_arithmetic", ambiguous: false, reason: null };
 }
 
 function isPromptCompatibleWithTrack(prompt: string, track: EquationTrack): boolean {
@@ -851,7 +875,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const start = Date.now();
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocr_text);
-  const equationTrack = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
+  const equationTrackAnalysis = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
+  const equationTrack = equationTrackAnalysis?.track ?? null;
   const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocr_text) : "general";
   const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
@@ -1214,7 +1239,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
 
   const appliedCount = accepted.length;
   const topItems = accepted[0]?.items ?? [];
-  const needConfirm = appliedCount === 0;
+  const needConfirm = appliedCount === 0 || (equationTrackAnalysis?.ambiguous ?? false);
   const note =
     appliedCount === 0
       ? "unknown_no_viable_candidate"
@@ -1222,6 +1247,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         ? "partial_success_timeout"
         : appliedCount < targetCount
           ? "partial_success"
+          : equationTrackAnalysis?.ambiguous
+            ? "ok_ambiguous_unit_conversion"
           : cappedByPolicy
             ? "ok_count_capped_by_policy"
           : "ok";
@@ -1263,6 +1290,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       source_category: sourceCategory,
       source_word_intent: sourceWordIntent,
       equation_track: equationTrack,
+      equation_track_decision: equationTrackAnalysis?.decision ?? null,
+      equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
+      equation_track_reason: equationTrackAnalysis?.reason ?? null,
+      ocr_retake_recommended: equationTrackAnalysis?.ambiguous ?? false,
       generation_timeline: generationTimeline,
       equation_style_miss_samples: equationStyleMissSamples,
       unit_domain_lock: unitDomainLock,
@@ -1283,6 +1314,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       request_id: requestId,
       input_mode: inputMode,
       equation_track: equationTrack,
+      equation_track_decision: equationTrackAnalysis?.decision ?? null,
+      equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
+      equation_track_reason: equationTrackAnalysis?.reason ?? null,
       source_word_intent: sourceWordIntent,
       requested_count: count,
       target_count: targetCount,
