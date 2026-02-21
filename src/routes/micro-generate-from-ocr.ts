@@ -250,6 +250,36 @@ function hasPureUnitConversionForm(text: string): boolean {
   return parseUnitConversion(text) !== null || parseUnitConversionLoose(text) !== null || parseCompositeUnitConversion(text) !== null;
 }
 
+function extractCanonicalUnits(text: string): CanonicalUnit[] {
+  const normalized = text.normalize("NFKC");
+  const pattern =
+    /(mL|dL|mm|cm|km|kg|L|m|g|ミリリットル|デシリットル|リットル|ミリメートル|センチメートル|キロメートル|メートル|キログラム|グラム)/gi;
+  const out: CanonicalUnit[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(normalized)) !== null) {
+    const unit = normalizeUnitToken(m[1]);
+    if (unit !== null) out.push(unit);
+  }
+  return out;
+}
+
+function buildUnitDomainLockFromText(text: string): UnitDomainLock | null {
+  const units = extractCanonicalUnits(text);
+  if (units.length === 0) return null;
+  const domains = new Set(units.map((u) => getUnitDomain(u)));
+  if (domains.size !== 1) return null;
+  const domain = [...domains][0];
+  if (domain === "length") return { domain, allowedUnits: ["mm", "cm", "m", "km"] };
+  if (domain === "volume") return { domain, allowedUnits: ["mL", "dL", "L"] };
+  return { domain, allowedUnits: ["g", "kg"] };
+}
+
+function promptUsesOnlyUnitDomain(text: string, lock: UnitDomainLock): boolean {
+  const units = extractCanonicalUnits(text);
+  if (units.length === 0) return true;
+  return units.every((u) => lock.allowedUnits.includes(u));
+}
+
 function isConversionInDomain(parsed: UnitConversionParsed, lock: UnitDomainLock): boolean {
   return (
     getUnitDomain(parsed.fromUnit) === lock.domain &&
@@ -827,7 +857,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const sourceConversion = parseUnitConversion(ocr_text);
   const sourceCompositeConversion = parseCompositeUnitConversion(ocr_text);
   const unitDomainLock =
-    buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text)) ?? buildUnitDomainLockFromComposite(sourceCompositeConversion);
+    buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text)) ??
+    buildUnitDomainLockFromComposite(sourceCompositeConversion) ??
+    buildUnitDomainLockFromText(ocr_text);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -948,6 +980,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         continue;
       }
       if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
+        if (!promptUsesOnlyUnitDomain(workingDraft.prompt, unitDomainLock)) {
+          reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+          batchRejectCounts.unit_domain_mismatch = (batchRejectCounts.unit_domain_mismatch ?? 0) + 1;
+          continue;
+        }
         const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
         if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
@@ -1084,6 +1121,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           continue;
         }
         if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
+          if (!promptUsesOnlyUnitDomain(workingDraft.prompt, unitDomainLock)) {
+            reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+            fillRejectCounts.unit_domain_mismatch = (fillRejectCounts.unit_domain_mismatch ?? 0) + 1;
+            continue;
+          }
           const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
           if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
