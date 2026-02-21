@@ -59,6 +59,11 @@ function normalizeSpaces(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+function truncateForLog(s: string, max = 120): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}...`;
+}
+
 function hashInt(input: string): number {
   const hex = sha(input).slice(0, 8);
   return Number.parseInt(hex, 16);
@@ -724,6 +729,16 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
 
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
+  const generationTimeline: Array<{
+    phase: "batch" | "fill";
+    index: number;
+    requested: number;
+    drafts: number;
+    accepted: number;
+    rejected: number;
+    errors: string[];
+  }> = [];
+  const equationStyleMissSamples: string[] = [];
   let generationCalls = 0;
   const solverCalls = 0;
   let generationStatus: number | null = null;
@@ -756,6 +771,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
+    const acceptedBeforeBatch = accepted.length;
+    const batchRejectCounts: Record<string, number> = {};
     generationCalls += generated.calls;
     generationStatus = generated.status;
     for (const error of generated.errors) {
@@ -796,37 +813,47 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
       if (inputMode === "equation" && !isPromptCompatibleWithTrack(workingDraft.prompt, equationTrack ?? "arithmetic")) {
         reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+        batchRejectCounts.equation_style_miss = (batchRejectCounts.equation_style_miss ?? 0) + 1;
+        if (equationStyleMissSamples.length < 5) {
+          equationStyleMissSamples.push(truncateForLog(workingDraft.prompt));
+        }
         continue;
       }
       const generatedCategory = detectSolveCategory(workingDraft.prompt);
       if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
         reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
+        batchRejectCounts.classification_mismatch = (batchRejectCounts.classification_mismatch ?? 0) + 1;
         continue;
       }
       if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
         reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
+        batchRejectCounts.unit_conversion_style_miss = (batchRejectCounts.unit_conversion_style_miss ?? 0) + 1;
         continue;
       }
       if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
         const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
         if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+          batchRejectCounts.unit_domain_mismatch = (batchRejectCounts.unit_domain_mismatch ?? 0) + 1;
           continue;
         }
       }
 
       if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
         reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
+        batchRejectCounts.prompt_too_short = (batchRejectCounts.prompt_too_short ?? 0) + 1;
         continue;
       }
       const parsedConversion = parseUnitConversion(workingDraft.prompt);
       if (parsedConversion !== null) {
         if (unitDomainLock !== null && !isConversionInDomain(parsedConversion, unitDomainLock)) {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+          batchRejectCounts.unit_domain_mismatch = (batchRejectCounts.unit_domain_mismatch ?? 0) + 1;
           continue;
         }
         if (convertUnitValue(parsedConversion) === null) {
           reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
+          batchRejectCounts.unit_conversion_pair_unsupported = (batchRejectCounts.unit_conversion_pair_unsupported ?? 0) + 1;
           continue;
         }
       }
@@ -847,6 +874,15 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         break;
       }
     }
+    generationTimeline.push({
+      phase: "batch",
+      index: batchIndex,
+      requested: batchTarget,
+      drafts: generationDrafts.length,
+      accepted: accepted.length - acceptedBeforeBatch,
+      rejected: Object.values(batchRejectCounts).reduce((sum, v) => sum + v, 0),
+      errors: generated.errors
+    });
   }
 
   if (!shouldStopEarly(targetCount, accepted.length, inputMode)) {
@@ -873,6 +909,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
       });
+      const acceptedBeforeFill = accepted.length;
+      const fillRejectCounts: Record<string, number> = {};
       generationCalls += generated.calls;
       generationStatus = generated.status;
       for (const error of generated.errors) {
@@ -899,37 +937,47 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         }
         if (inputMode === "equation" && !isPromptCompatibleWithTrack(workingDraft.prompt, equationTrack ?? "arithmetic")) {
           reasons.equation_style_miss = (reasons.equation_style_miss ?? 0) + 1;
+          fillRejectCounts.equation_style_miss = (fillRejectCounts.equation_style_miss ?? 0) + 1;
+          if (equationStyleMissSamples.length < 5) {
+            equationStyleMissSamples.push(truncateForLog(workingDraft.prompt));
+          }
           continue;
         }
         const generatedCategory = detectSolveCategory(workingDraft.prompt);
         if (!isCategoryCompatible(sourceCategory, generatedCategory)) {
           reasons.classification_mismatch = (reasons.classification_mismatch ?? 0) + 1;
+          fillRejectCounts.classification_mismatch = (fillRejectCounts.classification_mismatch ?? 0) + 1;
           continue;
         }
         if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && parseUnitConversion(workingDraft.prompt) === null) {
           reasons.unit_conversion_style_miss = (reasons.unit_conversion_style_miss ?? 0) + 1;
+          fillRejectCounts.unit_conversion_style_miss = (fillRejectCounts.unit_conversion_style_miss ?? 0) + 1;
           continue;
         }
         if (inputMode === "equation" && equationTrack !== "arithmetic" && unitDomainLock !== null) {
           const parsedDraftConversion = parseUnitConversion(workingDraft.prompt);
           if (parsedDraftConversion !== null && !isConversionInDomain(parsedDraftConversion, unitDomainLock)) {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+            fillRejectCounts.unit_domain_mismatch = (fillRejectCounts.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
         }
 
         if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
           reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
+          fillRejectCounts.prompt_too_short = (fillRejectCounts.prompt_too_short ?? 0) + 1;
           continue;
         }
         const parsedConversion = parseUnitConversion(workingDraft.prompt);
         if (parsedConversion !== null) {
           if (unitDomainLock !== null && !isConversionInDomain(parsedConversion, unitDomainLock)) {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
+            fillRejectCounts.unit_domain_mismatch = (fillRejectCounts.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
           if (convertUnitValue(parsedConversion) === null) {
             reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
+            fillRejectCounts.unit_conversion_pair_unsupported = (fillRejectCounts.unit_conversion_pair_unsupported ?? 0) + 1;
             continue;
           }
         }
@@ -950,6 +998,15 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           break;
         }
       }
+      generationTimeline.push({
+        phase: "fill",
+        index: fillTry,
+        requested: Math.min(needed, 5),
+        drafts: generated.drafts.length,
+        accepted: accepted.length - acceptedBeforeFill,
+        rejected: Object.values(fillRejectCounts).reduce((sum, v) => sum + v, 0),
+        errors: generated.errors
+      });
     }
   }
 
@@ -1036,6 +1093,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       input_mode: inputMode,
       source_category: sourceCategory,
       equation_track: equationTrack,
+      generation_timeline: generationTimeline,
+      equation_style_miss_samples: equationStyleMissSamples,
       unit_domain_lock: unitDomainLock,
       choices_disabled: true,
       choice_generation_via_ai: false,
@@ -1047,6 +1106,21 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
     }
   };
+
+  console.log(
+    JSON.stringify({
+      event: "micro_generate_from_ocr_observe",
+      request_id: requestId,
+      input_mode: inputMode,
+      equation_track: equationTrack,
+      requested_count: count,
+      target_count: targetCount,
+      applied_count: appliedCount,
+      reasons,
+      generation_timeline: generationTimeline,
+      equation_style_miss_samples: equationStyleMissSamples
+    })
+  );
 
   return res.status(200).json(response);
 });
