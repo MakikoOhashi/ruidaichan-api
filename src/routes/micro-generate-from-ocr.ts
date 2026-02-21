@@ -141,7 +141,7 @@ function parseUnitConversion(text: string): UnitConversionParsed | null {
   const blank = String.raw`(?:□|口|ロ|_|\?)?`;
   const m = normalized.match(
     new RegExp(
-      String.raw`(\d+(?:\.\d+)?)${sep}(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)${sep}=${sep}${blank}${sep}(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)`,
+      String.raw`(\d+(?:\.\d+)?)${sep}(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)${sep}=${sep}${blank}${sep}(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)`,
       "i"
     )
   );
@@ -156,7 +156,7 @@ function parseUnitConversion(text: string): UnitConversionParsed | null {
 function parseUnitConversionLoose(text: string): UnitConversionParsed | null {
   const normalized = text.normalize("NFKC");
   const unitPattern =
-    "(mm|cm|km|mL|dL|L|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
+    "(mm|cm|km|mL|dL|L|m|kg|g|ミリメートル|センチメートル|キロメートル|メートル|ミリリットル|デシリットル|リットル|キログラム|グラム)";
 
   const direct = normalized.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*${unitPattern}\s*(?:を|から)?\s*${unitPattern}\s*(?:に|へ)?`, "i"));
   if (direct) {
@@ -232,7 +232,7 @@ function isEquationStylePrompt(prompt: string): boolean {
 }
 
 function hasUnitToken(text: string): boolean {
-  return /(mm|cm|km|mL|dL|L|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
+  return /(mm|cm|km|mL|dL|L|m|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
     text.normalize("NFKC")
   );
 }
