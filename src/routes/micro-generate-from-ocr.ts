@@ -10,7 +10,6 @@ const DEFAULT_COUNT = 5;
 const REQUEST_TIME_BUDGET_MS = 45_000;
 const FILL_RETRY_MAX = 1;
 const FILL_EXTRA_BUDGET_MS = 8_000;
-const EARLY_SATISFY_COUNT = 4;
 
 type RenderItem = { type: "prompt"; slot: "stem"; text: string };
 
@@ -673,7 +672,7 @@ function shouldStopEarly(
 ): boolean {
   if (acceptedCount >= targetCount) return true;
   if (inputMode !== "word_problem") return false;
-  return targetCount >= 5 && acceptedCount >= EARLY_SATISFY_COUNT;
+  return false;
 }
 
 function buildLengthMeterFallbackProblem(seedText: string): GeneratedProblem {
@@ -1057,9 +1056,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       : hitTimeBudget
         ? "partial_success_timeout"
         : appliedCount < targetCount
-          ? inputMode === "word_problem" && appliedCount >= EARLY_SATISFY_COUNT
-            ? "partial_success_filled"
-            : "partial_success"
+          ? "partial_success"
           : cappedByPolicy
             ? "ok_count_capped_by_policy"
           : "ok";
