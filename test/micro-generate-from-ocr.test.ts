@@ -106,7 +106,7 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
         applied_count: number;
         requested_count: number;
         need_confirm: boolean;
-        problems: Array<{ prompt: string; choices: string[]; correct_index: number; answer_value: number }>;
+        problems: Array<{ prompt: string }>;
         meta: { note: string; grade_band_applied: string };
         debug: { kanji_guard: { checked: boolean; violations_count: number; rewrite_attempts: number } };
       };
@@ -114,8 +114,8 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
       assert.equal(res.status, 200);
       assert.equal(body.spec_version, "micro_problem_render_v1");
       assert.equal(body.detected_mode, "word_problem");
-      assert.deepEqual(body.required_items, ["prompt", "choices"]);
-      assert.equal(body.items.some((i) => i.type === "choices"), true);
+      assert.deepEqual(body.required_items, ["prompt"]);
+      assert.equal(body.items.some((i) => i.type === "prompt"), true);
       assert.equal(body.applied_count > 0, true);
       assert.equal(body.requested_count, 4);
       assert.equal(body.need_confirm, false);
@@ -925,7 +925,7 @@ test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () 
       });
       const body = (await res.json()) as {
         applied_count: number;
-        problems: Array<{ prompt: string; choices: string[] }>;
+        problems: Array<{ prompt: string }>;
         meta: { grade_band_applied: string };
         debug: { kanji_guard: { rewrite_attempts: number; violations_count: number; local_replacements: number } };
       };
@@ -936,7 +936,6 @@ test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () 
       assert.equal(body.debug.kanji_guard.violations_count > 0, true);
       assert.equal(body.debug.kanji_guard.local_replacements > 0, true);
       assert.equal(body.problems[0].prompt.includes("練"), false);
-      assert.equal(body.problems[0].choices[2].includes("10"), true);
     });
   });
 });

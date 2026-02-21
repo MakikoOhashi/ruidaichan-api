@@ -9,6 +9,7 @@
 - 入力: iOS Vision OCRの `ocr_text`（画像は補助）
 - 出力: `micro_problem_render_v1` 契約（`detected_mode` / `required_items` / `items` / `problems`）
 - 目的: 「即印刷できるA4問題」を短時間で返す
+- 方針: 問題文生成はAI、選択肢は生成しない（AIにも作らせない）
 
 ## Responsibility Boundary
 
@@ -53,7 +54,7 @@ Response (shape):
   "spec_version": "micro_problem_render_v1",
   "schema_version": "micro_generate_from_ocr_response_v1",
   "detected_mode": "equation|word_problem|unknown",
-  "required_items": ["prompt", "choices"],
+  "required_items": ["prompt"],
   "items": [],
   "problems": [],
   "requested_count": 5,

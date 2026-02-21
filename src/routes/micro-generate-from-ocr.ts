@@ -12,18 +12,11 @@ const FILL_RETRY_MAX = 1;
 const FILL_EXTRA_BUDGET_MS = 8_000;
 const EARLY_SATISFY_COUNT = 4;
 
-type RenderItem =
-  | { type: "prompt"; slot: "stem"; text: string }
-  | { type: "choices"; slot: "options"; style: "mc"; choices: string[]; correct_index: number };
+type RenderItem = { type: "prompt"; slot: "stem"; text: string };
 
 type GeneratedProblem = {
   prompt: string;
-  choices: string[];
-  correct_index: number;
-  answer_value: number;
-  equation?: string;
-  check_trace?: string;
-  required_items: ["prompt", "choices"];
+  required_items: ["prompt"];
   items: RenderItem[];
 };
 
@@ -43,27 +36,16 @@ const llmGenSchema = z
       .array(
         z
           .object({
-            prompt: z.string().min(1),
-            choices: z.array(z.string().min(1)).min(5)
+            prompt: z.string().min(1)
           })
-          .strict()
+          .passthrough()
       )
       .min(1)
   })
   .strict();
 
-const llmSolveSchema = z
-  .object({
-    answer_value: z.number(),
-    correct_index: z.number().int(),
-    equation: z.string().optional(),
-    check_trace: z.string().optional()
-  })
-  .strict();
-
 type GenerationDraft = {
   prompt: string;
-  choices: string[];
 };
 
 function sha(input: string): string {
@@ -234,24 +216,6 @@ function conversionPairKey(parsed: UnitConversionParsed): string {
   return `${parsed.fromUnit}->${parsed.toUnit}`;
 }
 
-function validateLight(problem: { prompt: string; choices: string[]; correct_index: number; answer_value: number }): { ok: boolean; reason?: string } {
-  const choices = problem.choices.map((c) => normalizeSpaces(c));
-  if (!problem.prompt || normalizeSpaces(problem.prompt).length < 5) return { ok: false, reason: "prompt_too_short" };
-  if (choices.length !== 5) return { ok: false, reason: "choices_not_5" };
-  if (problem.correct_index < 0 || problem.correct_index > 4) return { ok: false, reason: "correct_index_out_of_range" };
-  const uniq = new Set(choices.map((c) => c.toLowerCase()));
-  if (uniq.size !== choices.length) return { ok: false, reason: "choices_duplicated" };
-
-  const selected = choices[problem.correct_index];
-  const selectedNum = extractFirstNumber(selected);
-  if (selectedNum === null) return { ok: false, reason: "selected_choice_has_no_number" };
-  if (Math.abs(selectedNum - problem.answer_value) > 1e-9) return { ok: false, reason: "answer_choice_mismatch" };
-  if (!Number.isFinite(problem.answer_value) || problem.answer_value < 0 || problem.answer_value > 9999) {
-    return { ok: false, reason: "answer_out_of_range" };
-  }
-  return { ok: true };
-}
-
 function isEquationStylePrompt(prompt: string): boolean {
   const normalized = prompt.normalize("NFKC");
   const arithmeticStyle = /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) && /=|□|口|ロ|_/.test(normalized);
@@ -317,29 +281,6 @@ function extractPromptValue(item: Record<string, unknown>): string {
   return "";
 }
 
-function normalizeChoiceValue(v: unknown): string[] {
-  if (Array.isArray(v)) {
-    return v
-      .flatMap((x) => {
-        if (typeof x === "string") return [normalizeSpaces(x)];
-        if (x && typeof x === "object") {
-          const t = (x as Record<string, unknown>).text;
-          if (typeof t === "string") return [normalizeSpaces(t)];
-        }
-        return [];
-      })
-      .filter(Boolean);
-  }
-  if (typeof v === "string") {
-    const normalized = v.normalize("NFKC");
-    return normalized
-      .split(/\n|,|、|;|；|\|/)
-      .map((x) => normalizeSpaces(x.replace(/^[①-⑩\d\.\)\(]+\s*/, "")))
-      .filter(Boolean);
-  }
-  return [];
-}
-
 function salvageGenerationPayload(raw: unknown): GenerationDraft[] {
   const pickArray = (obj: Record<string, unknown>): unknown[] => {
     const keys = ["problems", "items", "questions", "tasks", "outputs", "data"];
@@ -359,18 +300,8 @@ function salvageGenerationPayload(raw: unknown): GenerationDraft[] {
     if (!row || typeof row !== "object") continue;
     const obj = row as Record<string, unknown>;
     const prompt = extractPromptValue(obj);
-    const choiceKeys = ["choices", "options", "candidates", "answers", "select_options"];
-    let choices: string[] = [];
-    for (const key of choiceKeys) {
-      choices = normalizeChoiceValue(obj[key]);
-      if (choices.length > 0) break;
-    }
-    const dedup = Array.from(new Set(choices.map((x) => normalizeSpaces(x).toLowerCase()))).map((x) => {
-      const original = choices.find((c) => normalizeSpaces(c).toLowerCase() === x);
-      return original ?? x;
-    });
-    if (!prompt || dedup.length < 5) continue;
-    out.push({ prompt, choices: dedup.slice(0, 5) });
+    if (!prompt) continue;
+    out.push({ prompt });
   }
   return out;
 }
@@ -381,10 +312,9 @@ function repairGenerationPrompt(language: string, raw: unknown): string {
     "ROLE: json_repair_v1",
     `Language: ${language}`,
     "Convert the following output into STRICT JSON only.",
-    'Target schema: {"problems":[{"prompt":"...","choices":["...","...","...","...","..."]}]}',
+    'Target schema: {"problems":[{"prompt":"..."}]}',
     "Rules:",
     "- Keep only usable problems.",
-    "- choices must be exactly 5 strings per problem.",
     "- Remove all markdown or commentary.",
     "Input:",
     rawText
@@ -466,12 +396,13 @@ function generationPrompt(input: {
     `Input mode: ${input.inputMode}`,
     `Requested count: ${input.count}`,
     `Seed: ${input.seed}`,
-    "Task: Read the source problem and generate similar elementary math multiple-choice problems.",
+    "Task: Read the source problem and generate similar elementary math problems.",
     "Output STRICT JSON only:",
-    '{"problems":[{"prompt":"...","choices":["...","...","...","...","..."]}]}',
+    '{"problems":[{"prompt":"..."}]}',
     "Rules:",
     "- Keep difficulty around grade 1-3.",
-    "- Each problem must be answerable with one correct option.",
+    "- Do not generate answer choices.",
+    "- Do not include option labels like ①②③.",
     ...(input.inputMode === "equation"
       ? [
           "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
@@ -501,23 +432,6 @@ function generationPrompt(input: {
     ...gradeInstructions,
     "Source OCR:",
     input.ocrText
-  ].join("\n");
-}
-
-function solvePrompt(input: { prompt: string; choices: string[]; language: string }): string {
-  return [
-    "ROLE: solver_v1",
-    `Language: ${input.language}`,
-    "Solve the multiple-choice elementary math problem.",
-    "Output STRICT JSON only:",
-    '{"answer_value":56,"correct_index":3,"equation":"8*7","check_trace":"..."}',
-    "Rules:",
-    "- correct_index must be 0-based.",
-    "- answer_value must match the selected choice numerically.",
-    "Problem:",
-    input.prompt,
-    "Choices:",
-    input.choices.map((c, i) => `${i}: ${c}`).join("\n")
   ].join("\n");
 }
 
@@ -608,10 +522,7 @@ async function fetchGenerationDrafts(input: {
 
     const parsedGen = llmGenSchema.safeParse(genResp.data);
     if (parsedGen.success) {
-      drafts = parsedGen.data.problems.map((p) => ({
-        prompt: normalizeSpaces(p.prompt),
-        choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
-      }));
+      drafts = parsedGen.data.problems.map((p) => ({ prompt: normalizeSpaces(p.prompt) }));
     } else {
       drafts = salvageGenerationPayload(genResp.data);
       if (drafts.length === 0) {
@@ -619,10 +530,7 @@ async function fetchGenerationDrafts(input: {
         if (repaired.ok && repaired.data) {
           const repairedStrict = llmGenSchema.safeParse(repaired.data);
           if (repairedStrict.success) {
-            drafts = repairedStrict.data.problems.map((p) => ({
-              prompt: normalizeSpaces(p.prompt),
-              choices: p.choices.slice(0, 5).map((c) => normalizeSpaces(c))
-            }));
+            drafts = repairedStrict.data.problems.map((p) => ({ prompt: normalizeSpaces(p.prompt) }));
           } else {
             drafts = salvageGenerationPayload(repaired.data);
           }
@@ -675,17 +583,11 @@ function applyGradeBandLexicon(draft: GenerationDraft, gradeBand: GradeBandAppli
   const dict = gradeBand === "g1" ? g1Dict : g23Dict;
 
   const promptApplied = applyReplaceDict(draft.prompt, dict);
-  let replacements = promptApplied.changed;
-  const nextChoices = draft.choices.map((c) => {
-    const applied = applyReplaceDict(c, dict);
-    replacements += applied.changed;
-    return normalizeSpaces(applied.text);
-  });
+  const replacements = promptApplied.changed;
 
   return {
     draft: {
-      prompt: normalizeSpaces(promptApplied.text),
-      choices: nextChoices
+      prompt: normalizeSpaces(promptApplied.text)
     },
     replacements
   };
@@ -703,34 +605,12 @@ function shouldStopEarly(
 
 function buildLengthMeterFallbackProblem(seedText: string): GeneratedProblem {
   const meters = (hashInt(`${seedText}:meter`) % 9) + 1; // 1..9 m
-  const answer = meters * 100;
-  const distractors = [answer - 100, answer + 100, answer + 200, answer - 200]
-    .filter((v) => v >= 0)
-    .slice(0, 4);
-  while (distractors.length < 4) {
-    distractors.push(answer + (distractors.length + 1) * 300);
-  }
-  const all = [answer, ...distractors];
-  const unique = Array.from(new Set(all)).slice(0, 5);
-  while (unique.length < 5) {
-    unique.push(answer + (unique.length + 1) * 500);
-  }
-  const correctIndex = unique.indexOf(answer);
-  const choices = unique.map((v) => String(v));
   const prompt = `${meters} m = □ cm`;
 
   return {
     prompt,
-    choices,
-    correct_index: correctIndex,
-    answer_value: answer,
-    equation: `${meters}*100`,
-    check_trace: `${meters}m = ${answer}cm`,
-    required_items: ["prompt", "choices"],
-    items: [
-      { type: "prompt", slot: "stem", text: prompt },
-      { type: "choices", slot: "options", style: "mc", choices, correct_index: correctIndex }
-    ]
+    required_items: ["prompt"],
+    items: [{ type: "prompt", slot: "stem", text: prompt }]
   };
 }
 
@@ -738,44 +618,18 @@ function buildLengthConversionFallbackProblem(seedText: string, kind: "cm_to_m" 
   if (kind === "cm_to_m") {
     const meters = (hashInt(`${seedText}:cm_to_m`) % 9) + 1;
     const cm = meters * 100;
-    const answer = meters;
-    const choices = [String(answer), String(answer + 1), String(answer + 2), String(answer + 3), String(answer + 4)];
     return {
       prompt: `${cm} cm = □ m`,
-      choices,
-      correct_index: 0,
-      answer_value: answer,
-      equation: `${cm}/100`,
-      check_trace: `${cm}cm = ${answer}m`,
-      required_items: ["prompt", "choices"],
-      items: [
-        { type: "prompt", slot: "stem", text: `${cm} cm = □ m` },
-        { type: "choices", slot: "options", style: "mc", choices, correct_index: 0 }
-      ]
+      required_items: ["prompt"],
+      items: [{ type: "prompt", slot: "stem", text: `${cm} cm = □ m` }]
     };
   }
 
   const meters = (hashInt(`${seedText}:m_to_cm`) % 9) + 1;
-  const answer = meters * 100;
-  const distractors = [answer - 100, answer + 100, answer + 200, answer - 200].filter((v) => v >= 0).slice(0, 4);
-  while (distractors.length < 4) distractors.push(answer + (distractors.length + 1) * 300);
-  const raw = [answer, ...distractors];
-  const unique = Array.from(new Set(raw)).slice(0, 5);
-  while (unique.length < 5) unique.push(answer + (unique.length + 1) * 500);
-  const choices = unique.map(String);
-  const correctIndex = unique.indexOf(answer);
   return {
     prompt: `${meters} m = □ cm`,
-    choices,
-    correct_index: correctIndex,
-    answer_value: answer,
-    equation: `${meters}*100`,
-    check_trace: `${meters}m = ${answer}cm`,
-    required_items: ["prompt", "choices"],
-    items: [
-      { type: "prompt", slot: "stem", text: `${meters} m = □ cm` },
-      { type: "choices", slot: "options", style: "mc", choices, correct_index: correctIndex }
-    ]
+    required_items: ["prompt"],
+    items: [{ type: "prompt", slot: "stem", text: `${meters} m = □ cm` }]
   };
 }
 
@@ -807,9 +661,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
   let generationCalls = 0;
-  let solverCalls = 0;
+  const solverCalls = 0;
   let generationStatus: number | null = null;
-  let solverStatus: number | null = null;
+  const solverStatus: number | null = null;
   let violationsCount = 0;
   let localReplacements = 0;
   let gradeBandApplied: GradeBandApplied = requestedGradeBand ?? "g1";
@@ -849,7 +703,10 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     }
 
     if (!gradeBandEstimated) {
-      gradeBandApplied = estimateGradeBand({ ocrText: ocr_text, drafts: generationDrafts });
+      gradeBandApplied = estimateGradeBand({
+        ocrText: ocr_text,
+        drafts: generationDrafts.map((d) => ({ prompt: d.prompt, choices: [] }))
+      });
       gradeBandEstimated = true;
     }
 
@@ -863,7 +720,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
       localReplacements += normalized.replacements;
       let workingDraft = normalized.draft;
-      const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+      const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
       violationsCount += guard.violations_count;
       if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
         const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
@@ -893,29 +750,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         }
       }
 
-      solverCalls += 1;
-      const solveResp = await callGeminiJson(solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language }));
-      solverStatus = solveResp.status;
-      if (!solveResp.ok || !solveResp.data) {
-        reasons[solveResp.error ?? "solver_failed"] = (reasons[solveResp.error ?? "solver_failed"] ?? 0) + 1;
-        continue;
-      }
-
-      const parsedSolve = llmSolveSchema.safeParse(solveResp.data);
-      if (!parsedSolve.success) {
-        reasons.solver_schema_invalid = (reasons.solver_schema_invalid ?? 0) + 1;
-        continue;
-      }
-
-      const light = validateLight({
-        prompt: workingDraft.prompt,
-        choices: workingDraft.choices.slice(0, 5),
-        correct_index: parsedSolve.data.correct_index,
-        answer_value: parsedSolve.data.answer_value
-      });
-      if (!light.ok) {
-        const key = light.reason ?? "light_validation_failed";
-        reasons[key] = (reasons[key] ?? 0) + 1;
+      if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
+        reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
         continue;
       }
       const parsedConversion = parseUnitConversion(workingDraft.prompt);
@@ -924,35 +760,16 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
           continue;
         }
-        const expected = convertUnitValue(parsedConversion);
-        if (expected === null) {
+        if (convertUnitValue(parsedConversion) === null) {
           reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
-          continue;
-        }
-        if (Math.abs(expected - parsedSolve.data.answer_value) > 1e-9) {
-          reasons.unit_conversion_answer_mismatch = (reasons.unit_conversion_answer_mismatch ?? 0) + 1;
           continue;
         }
       }
 
       accepted.push({
         prompt: normalizeSpaces(workingDraft.prompt),
-        choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
-        correct_index: parsedSolve.data.correct_index,
-        answer_value: parsedSolve.data.answer_value,
-        equation: parsedSolve.data.equation,
-        check_trace: parsedSolve.data.check_trace,
-        required_items: ["prompt", "choices"],
-        items: [
-          { type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) },
-          {
-            type: "choices",
-            slot: "options",
-            style: "mc",
-            choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
-            correct_index: parsedSolve.data.correct_index
-          }
-        ]
+        required_items: ["prompt"],
+        items: [{ type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) }]
       });
       if (unitDomainLock?.domain === "length") {
         const acceptedConversion = parseUnitConversion(workingDraft.prompt);
@@ -1005,7 +822,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
         localReplacements += normalized.replacements;
         let workingDraft = normalized.draft;
-        const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: workingDraft.choices }, gradeBandApplied);
+        const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
         violationsCount += guard.violations_count;
         if (inputMode === "equation" && sourceConversion !== null && parseUnitConversion(workingDraft.prompt) === null) {
           const looseParsed = parseUnitConversionLoose(workingDraft.prompt);
@@ -1035,31 +852,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           }
         }
 
-        solverCalls += 1;
-        const solveResp = await callGeminiJson(
-          solvePrompt({ prompt: workingDraft.prompt, choices: workingDraft.choices.slice(0, 5), language })
-        );
-        solverStatus = solveResp.status;
-        if (!solveResp.ok || !solveResp.data) {
-          reasons[solveResp.error ?? "solver_failed"] = (reasons[solveResp.error ?? "solver_failed"] ?? 0) + 1;
-          continue;
-        }
-
-        const parsedSolve = llmSolveSchema.safeParse(solveResp.data);
-        if (!parsedSolve.success) {
-          reasons.solver_schema_invalid = (reasons.solver_schema_invalid ?? 0) + 1;
-          continue;
-        }
-
-        const light = validateLight({
-          prompt: workingDraft.prompt,
-          choices: workingDraft.choices.slice(0, 5),
-          correct_index: parsedSolve.data.correct_index,
-          answer_value: parsedSolve.data.answer_value
-        });
-        if (!light.ok) {
-          const key = light.reason ?? "light_validation_failed";
-          reasons[key] = (reasons[key] ?? 0) + 1;
+        if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
+          reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
           continue;
         }
         const parsedConversion = parseUnitConversion(workingDraft.prompt);
@@ -1068,35 +862,16 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             reasons.unit_domain_mismatch = (reasons.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
-          const expected = convertUnitValue(parsedConversion);
-          if (expected === null) {
+          if (convertUnitValue(parsedConversion) === null) {
             reasons.unit_conversion_pair_unsupported = (reasons.unit_conversion_pair_unsupported ?? 0) + 1;
-            continue;
-          }
-          if (Math.abs(expected - parsedSolve.data.answer_value) > 1e-9) {
-            reasons.unit_conversion_answer_mismatch = (reasons.unit_conversion_answer_mismatch ?? 0) + 1;
             continue;
           }
         }
 
         accepted.push({
           prompt: normalizeSpaces(workingDraft.prompt),
-          choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
-          correct_index: parsedSolve.data.correct_index,
-          answer_value: parsedSolve.data.answer_value,
-          equation: parsedSolve.data.equation,
-          check_trace: parsedSolve.data.check_trace,
-          required_items: ["prompt", "choices"],
-          items: [
-            { type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) },
-            {
-              type: "choices",
-              slot: "options",
-              style: "mc",
-              choices: workingDraft.choices.slice(0, 5).map((c) => normalizeSpaces(c)),
-              correct_index: parsedSolve.data.correct_index
-            }
-          ]
+          required_items: ["prompt"],
+          items: [{ type: "prompt", slot: "stem", text: normalizeSpaces(workingDraft.prompt) }]
         });
         if (unitDomainLock?.domain === "length") {
           const acceptedConversion = parseUnitConversion(workingDraft.prompt);
@@ -1166,7 +941,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     detected_mode: appliedCount > 0 ? (inputMode as "equation" | "word_problem") : ("unknown" as const),
     intent: appliedCount > 0 ? "llm_free_generation" : "unknown_intent",
     confidence: appliedCount > 0 ? 0.78 : 0.2,
-    required_items: appliedCount > 0 ? (["prompt", "choices"] as const) : ([] as const),
+    required_items: appliedCount > 0 ? (["prompt"] as const) : ([] as const),
     items: topItems,
     problems: accepted,
     requested_count: count,
@@ -1185,7 +960,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     },
     debug: {
       generator_model: GEMINI_MODEL,
-      solver_model: GEMINI_MODEL,
+      solver_model: null,
       generation_calls: generationCalls,
       solver_calls: solverCalls,
       generation_status: generationStatus,
@@ -1195,6 +970,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       input_mode: inputMode,
       source_category: sourceCategory,
       unit_domain_lock: unitDomainLock,
+      choices_disabled: true,
+      choice_generation_via_ai: false,
       kanji_guard: {
         checked: true,
         violations_count: violationsCount,
