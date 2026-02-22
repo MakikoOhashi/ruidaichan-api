@@ -23,7 +23,7 @@ type InputMode = "equation" | "word_problem";
 type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_calc";
 type WordProblemIntent = "compare_diff" | "general";
 type ArithmeticOperatorHint = "multiply" | "divide" | "add_sub" | "mixed" | "unknown";
-type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic";
+type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic" | "narrative_guard";
 type EquationTrackAnalysis = {
   track: EquationTrack;
   decision: EquationTrackDecision;
