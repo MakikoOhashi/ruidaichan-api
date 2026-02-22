@@ -22,6 +22,7 @@ type GeneratedProblem = {
 type InputMode = "equation" | "word_problem";
 type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_calc";
 type WordProblemIntent = "compare_diff" | "general";
+type ArithmeticOperatorHint = "multiply" | "divide" | "add_sub" | "mixed" | "unknown";
 type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic";
 type EquationTrackAnalysis = {
   track: EquationTrack;
@@ -453,6 +454,32 @@ function isRelaxedWordProblem(prompt: string): boolean {
   return sentenceLike && numberCount >= 2 && questionLike;
 }
 
+function detectArithmeticOperatorHint(text: string): ArithmeticOperatorHint {
+  const normalized = text.normalize("NFKC");
+  const hasMul = /[×xX＊*]/.test(normalized);
+  const hasDiv = /[÷]/.test(normalized);
+  const hasAddSub = /[+\-＋－]/.test(normalized);
+
+  if (hasMul && !hasDiv && !hasAddSub) return "multiply";
+  if (hasDiv && !hasMul && !hasAddSub) return "divide";
+  if (hasAddSub && !hasMul && !hasDiv) return "add_sub";
+  if (hasMul || hasDiv || hasAddSub) return "mixed";
+  return "unknown";
+}
+
+function isPromptCompatibleWithArithmeticHint(prompt: string, hint: ArithmeticOperatorHint): boolean {
+  if (hint === "unknown" || hint === "mixed") return true;
+  const normalized = prompt.normalize("NFKC");
+  const hasMul = /[×xX＊*]/.test(normalized);
+  const hasDiv = /[÷]/.test(normalized);
+  const hasAddSub = /[+\-＋－]/.test(normalized);
+
+  if (hint === "multiply") return hasMul && !hasDiv && !hasAddSub;
+  if (hint === "divide") return hasDiv && !hasMul && !hasAddSub;
+  if (hint === "add_sub") return hasAddSub && !hasMul && !hasDiv;
+  return true;
+}
+
 function parseJsonLoose(raw: string): unknown {
   const t = raw.trim();
   try {
@@ -573,6 +600,7 @@ function generationPrompt(input: {
   seed: string;
   inputMode: InputMode;
   equationTrack: EquationTrack | null;
+  arithmeticHint: ArithmeticOperatorHint;
   wordProblemIntent: WordProblemIntent;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
@@ -626,6 +654,15 @@ function generationPrompt(input: {
                   "- Do NOT convert equations into story/word problems.",
                   "- Do NOT include unit-conversion constraints unless source clearly uses units."
                 ]),
+          ...(input.equationTrack === "arithmetic" && input.arithmeticHint === "multiply"
+            ? ["- Use multiplication equations only (×). Do NOT use + or - or ÷."]
+            : []),
+          ...(input.equationTrack === "arithmetic" && input.arithmeticHint === "divide"
+            ? ["- Use division equations only (÷). Do NOT use + or - or ×."]
+            : []),
+          ...(input.equationTrack === "arithmetic" && input.arithmeticHint === "add_sub"
+            ? ["- Use addition/subtraction equations only (+/-). Do NOT use × or ÷."]
+            : []),
           ...(input.conversionHint
             ? [
                 "- Allowed elementary conversions: mm/cm, cm/m, m/km, mL/dL, dL/L, g/kg.",
@@ -740,6 +777,7 @@ async function fetchGenerationDrafts(input: {
   seed: string;
   inputMode: InputMode;
   equationTrack: EquationTrack | null;
+  arithmeticHint: ArithmeticOperatorHint;
   wordProblemIntent: WordProblemIntent;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
@@ -760,6 +798,7 @@ async function fetchGenerationDrafts(input: {
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
         equationTrack: input.equationTrack,
+        arithmeticHint: input.arithmeticHint,
         wordProblemIntent: input.wordProblemIntent,
         conversionHint: input.conversionHint,
         unitDomainLock: input.unitDomainLock
@@ -945,6 +984,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const inputMode = detectInputMode(ocr_text);
   const equationTrackAnalysis = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
   const equationTrack = equationTrackAnalysis?.track ?? null;
+  const arithmeticHint =
+    inputMode === "equation" && equationTrack === "arithmetic" ? detectArithmeticOperatorHint(ocr_text) : "unknown";
   const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocr_text) : "general";
   const sourceCategory = detectSolveCategory(ocr_text);
   const sourceConversion = parseUnitConversion(ocr_text);
@@ -999,6 +1040,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: `${seedText}:b${batchIndex}`,
         inputMode,
         equationTrack,
+        arithmeticHint,
         wordProblemIntent: sourceWordIntent,
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
@@ -1049,6 +1091,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         if (equationStyleMissSamples.length < 5) {
           equationStyleMissSamples.push(truncateForLog(workingDraft.prompt));
         }
+        continue;
+      }
+      if (inputMode === "equation" && equationTrack === "arithmetic" && !isPromptCompatibleWithArithmeticHint(workingDraft.prompt, arithmeticHint)) {
+        reasons.arithmetic_operator_mismatch = (reasons.arithmetic_operator_mismatch ?? 0) + 1;
+        batchRejectCounts.arithmetic_operator_mismatch = (batchRejectCounts.arithmetic_operator_mismatch ?? 0) + 1;
         continue;
       }
       const generatedCategory = detectSolveCategory(workingDraft.prompt);
@@ -1154,6 +1201,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
         equationTrack,
+        arithmeticHint,
         wordProblemIntent: sourceWordIntent,
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
         unitDomainLock
@@ -1190,6 +1238,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           if (equationStyleMissSamples.length < 5) {
             equationStyleMissSamples.push(truncateForLog(workingDraft.prompt));
           }
+          continue;
+        }
+        if (inputMode === "equation" && equationTrack === "arithmetic" && !isPromptCompatibleWithArithmeticHint(workingDraft.prompt, arithmeticHint)) {
+          reasons.arithmetic_operator_mismatch = (reasons.arithmetic_operator_mismatch ?? 0) + 1;
+          fillRejectCounts.arithmetic_operator_mismatch = (fillRejectCounts.arithmetic_operator_mismatch ?? 0) + 1;
           continue;
         }
         const generatedCategory = detectSolveCategory(workingDraft.prompt);
@@ -1379,6 +1432,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       source_category: sourceCategory,
       source_word_intent: sourceWordIntent,
       equation_track: equationTrack,
+      arithmetic_hint: arithmeticHint,
       equation_track_decision: equationTrackAnalysis?.decision ?? null,
       equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
       equation_track_reason: equationTrackAnalysis?.reason ?? null,
@@ -1403,6 +1457,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       request_id: requestId,
       input_mode: inputMode,
       equation_track: equationTrack,
+      arithmetic_hint: arithmeticHint,
       equation_track_decision: equationTrackAnalysis?.decision ?? null,
       equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
       equation_track_reason: equationTrackAnalysis?.reason ?? null,

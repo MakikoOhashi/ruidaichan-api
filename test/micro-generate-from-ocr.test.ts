@@ -373,6 +373,58 @@ test("/micro/generate_from_ocr keeps equation count=10", async () => {
   });
 });
 
+test("/micro/generate_from_ocr respects multiplication hint from noisy OCR", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          { prompt: "5 + 3 = □" },
+          { prompt: "7 × 6 = □" },
+          { prompt: "12 - 4 = □" },
+          { prompt: "9 × 4 = □" }
+        ]
+      });
+    }
+    return geminiResponse({ problems: [] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "== x (9)。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "mul-hint"
+        })
+      });
+
+      const body = (await res.json()) as {
+        detected_mode: string;
+        problems: Array<{ prompt: string }>;
+        reasons: Record<string, number>;
+        debug: { arithmetic_hint: string };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.debug.arithmetic_hint, "multiply");
+      assert.equal(body.problems.length > 0, true);
+      assert.equal(body.problems.every((p) => /[×xX＊*]/.test(p.prompt)), true);
+      assert.equal((body.reasons.arithmetic_operator_mismatch ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
