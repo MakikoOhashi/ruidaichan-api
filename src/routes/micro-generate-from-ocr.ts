@@ -361,16 +361,27 @@ function detectEquationTrack(text: string): EquationTrackAnalysis {
   const normalized = text.normalize("NFKC");
   const hasOpPattern = /[0-9]\s*[\+\-×÷]\s*[0-9]/.test(normalized);
   const hasEq = /=/.test(normalized) || /□|口|ロ|_|\[\]/.test(normalized);
-  const pureConversion =
-    parseUnitConversion(normalized) !== null || parseUnitConversionLoose(normalized) !== null || parseCompositeUnitConversion(normalized) !== null;
+  const strictConversion = parseUnitConversion(normalized) !== null || parseCompositeUnitConversion(normalized) !== null;
+  const looseConversion = parseUnitConversionLoose(normalized) !== null;
+  const pureConversion = strictConversion || looseConversion;
   const hasUnits = hasUnitToken(normalized);
   const unitCount = extractCanonicalUnits(normalized).length;
   const numberCount = (normalized.match(/\d+/g) ?? []).length;
   const explicitCalc = isExplicitUnitConversionCalc(normalized);
+  const strongWordProblemSignals = hasStrongWordProblemSignals(normalized);
+  const hasStructuredEquationSignal = strictConversion || explicitCalc || hasOpPattern || /□|口|ロ|_|\[\]/.test(normalized);
 
   // OCRが崩れて「2L9dL=□dL」が「2- 9α- = dL」のようになるケースを純変換側へ寄せる
   const sparsePureHint = hasEq && hasUnits && unitCount <= 1 && numberCount >= 2;
 
+  if (strongWordProblemSignals && looseConversion && !hasStructuredEquationSignal) {
+    return {
+      track: "arithmetic",
+      decision: "narrative_guard",
+      ambiguous: true,
+      reason: "narrative_unit_conversion_sentence"
+    };
+  }
   if (pureConversion) {
     return { track: "unit_conversion_pure", decision: "explicit_pure", ambiguous: false, reason: null };
   }
@@ -802,18 +813,31 @@ function isRetriableGenError(error?: string): boolean {
   return error === "gemini_timeout" || error === "gemini_transport_error" || error === "gemini_http_429" || error === "gemini_http_500" || error === "gemini_http_503";
 }
 
+const WORD_MARKERS =
+  /(ですか|なりますか|つぎから|えらびなさい|あげました|もらいました|もっていきました|のこり|のこっています|何こ|なんこ|何本|何人|毎日|きょう|きのう|しき|こたえ|答え|あわせて|合計|入っています)/;
+
+function hasStrongWordProblemSignals(text: string): boolean {
+  const normalized = text.normalize("NFKC");
+  const sentenceLike = /[。！？]/.test(normalized);
+  const wordMarkerCount = (normalized.match(new RegExp(WORD_MARKERS, "g")) ?? []).length;
+  return sentenceLike && wordMarkerCount >= 2 && normalized.length >= 30;
+}
+
 function detectInputMode(ocrText: string): InputMode {
   const normalized = ocrText.normalize("NFKC");
   const hasEquals = normalized.includes("=");
-  const hasBlank = /□|＿|_|\[\]|\b空欄\b/.test(normalized);
+  const hasBlankSymbol = /□|＿|\[\]|\b空欄\b/.test(normalized);
+  const hasStandaloneUnderscoreBlank = /(^|[\s=+\-×÷()（）「」『』【】,，、。．])_(?=$|[\s=+\-×÷()（）「」『』【】,，、。．])/.test(
+    normalized
+  );
+  const hasBlank = hasBlankSymbol || hasStandaloneUnderscoreBlank;
   const hasArithmeticPattern = /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized);
   const hasUnitConversionPattern = parseUnitConversion(normalized) !== null;
   const hasNumberUnitPair = /\d+\s*(mm|cm|km|mL|dL|L|kg|g|円|ミリメートル|センチメートル|メートル|キロメートル|ミリリットル|デシリットル|リットル|グラム|キログラム)/i.test(
     normalized
   );
-  const wordMarkers = /(ですか|なりますか|つぎから|えらびなさい|あげました|もらいました|もっていきました|のこり|のこっています|何こ|なんこ|何本|何人|毎日|きょう|きのう|しき|こたえ)/;
   const sentenceLike = /[。！？]/.test(normalized);
-  const wordMarkerCount = (normalized.match(new RegExp(wordMarkers, "g")) ?? []).length;
+  const wordMarkerCount = (normalized.match(new RegExp(WORD_MARKERS, "g")) ?? []).length;
   const hasEquationHardSignal = hasEquals || hasBlank || hasArithmeticPattern || hasUnitConversionPattern;
 
   if (hasEquationHardSignal) {

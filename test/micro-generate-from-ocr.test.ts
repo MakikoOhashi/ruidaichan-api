@@ -1002,6 +1002,105 @@ test("/micro/generate_from_ocr keeps clear sentence as word_problem mode", async
   });
 });
 
+test("/micro/generate_from_ocr keeps sentence OCR with trailing underscore as word_problem mode", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "大きいバケツに3.45L、小さいバケツに2.13Lの水が入っています。水はあわせて何Lですか。",
+            choices: ["5.38L", "5.48L", "5.58L", "5.68L", "5.78L"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 5.58, correct_index: 2, equation: "3.45+2.13" });
+    }
+    return geminiResponse({ answer_value: 5.58, correct_index: 2 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "大きいバケツには3.45L。小さいバケツには2.13_。の水が入っています。水はあわせて何Lですか。式。答え。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "word-problem-trailing-underscore"
+        })
+      });
+      const body = (await res.json()) as { detected_mode: string; debug: { input_mode: string; equation_track: string | null } };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "word_problem");
+      assert.equal(body.debug.input_mode, "word_problem");
+      assert.equal(body.debug.equation_track, null);
+    });
+  });
+});
+
+test("/micro/generate_from_ocr narrative unit sentence with stray '=' avoids unit_conversion_pure track", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "30 mL = □ dL",
+            choices: ["0.3 dL", "3 dL", "30 dL", "300 dL", "0.03 dL"]
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 0.3, correct_index: 0, equation: "30mL=0.3dL" });
+    }
+    return geminiResponse({ answer_value: 0.3, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "大きいバケツには3.45L、小さいバケツには2.13Lの水が入っています。水はあわせて何Lですか。式 = 。答え。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "narrative-unit-guard"
+        })
+      });
+      const body = (await res.json()) as {
+        detected_mode: string;
+        debug: { input_mode: string; equation_track: string | null; equation_track_decision: string | null; equation_track_reason: string | null };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.debug.input_mode, "equation");
+      assert.equal(body.debug.equation_track, "arithmetic");
+      assert.equal(body.debug.equation_track_decision, "narrative_guard");
+      assert.equal(body.debug.equation_track_reason, "narrative_unit_conversion_sentence");
+    });
+  });
+});
+
 test("/micro/generate_from_ocr rejects word-problemized output for equation input", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
