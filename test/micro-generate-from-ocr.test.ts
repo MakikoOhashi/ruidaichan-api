@@ -490,6 +490,54 @@ test("/micro/generate_from_ocr can fallback to image OCR when text OCR is noisy"
   });
 });
 
+test("/micro/generate_from_ocr rewrites impossible -0 equation to blank", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [{ prompt: "98 - □ = 39" }, { prompt: "76 - □ = 21" }, { prompt: "54 - □ = 18" }, { prompt: "87 - □ = 45" }]
+      });
+    }
+    return geminiResponse({ problems: [] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "(10) 98-0=39。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "zero-confusion"
+        })
+      });
+
+      const body = (await res.json()) as {
+        applied_count: number;
+        reasons: Record<string, number>;
+        debug: {
+          source_blank_confusion_applied: boolean;
+          source_blank_confusion_reason: string | null;
+        };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count > 0, true);
+      assert.equal(body.debug.source_blank_confusion_applied, true);
+      assert.equal(body.debug.source_blank_confusion_reason, "minus_zero_blank_confusion");
+      assert.equal((body.reasons.source_blank_confusion_rewritten ?? 0) > 0, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

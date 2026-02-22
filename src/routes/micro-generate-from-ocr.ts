@@ -846,6 +846,59 @@ function shouldPreferImageOcrFallback(ocrText: string): boolean {
   return false;
 }
 
+function rewriteImpossibleZeroAsBlankInSource(text: string): { text: string; applied: boolean; reason: string | null } {
+  const normalized = normalizeEquationPrompt(text);
+
+  let rewritten = normalized;
+  let applied = false;
+  let reason: string | null = null;
+
+  rewritten = rewritten.replace(/(\d+)\s*-\s*0\s*=\s*(\d+)/, (_, aRaw, bRaw) => {
+    const a = Number(aRaw);
+    const b = Number(bRaw);
+    if (Number.isFinite(a) && Number.isFinite(b) && a !== b) {
+      applied = true;
+      reason = "minus_zero_blank_confusion";
+      return `${a} - □ = ${b}`;
+    }
+    return `${aRaw} - 0 = ${bRaw}`;
+  });
+
+  rewritten = rewritten.replace(/(\d+)\s*\+\s*0\s*=\s*(\d+)/, (_, aRaw, bRaw) => {
+    const a = Number(aRaw);
+    const b = Number(bRaw);
+    if (!applied && Number.isFinite(a) && Number.isFinite(b) && a !== b) {
+      applied = true;
+      reason = "plus_zero_blank_confusion";
+      return `${a} + □ = ${b}`;
+    }
+    return `${aRaw} + 0 = ${bRaw}`;
+  });
+
+  rewritten = rewritten.replace(/0\s*\+\s*(\d+)\s*=\s*(\d+)/, (_, aRaw, bRaw) => {
+    const a = Number(aRaw);
+    const b = Number(bRaw);
+    if (!applied && Number.isFinite(a) && Number.isFinite(b) && a !== b) {
+      applied = true;
+      reason = "leading_zero_blank_confusion";
+      return `□ + ${a} = ${b}`;
+    }
+    return `0 + ${aRaw} = ${bRaw}`;
+  });
+
+  rewritten = rewritten.replace(/(\d+)\s*[×]\s*0\s*=\s*(\d+)/, (_, aRaw, bRaw) => {
+    const b = Number(bRaw);
+    if (!applied && Number.isFinite(b) && b !== 0) {
+      applied = true;
+      reason = "times_zero_blank_confusion";
+      return `${aRaw} × □ = ${bRaw}`;
+    }
+    return `${aRaw} × 0 = ${bRaw}`;
+  });
+
+  return { text: normalizeSpaces(rewritten), applied, reason };
+}
+
 function generationBatches(count: 4 | 5 | 10): number[] {
   if (count === 10) return [5, 5];
   return [count];
@@ -1091,6 +1144,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let aiOcrFallbackUsed = false;
   let aiOcrStatus: number | null = null;
   let aiOcrError: string | null = null;
+  let sourceBlankConfusionApplied = false;
+  let sourceBlankConfusionReason: string | null = null;
 
   if (image_base64 && (ocrText.length === 0 || shouldPreferImageOcrFallback(ocrText))) {
     const aiOcr = await callGeminiImageOcr({
@@ -1173,6 +1228,12 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       }
     });
   }
+  const sourceCorrection = rewriteImpossibleZeroAsBlankInSource(ocrText);
+  if (sourceCorrection.applied) {
+    ocrText = sourceCorrection.text;
+    sourceBlankConfusionApplied = true;
+    sourceBlankConfusionReason = sourceCorrection.reason;
+  }
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocrText);
   const equationTrackAnalysis = inputMode === "equation" ? detectEquationTrack(ocrText) : null;
@@ -1193,6 +1254,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
 
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
+  if (sourceBlankConfusionApplied) {
+    reasons.source_blank_confusion_rewritten = 1;
+  }
   const generationTimeline: Array<{
     phase: "batch" | "fill";
     index: number;
@@ -1641,6 +1705,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ai_ocr_status: aiOcrStatus,
       ai_ocr_error: aiOcrError,
       ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
+      source_blank_confusion_applied: sourceBlankConfusionApplied,
+      source_blank_confusion_reason: sourceBlankConfusionReason,
       generation_timeline: generationTimeline,
       equation_style_miss_samples: equationStyleMissSamples,
       unit_domain_lock: unitDomainLock,
@@ -1670,6 +1736,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ai_ocr_status: aiOcrStatus,
       ai_ocr_error: aiOcrError,
       ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
+      source_blank_confusion_applied: sourceBlankConfusionApplied,
+      source_blank_confusion_reason: sourceBlankConfusionReason,
       source_word_intent: sourceWordIntent,
       requested_count: count,
       target_count: targetCount,
