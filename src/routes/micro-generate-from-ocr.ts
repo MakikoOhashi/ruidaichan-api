@@ -317,11 +317,21 @@ function conversionPairKey(parsed: UnitConversionParsed): string {
 }
 
 function isEquationStylePrompt(prompt: string): boolean {
-  const normalized = prompt.normalize("NFKC");
+  const normalized = normalizeEquationPrompt(prompt);
   const operand = String.raw`(?:\d+(?:\.\d+)?|□|口|ロ|_|\[\])`;
-  const arithmeticStyle = new RegExp(String.raw`${operand}\s*[\+\-\*×÷]\s*${operand}\s*=\s*${operand}?`).test(normalized);
+  const arithmeticStyle = new RegExp(String.raw`${operand}\s*[\+\-\*×✕xX＊]\s*${operand}\s*=\s*${operand}?`).test(normalized) || new RegExp(String.raw`${operand}\s*÷\s*${operand}\s*=\s*${operand}?`).test(normalized);
   const conversionStyle = parseUnitConversion(normalized) !== null;
   return arithmeticStyle || conversionStyle;
+}
+
+function normalizeEquationPrompt(prompt: string): string {
+  return normalizeSpaces(
+    prompt
+      .normalize("NFKC")
+      .replace(/[xX✕＊*]/g, "×")
+      .replace(/[。．]/g, "")
+      .replace(/\s*=\s*/g, " = ")
+  );
 }
 
 function hasUnitToken(text: string): boolean {
@@ -468,7 +478,7 @@ function isRelaxedWordProblem(prompt: string): boolean {
 
 function detectArithmeticOperatorHint(text: string): ArithmeticOperatorHint {
   const normalized = text.normalize("NFKC");
-  const hasMul = /[×xX＊*]/.test(normalized);
+  const hasMul = /[×✕xX＊*]/.test(normalized);
   const hasDiv = /[÷]/.test(normalized);
   const hasAddSub = /[+\-＋－]/.test(normalized);
 
@@ -481,8 +491,8 @@ function detectArithmeticOperatorHint(text: string): ArithmeticOperatorHint {
 
 function isPromptCompatibleWithArithmeticHint(prompt: string, hint: ArithmeticOperatorHint): boolean {
   if (hint === "unknown" || hint === "mixed") return true;
-  const normalized = prompt.normalize("NFKC");
-  const hasMul = /[×xX＊*]/.test(normalized);
+  const normalized = normalizeEquationPrompt(prompt);
+  const hasMul = /[×]/.test(normalized);
   const hasDiv = /[÷]/.test(normalized);
   const hasAddSub = /[+\-＋－]/.test(normalized);
 
@@ -1259,6 +1269,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
       localReplacements += normalized.replacements;
       let workingDraft = normalized.draft;
+      if (inputMode === "equation") {
+        workingDraft = { ...workingDraft, prompt: normalizeEquationPrompt(workingDraft.prompt) };
+      }
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
       violationsCount += guard.violations_count;
       if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
@@ -1406,6 +1419,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         const normalized = applyGradeBandLexicon(draft, gradeBandApplied);
         localReplacements += normalized.replacements;
         let workingDraft = normalized.draft;
+        if (inputMode === "equation") {
+          workingDraft = { ...workingDraft, prompt: normalizeEquationPrompt(workingDraft.prompt) };
+        }
         const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
         violationsCount += guard.violations_count;
         if (inputMode === "equation" && equationTrack === "unit_conversion_pure" && !hasPureUnitConversionForm(workingDraft.prompt)) {
