@@ -33,13 +33,24 @@ type EquationTrackAnalysis = {
 
 const requestSchema = z
   .object({
-    ocr_text: z.string().min(1),
+    ocr_text: z.string().trim().min(1).optional(),
+    image_base64: z.string().trim().min(1).optional(),
+    image_mime_type: z.string().trim().min(1).default("image/jpeg"),
     count: z.union([z.literal(4), z.literal(5), z.literal(10)]).default(DEFAULT_COUNT),
     grade_band: z.enum(["g1", "g2_g3", "g1_g3"]).optional(),
     language: z.string().default("ja"),
     seed: z.union([z.string().min(1), z.number().int()])
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (!value.ocr_text && !value.image_base64) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "ocr_text_or_image_base64_required",
+        path: ["ocr_text"]
+      });
+    }
+  });
 
 const llmGenSchema = z
   .object({
@@ -592,6 +603,75 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
   }
 }
 
+async function callGeminiImageOcr(input: {
+  imageBase64: string;
+  imageMimeType: string;
+  language: string;
+}): Promise<{ ok: boolean; status: number | null; text?: string; error?: string }> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, status: null, error: "gemini_api_key_missing" };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: [
+                    "ROLE: image_ocr_v1",
+                    `Language: ${input.language}`,
+                    "Extract OCR text for a Japanese elementary math worksheet image.",
+                    "Return ONLY plain text, no JSON, no markdown.",
+                    "Preserve math symbols when possible: + - × ÷ = □ and units."
+                  ].join("\n")
+                },
+                {
+                  inline_data: {
+                    mime_type: input.imageMimeType,
+                    data: input.imageBase64
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: { temperature: 0.0 }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) {
+      return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
+    }
+
+    const json = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = normalizeSpaces(json.candidates?.[0]?.content?.parts?.[0]?.text ?? "");
+    if (!text) {
+      return { ok: false, status: response.status, error: "gemini_empty_text" };
+    }
+    return { ok: true, status: response.status, text };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { ok: false, status: null, error: "gemini_timeout" };
+    }
+    return { ok: false, status: null, error: "gemini_transport_error" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function generationPrompt(input: {
   ocrText: string;
   count: number;
@@ -738,6 +818,21 @@ function detectInputMode(ocrText: string): InputMode {
     return "word_problem";
   }
   return "word_problem";
+}
+
+function shouldPreferImageOcrFallback(ocrText: string): boolean {
+  const normalized = ocrText.normalize("NFKC");
+  if (!normalized) return true;
+
+  const hasEq = normalized.includes("=");
+  const hasAnyOp = /[+\-×÷]/.test(normalized);
+  const hasCanonicalEquation = /\d+\s*[+\-×÷]\s*\d+/.test(normalized);
+  const hasUnitLike = new RegExp(UNIT_TOKEN_PATTERN, "i").test(normalized);
+
+  if (normalized.length <= 10) return true;
+  if (hasEq && !hasCanonicalEquation && !hasUnitLike) return true;
+  if (hasEq && hasAnyOp && !/\d/.test(normalized)) return true;
+  return false;
 }
 
 function generationBatches(count: 4 | 5 | 10): number[] {
@@ -977,23 +1072,110 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     });
   }
 
-  const { ocr_text, count, grade_band, language, seed } = parsed.data;
+  const { ocr_text: request_ocr_text, image_base64, image_mime_type, count, grade_band, language, seed } = parsed.data;
   const seedText = String(seed);
   const start = Date.now();
+  let ocrText = normalizeSpaces(request_ocr_text ?? "");
+  let ocrSource: "request_text" | "image_ocr" | "none" = ocrText ? "request_text" : "none";
+  let aiOcrFallbackUsed = false;
+  let aiOcrStatus: number | null = null;
+  let aiOcrError: string | null = null;
+
+  if (image_base64 && (ocrText.length === 0 || shouldPreferImageOcrFallback(ocrText))) {
+    const aiOcr = await callGeminiImageOcr({
+      imageBase64: image_base64,
+      imageMimeType: image_mime_type,
+      language
+    });
+    aiOcrStatus = aiOcr.status;
+    if (aiOcr.ok && aiOcr.text) {
+      ocrText = aiOcr.text;
+      ocrSource = "image_ocr";
+      aiOcrFallbackUsed = true;
+    } else {
+      aiOcrError = aiOcr.error ?? "ai_ocr_failed";
+    }
+  }
+
+  if (!ocrText) {
+    return res.status(200).json({
+      spec_version: "micro_problem_render_v1",
+      request_id: requestId,
+      schema_version: "micro_generate_from_ocr_response_v1",
+      detected_mode: "unknown",
+      intent: "unknown_intent",
+      confidence: 0.2,
+      required_items: [],
+      items: [],
+      problems: [],
+      requested_count: count,
+      applied_count: 0,
+      need_confirm: true,
+      reasons: {
+        ...(aiOcrError ? { [aiOcrError]: 1 } : {}),
+        ...(ocrSource === "none" ? { ocr_text_missing: 1 } : {})
+      },
+      meta: {
+        note: "unknown_no_viable_candidate",
+        seed: seedText,
+        grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
+        count_policy: "server_enforced",
+        max_count: 10,
+        target_count: Math.min(count, 10),
+        request_hash: "",
+        inference_latency_ms: Date.now() - start
+      },
+      debug: {
+        generator_model: GEMINI_MODEL,
+        solver_model: null,
+        generation_calls: 0,
+        solver_calls: 0,
+        generation_status: null,
+        solver_status: null,
+        language,
+        grade_band,
+        input_mode: "word_problem",
+        source_category: "unknown",
+        source_word_intent: "general",
+        equation_track: null,
+        arithmetic_hint: "unknown",
+        equation_track_decision: null,
+        equation_track_ambiguous: false,
+        equation_track_reason: null,
+        ocr_retake_recommended: true,
+        generation_timeline: [],
+        equation_style_miss_samples: [],
+        unit_domain_lock: null,
+        ocr_source: ocrSource,
+        ai_ocr_fallback_used: aiOcrFallbackUsed,
+        ai_ocr_status: aiOcrStatus,
+        ai_ocr_error: aiOcrError,
+        ai_ocr_text_length: 0,
+        choices_disabled: true,
+        choice_generation_via_ai: false,
+        kanji_guard: {
+          checked: true,
+          violations_count: 0,
+          rewrite_attempts: 0,
+          local_replacements: 0
+        }
+      }
+    });
+  }
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
-  const inputMode = detectInputMode(ocr_text);
-  const equationTrackAnalysis = inputMode === "equation" ? detectEquationTrack(ocr_text) : null;
+  const inputMode = detectInputMode(ocrText);
+  const equationTrackAnalysis = inputMode === "equation" ? detectEquationTrack(ocrText) : null;
   const equationTrack = equationTrackAnalysis?.track ?? null;
   const arithmeticHint =
-    inputMode === "equation" && equationTrack === "arithmetic" ? detectArithmeticOperatorHint(ocr_text) : "unknown";
-  const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocr_text) : "general";
-  const sourceCategory = detectSolveCategory(ocr_text);
-  const sourceConversion = parseUnitConversion(ocr_text);
-  const sourceCompositeConversion = parseCompositeUnitConversion(ocr_text);
+    inputMode === "equation" && equationTrack === "arithmetic" ? detectArithmeticOperatorHint(ocrText) : "unknown";
+  const sourceWordIntent = inputMode === "word_problem" ? detectWordProblemIntent(ocrText) : "general";
+  const sourceCategory = detectSolveCategory(ocrText);
+  const sourceConversion = parseUnitConversion(ocrText);
+  const sourceCompositeConversion = parseCompositeUnitConversion(ocrText);
   const unitDomainLock =
-    buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocr_text)) ??
+    buildUnitDomainLock(sourceConversion ?? parseUnitConversionLoose(ocrText)) ??
     buildUnitDomainLockFromComposite(sourceCompositeConversion) ??
-    buildUnitDomainLockFromText(ocr_text);
+    buildUnitDomainLockFromText(ocrText);
   const maxCount = inputMode === "word_problem" ? 5 : 10;
   const targetCount = Math.min(count, maxCount) as 4 | 5 | 10;
   const cappedByPolicy = targetCount < count;
@@ -1033,7 +1215,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     const draftTarget = generationDraftTarget(batchTarget, inputMode, equationTrack, batchIndex, targetCount);
 
     const generated = await fetchGenerationDrafts({
-      ocrText: ocr_text,
+      ocrText: ocrText,
       count: draftTarget,
       gradeBand: grade_band ?? "g1_g3",
         language,
@@ -1060,7 +1242,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
 
     if (!gradeBandEstimated) {
       gradeBandApplied = estimateGradeBand({
-        ocrText: ocr_text,
+        ocrText: ocrText,
         drafts: generationDrafts.map((d) => ({ prompt: d.prompt, choices: [] }))
       });
       gradeBandEstimated = true;
@@ -1194,7 +1376,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       const needed = targetCount - accepted.length;
       const fillTarget = generationDraftTarget(Math.min(needed, 5), inputMode, equationTrack, fillTry + 10, targetCount);
       const generated = await fetchGenerationDrafts({
-        ocrText: ocr_text,
+        ocrText: ocrText,
         count: fillTarget,
         gradeBand: grade_band ?? "g1_g3",
         language,
@@ -1416,7 +1598,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       count_policy: "server_enforced",
       max_count: maxCount,
       target_count: targetCount,
-      request_hash: sha(normalizeSpaces(ocr_text)),
+      request_hash: sha(normalizeSpaces(ocrText)),
       inference_latency_ms: Date.now() - start
     },
     debug: {
@@ -1437,6 +1619,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
       equation_track_reason: equationTrackAnalysis?.reason ?? null,
       ocr_retake_recommended: equationTrackAnalysis?.ambiguous ?? false,
+      ocr_source: ocrSource,
+      ai_ocr_fallback_used: aiOcrFallbackUsed,
+      ai_ocr_status: aiOcrStatus,
+      ai_ocr_error: aiOcrError,
+      ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
       generation_timeline: generationTimeline,
       equation_style_miss_samples: equationStyleMissSamples,
       unit_domain_lock: unitDomainLock,
@@ -1461,6 +1648,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       equation_track_decision: equationTrackAnalysis?.decision ?? null,
       equation_track_ambiguous: equationTrackAnalysis?.ambiguous ?? false,
       equation_track_reason: equationTrackAnalysis?.reason ?? null,
+      ocr_source: ocrSource,
+      ai_ocr_fallback_used: aiOcrFallbackUsed,
+      ai_ocr_status: aiOcrStatus,
+      ai_ocr_error: aiOcrError,
+      ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
       source_word_intent: sourceWordIntent,
       requested_count: count,
       target_count: targetCount,

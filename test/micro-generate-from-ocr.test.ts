@@ -425,6 +425,71 @@ test("/micro/generate_from_ocr respects multiplication hint from noisy OCR", asy
   });
 });
 
+test("/micro/generate_from_ocr can fallback to image OCR when text OCR is noisy", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string; inline_data?: unknown }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: image_ocr_v1")) {
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "7 × 6 =" }] } }]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [{ prompt: "7 × 6 = □" }, { prompt: "8 × 3 = □" }, { prompt: "9 × 4 = □" }, { prompt: "6 × 5 = □" }]
+      });
+    }
+
+    return geminiResponse({ problems: [] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "== x (9)。",
+          image_base64: "ZmFrZS1pbWFnZS1ieXRlcw==",
+          image_mime_type: "image/jpeg",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "image-ocr-fallback"
+        })
+      });
+
+      const body = (await res.json()) as {
+        applied_count: number;
+        debug: {
+          ocr_source: string;
+          ai_ocr_fallback_used: boolean;
+          ai_ocr_text_length: number;
+          arithmetic_hint: string;
+        };
+        problems: Array<{ prompt: string }>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.debug.ocr_source, "image_ocr");
+      assert.equal(body.debug.ai_ocr_fallback_used, true);
+      assert.equal(body.debug.ai_ocr_text_length > 0, true);
+      assert.equal(body.debug.arithmetic_hint, "multiply");
+      assert.equal(body.applied_count > 0, true);
+      assert.equal(body.problems.every((p) => /×/.test(p.prompt)), true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
