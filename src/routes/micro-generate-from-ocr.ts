@@ -318,7 +318,8 @@ function conversionPairKey(parsed: UnitConversionParsed): string {
 
 function isEquationStylePrompt(prompt: string): boolean {
   const normalized = prompt.normalize("NFKC");
-  const arithmeticStyle = /[0-9]\s*[\+\-\*×÷]\s*[0-9]/.test(normalized) && /=|□|口|ロ|_/.test(normalized);
+  const operand = String.raw`(?:\d+(?:\.\d+)?|□|口|ロ|_|\[\])`;
+  const arithmeticStyle = new RegExp(String.raw`${operand}\s*[\+\-\*×÷]\s*${operand}\s*=\s*${operand}?`).test(normalized);
   const conversionStyle = parseUnitConversion(normalized) !== null;
   return arithmeticStyle || conversionStyle;
 }
