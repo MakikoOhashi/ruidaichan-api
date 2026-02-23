@@ -68,7 +68,7 @@ Response (shape):
   "need_confirm": false,
   "reasons": {},
   "meta": {
-    "note": "ok|partial_success|unknown_no_viable_candidate|ok_count_capped_by_policy",
+    "note": "ok|partial_success|partial_success_timeout|unknown_no_viable_candidate|ok_ambiguous_unit_conversion|ok_count_capped_by_policy",
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
     "difficulty_applied": "easy|standard|hard",
@@ -101,16 +101,21 @@ Response (shape):
 - `unit_conversion_pure`
 - `unit_conversion_calc`
 
-4. 生成（AI）  
+4. difficulty適用  
+- 共通 difficulty（`easy` / `same` / `hard`）を内部 policy に写像
+- `same` は内部的に `standard` として扱う
+
+5. 生成（AI）  
 - promptのみ生成（選択肢なし）
 
-5. 軽量フィルタ  
+6. 軽量フィルタ  
 - モード整合
 - カテゴリ整合
 - 演算子ヒント整合（例: 掛け算入力は掛け算問題を優先）
 - 単位ドメイン整合（length / volume / weight）
+- 難易度policy整合（range / steps / blank位置 / unit変換段数）
 
-6. 返却  
+7. 返却  
 - 取り切れなければ `partial_success`
 - 候補ゼロなら `unknown` + `need_confirm=true`
 
@@ -137,9 +142,11 @@ Response (shape):
 2. 数学的意味
 - `simple_calc`: 加減乗除
 - `reverse_blank`: 穴あき逆算
-- `repeat_or_times`: くり返し / 倍
+- `repeat_multiply`: くり返し（毎日×日数）
+- `scale_times`: 倍（AはBのk倍）
 - `split_equal`: 等分
 - `unit_conversion`: 単位変換
+- `compare_diff`: 合算して差を問う比較
 
 3. 出力制約
 - 選択肢なし（`prompt`のみ）
