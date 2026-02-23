@@ -40,6 +40,7 @@ Request:
   "image_base64": "...",
   "image_mime_type": "image/jpeg",
   "count": 5,
+  "difficulty": "easy|same|hard",
   "grade_band": "g1|g2_g3|g1_g3",
   "language": "ja",
   "seed": "12345"
@@ -70,6 +71,7 @@ Response (shape):
     "note": "ok|partial_success|unknown_no_viable_candidate|ok_count_capped_by_policy",
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
+    "difficulty_applied": "easy|standard|hard",
     "count_policy": "server_enforced",
     "max_count": 5,
     "target_count": 5

@@ -1002,6 +1002,66 @@ test("/micro/generate_from_ocr keeps clear sentence as word_problem mode", async
   });
 });
 
+test("/micro/generate_from_ocr applies easy difficulty policy for simple_calc", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [
+          {
+            prompt: "8 + 5 - 3 = □"
+          },
+          {
+            prompt: "7 + 2 = □"
+          }
+        ]
+      });
+    }
+    if (prompt.includes("ROLE: solver_v1")) {
+      return geminiResponse({ answer_value: 9, correct_index: 0, equation: "7+2" });
+    }
+    return geminiResponse({ answer_value: 9, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "7+2=□",
+          count: 4,
+          difficulty: "easy",
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "easy-policy-simple-calc"
+        })
+      });
+      const body = (await res.json()) as {
+        detected_mode: string;
+        problems: Array<{ prompt: string }>;
+        reasons: Record<string, number>;
+        debug: { difficulty: string; difficulty_applied: string };
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.debug.difficulty, "easy");
+      assert.equal(body.debug.difficulty_applied, "easy");
+      assert.equal((body.reasons.difficulty_policy_miss ?? 0) > 0, true);
+      assert.equal(
+        body.problems.every((p) => (((p.prompt.normalize("NFKC").match(/[+\-×÷]/g) ?? []).length <= 1))),
+        true
+      );
+    });
+  });
+});
+
 test("/micro/generate_from_ocr keeps sentence OCR with trailing underscore as word_problem mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

@@ -24,6 +24,8 @@ type EquationTrack = "arithmetic" | "unit_conversion_pure" | "unit_conversion_ca
 type WordProblemIntent = "compare_diff" | "general";
 type ArithmeticOperatorHint = "multiply" | "divide" | "add_sub" | "mixed" | "unknown";
 type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic" | "narrative_guard";
+type DifficultyInput = "easy" | "same" | "hard";
+type DifficultyLevel = "easy" | "standard" | "hard";
 type EquationTrackAnalysis = {
   track: EquationTrack;
   decision: EquationTrackDecision;
@@ -37,6 +39,7 @@ const requestSchema = z
     image_base64: z.string().trim().min(1).optional(),
     image_mime_type: z.string().trim().min(1).default("image/jpeg"),
     count: z.union([z.literal(4), z.literal(5), z.literal(10)]).default(DEFAULT_COUNT),
+    difficulty: z.enum(["easy", "same", "hard"]).default("same"),
     grade_band: z.enum(["g1", "g2_g3", "g1_g3"]).optional(),
     language: z.string().default("ja"),
     seed: z.union([z.string().min(1), z.number().int()])
@@ -420,7 +423,15 @@ function isPromptCompatibleWithTrack(prompt: string, track: EquationTrack): bool
   return true;
 }
 
-type SolveCategory = "simple_calc" | "reverse_blank" | "repeat_or_times" | "split_equal" | "unit_conversion" | "unknown";
+type SolveCategory =
+  | "simple_calc"
+  | "reverse_blank"
+  | "repeat_multiply"
+  | "scale_times"
+  | "split_equal"
+  | "unit_conversion"
+  | "compare_diff"
+  | "unknown";
 
 function detectSolveCategory(text: string): SolveCategory {
   const normalized = text.normalize("NFKC");
@@ -440,12 +451,15 @@ function detectSolveCategory(text: string): SolveCategory {
   if (/(同じ数|分け|1人分|何人分|あまり|配る)/.test(normalized)) {
     return "split_equal";
   }
-  if (
-    /(毎日|ずつ|日間|何日|倍|ばい|何倍|何分|何本|何こ|なんこ|いくつ|全部|ぜんぶ|合計|合わせる|あわせる|どちら|多い|少ない|色|あめ玉|もらいました|もらう)/.test(
-      normalized
-    )
-  ) {
-    return "repeat_or_times";
+  const isCompareDiff = /(どちら|より)/.test(normalized) && /(多い|少ない|差)/.test(normalized) && /(合計|合わせる|あわせる)/.test(normalized);
+  if (isCompareDiff) {
+    return "compare_diff";
+  }
+  if (/(毎日|ずつ|日間|何日|何分|何本|何こ|なんこ|いくつ|全部|ぜんぶ|合計|合わせる|あわせる)/.test(normalized)) {
+    return "repeat_multiply";
+  }
+  if (/(倍|ばい|何倍)/.test(normalized)) {
+    return "scale_times";
   }
   return "unknown";
 }
@@ -455,8 +469,10 @@ function isCategoryCompatible(source: SolveCategory, generated: SolveCategory): 
   if (source === "unit_conversion") return generated === "unit_conversion";
   if (source === "reverse_blank") return generated === "reverse_blank" || generated === "simple_calc";
   if (source === "simple_calc") return generated === "simple_calc" || generated === "reverse_blank";
-  if (source === "repeat_or_times") return generated === "repeat_or_times";
+  if (source === "repeat_multiply") return generated === "repeat_multiply" || generated === "scale_times";
+  if (source === "scale_times") return generated === "scale_times" || generated === "repeat_multiply";
   if (source === "split_equal") return generated === "split_equal";
+  if (source === "compare_diff") return generated === "compare_diff";
   return false;
 }
 
@@ -562,6 +578,188 @@ function salvageGenerationPayload(raw: unknown): GenerationDraft[] {
     out.push({ prompt });
   }
   return out;
+}
+
+function normalizeDifficultyLevel(input: DifficultyInput): DifficultyLevel {
+  return input === "same" ? "standard" : input;
+}
+
+function countEquationOperators(prompt: string): number {
+  const normalized = normalizeEquationPrompt(prompt);
+  return (normalized.match(/[+\-×÷]/g) ?? []).length;
+}
+
+function extractNumbersFromPrompt(prompt: string): number[] {
+  const normalized = prompt.normalize("NFKC");
+  return [...normalized.matchAll(/\d+(?:\.\d+)?/g)].map((m) => Number(m[0])).filter((v) => Number.isFinite(v));
+}
+
+function detectBlankPosition(prompt: string): "lhs" | "rhs" | "none" {
+  const normalized = normalizeEquationPrompt(prompt);
+  if (!/□|口|ロ|_|\[\]/.test(normalized)) return "none";
+  const [lhsRaw, rhsRaw = ""] = normalized.split("=");
+  const lhs = lhsRaw ?? "";
+  const rhs = rhsRaw ?? "";
+  if (/□|口|ロ|_|\[\]/.test(lhs)) return "lhs";
+  if (/□|口|ロ|_|\[\]/.test(rhs)) return "rhs";
+  return "none";
+}
+
+function buildDifficultyPolicyHints(input: {
+  difficulty: DifficultyLevel;
+  sourceCategory: SolveCategory;
+  inputMode: InputMode;
+  equationTrack: EquationTrack | null;
+  gradeBand: string;
+}): string[] {
+  const out: string[] = [`- Difficulty profile: ${input.difficulty}.`];
+  const isG1 = input.gradeBand === "g1";
+  if (input.sourceCategory === "simple_calc") {
+    if (input.difficulty === "easy") {
+      out.push("- Use 1-step arithmetic only.");
+      out.push("- Keep add/sub operands mostly single-digit and avoid carry/borrow.");
+      out.push("- For multiplication, focus on 2-5 tables.");
+    } else if (input.difficulty === "hard") {
+      out.push("- Allow 2-step arithmetic such as a+b-c.");
+      out.push("- Increase numeric range within grade limits.");
+      if (!isG1) out.push("- Multiplication may include 6-9 tables.");
+    } else {
+      out.push("- Keep mostly 1-step arithmetic and allow a small amount of 2-step.");
+    }
+  }
+  if (input.sourceCategory === "reverse_blank") {
+    if (input.difficulty === "easy") out.push("- Blank should be the result side only (a+b=□).");
+    if (input.difficulty === "hard") out.push("- Allow reverse blanks on lhs (□+a=b, a×□=b).");
+  }
+  if (input.sourceCategory === "unit_conversion") {
+    if (input.equationTrack === "unit_conversion_pure") {
+      if (input.difficulty === "easy") out.push("- Use pure unit conversion only, no arithmetic operators.");
+      if (input.difficulty === "hard") out.push("- Pure conversion may use larger values, but avoid 3-unit chains.");
+    }
+    if (input.equationTrack === "unit_conversion_calc") {
+      if (input.difficulty === "easy") out.push("- Use addition only for conversion+calculation.");
+      if (input.difficulty === "hard" && !isG1) out.push("- Conversion+calculation may include subtraction.");
+    }
+  }
+  if (input.sourceCategory === "split_equal") {
+    out.push("- Keep division exact (no remainder).");
+  }
+  if (input.sourceCategory === "repeat_multiply") {
+    if (input.difficulty === "easy") out.push("- Keep days/rates small and 1-step total questions.");
+    if (input.difficulty === "hard") out.push("- Use larger days/rates within grade limits.");
+  }
+  if (input.sourceCategory === "scale_times") {
+    if (input.difficulty === "easy") out.push("- Use multipliers 2 or 3 only.");
+    if (input.difficulty === "hard") out.push("- Multipliers may go up to 9.");
+  }
+  if (input.sourceCategory === "compare_diff") {
+    if (input.difficulty === "easy") out.push("- Prefer direct comparison without combining both sides.");
+    if (input.difficulty === "hard") out.push("- Prefer combine both sides then compare difference.");
+  }
+  return out;
+}
+
+function validateDifficultyPolicy(input: {
+  prompt: string;
+  sourceCategory: SolveCategory;
+  difficulty: DifficultyLevel;
+  inputMode: InputMode;
+  equationTrack: EquationTrack | null;
+  gradeBandApplied: GradeBandApplied;
+}): string | null {
+  const normalized = normalizeEquationPrompt(input.prompt);
+  const numbers = extractNumbersFromPrompt(normalized);
+  const opCount = countEquationOperators(normalized);
+  const blankPosition = detectBlankPosition(normalized);
+  const hasMul = /×/.test(normalized);
+  const hasDiv = /÷/.test(normalized);
+  const hasSub = /\-/.test(normalized);
+  const maxNumber = numbers.length > 0 ? Math.max(...numbers) : 0;
+
+  if (input.sourceCategory === "simple_calc") {
+    if (input.difficulty === "easy") {
+      if (opCount > 1) return "difficulty_policy_miss";
+      if (maxNumber > 20) return "difficulty_policy_miss";
+      if (hasMul) {
+        const nums = numbers.slice(0, 2);
+        if (nums.length >= 2) {
+          const [a, b] = nums;
+          if (a < 2 || b < 2 || a > 9 || b > 9 || (a > 5 && b > 5)) return "difficulty_policy_miss";
+        }
+      }
+      const nums = numbers.slice(0, 2);
+      if (nums.length >= 2 && !hasMul && !hasDiv) {
+        const [a, b] = nums;
+        if (a > 9 || b > 9) return "difficulty_policy_miss";
+        if (/\+/.test(normalized) && a % 10 + b % 10 >= 10) return "difficulty_policy_miss";
+        if (hasSub && a % 10 < b % 10) return "difficulty_policy_miss";
+      }
+      return null;
+    }
+    if (input.difficulty === "standard") {
+      if (opCount > 2) return "difficulty_policy_miss";
+      if (maxNumber > 99) return "difficulty_policy_miss";
+      return null;
+    }
+    if (opCount > 2) return "difficulty_policy_miss";
+    if (maxNumber > 120) return "difficulty_policy_miss";
+    return null;
+  }
+
+  if (input.sourceCategory === "reverse_blank") {
+    if (input.difficulty === "easy") {
+      if (opCount > 1 || blankPosition !== "rhs" || hasMul || hasDiv) return "difficulty_policy_miss";
+      if (maxNumber > 30) return "difficulty_policy_miss";
+      return null;
+    }
+    if (input.difficulty === "standard") {
+      if (opCount > 2 || hasMul || hasDiv) return "difficulty_policy_miss";
+      if (maxNumber > 99) return "difficulty_policy_miss";
+      return null;
+    }
+    if (opCount > 2) return "difficulty_policy_miss";
+    if (maxNumber > 120) return "difficulty_policy_miss";
+    return null;
+  }
+
+  if (input.sourceCategory === "unit_conversion") {
+    if (input.equationTrack === "unit_conversion_pure" || !/[+\-×÷]/.test(normalized)) {
+      if (input.difficulty === "easy" && /[+\-×÷]/.test(normalized)) return "difficulty_policy_miss";
+      if (input.difficulty === "easy" && parseCompositeUnitConversion(normalized) !== null) return "difficulty_policy_miss";
+      if (maxNumber > (input.difficulty === "hard" ? 999 : input.difficulty === "standard" ? 300 : 120)) return "difficulty_policy_miss";
+      return null;
+    }
+    if (input.equationTrack === "unit_conversion_calc" || /[+\-×÷]/.test(normalized)) {
+      if (input.difficulty === "easy" && (hasSub || hasMul || hasDiv)) return "difficulty_policy_miss";
+      if (input.difficulty !== "hard" && (hasMul || hasDiv)) return "difficulty_policy_miss";
+      if (input.difficulty === "hard" && input.gradeBandApplied === "g1" && hasSub) return "difficulty_policy_miss";
+      return null;
+    }
+  }
+
+  if (input.sourceCategory === "split_equal") {
+    if (input.difficulty === "easy" && maxNumber > 30) return "difficulty_policy_miss";
+    if (input.difficulty === "standard" && maxNumber > 70) return "difficulty_policy_miss";
+    if (input.difficulty === "hard" && maxNumber > 120) return "difficulty_policy_miss";
+    return null;
+  }
+
+  if (input.sourceCategory === "repeat_multiply" || input.sourceCategory === "scale_times" || input.sourceCategory === "compare_diff") {
+    if (numbers.length === 0) return null;
+    const maxAllowed = input.difficulty === "easy" ? 40 : input.difficulty === "standard" ? 80 : 140;
+    if (maxNumber > maxAllowed) return "difficulty_policy_miss";
+    if (input.sourceCategory === "scale_times") {
+      const multiplierMatches = [...normalized.matchAll(/(\d+)\s*(?:倍|ばい|×)/g)].map((m) => Number(m[1]));
+      if (multiplierMatches.length > 0) {
+        const kMax = Math.max(...multiplierMatches);
+        if (input.difficulty === "easy" && kMax > 3) return "difficulty_policy_miss";
+        if (input.difficulty === "standard" && kMax > 5) return "difficulty_policy_miss";
+        if (input.difficulty === "hard" && kMax > 9) return "difficulty_policy_miss";
+      }
+    }
+  }
+
+  return null;
 }
 
 function repairGenerationPrompt(language: string, raw: unknown): string {
@@ -698,9 +896,11 @@ function generationPrompt(input: {
   ocrText: string;
   count: number;
   gradeBand: string;
+  difficulty: DifficultyLevel;
   language: string;
   seed: string;
   inputMode: InputMode;
+  sourceCategory: SolveCategory;
   equationTrack: EquationTrack | null;
   arithmeticHint: ArithmeticOperatorHint;
   wordProblemIntent: WordProblemIntent;
@@ -723,7 +923,9 @@ function generationPrompt(input: {
     "ROLE: generator_v1",
     `Language: ${input.language}`,
     `Grade band: ${input.gradeBand}`,
+    `Difficulty: ${input.difficulty}`,
     `Input mode: ${input.inputMode}`,
+    `Source category: ${input.sourceCategory}`,
     ...(input.inputMode === "equation" && input.equationTrack !== null ? [`Equation track: ${input.equationTrack}`] : []),
     `Requested count: ${input.count}`,
     `Seed: ${input.seed}`,
@@ -735,6 +937,13 @@ function generationPrompt(input: {
     '{"problems":[{"prompt":"..."}]}',
     "Rules:",
     "- Keep difficulty around grade 1-3.",
+    ...buildDifficultyPolicyHints({
+      difficulty: input.difficulty,
+      sourceCategory: input.sourceCategory,
+      inputMode: input.inputMode,
+      equationTrack: input.equationTrack,
+      gradeBand: input.gradeBand
+    }),
     "- Do not generate answer choices.",
     "- Do not include option labels like ①②③.",
     ...(input.inputMode === "equation"
@@ -956,9 +1165,11 @@ async function fetchGenerationDrafts(input: {
   ocrText: string;
   count: number;
   gradeBand: string;
+  difficulty: DifficultyLevel;
   language: string;
   seed: string;
   inputMode: InputMode;
+  sourceCategory: SolveCategory;
   equationTrack: EquationTrack | null;
   arithmeticHint: ArithmeticOperatorHint;
   wordProblemIntent: WordProblemIntent;
@@ -977,9 +1188,11 @@ async function fetchGenerationDrafts(input: {
         ocrText: input.ocrText,
         count: input.count,
         gradeBand: input.gradeBand,
+        difficulty: input.difficulty,
         language: input.language,
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
+        sourceCategory: input.sourceCategory,
         equationTrack: input.equationTrack,
         arithmeticHint: input.arithmeticHint,
         wordProblemIntent: input.wordProblemIntent,
@@ -1160,8 +1373,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     });
   }
 
-  const { ocr_text: request_ocr_text, image_base64, image_mime_type, count, grade_band, language, seed } = parsed.data;
+  const { ocr_text: request_ocr_text, image_base64, image_mime_type, count, difficulty, grade_band, language, seed } = parsed.data;
   const seedText = String(seed);
+  const difficultyLevel = normalizeDifficultyLevel(difficulty);
   const start = Date.now();
   let ocrText = normalizeSpaces(request_ocr_text ?? "");
   let ocrSource: "request_text" | "image_ocr" | "none" = ocrText ? "request_text" : "none";
@@ -1209,6 +1423,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         note: "unknown_no_viable_candidate",
         seed: seedText,
         grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
+        difficulty_applied: difficultyLevel,
         count_policy: "server_enforced",
         max_count: 10,
         target_count: Math.min(count, 10),
@@ -1224,6 +1439,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         solver_status: null,
         language,
         grade_band,
+        difficulty,
+        difficulty_applied: difficultyLevel,
         input_mode: "word_problem",
         source_category: "unknown",
         source_word_intent: "general",
@@ -1317,15 +1534,17 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ocrText: ocrText,
       count: draftTarget,
       gradeBand: grade_band ?? "g1_g3",
-        language,
-        seed: `${seedText}:b${batchIndex}`,
-        inputMode,
-        equationTrack,
-        arithmeticHint,
-        wordProblemIntent: sourceWordIntent,
-        conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
-        unitDomainLock
-      });
+      difficulty: difficultyLevel,
+      language,
+      seed: `${seedText}:b${batchIndex}`,
+      inputMode,
+      sourceCategory,
+      equationTrack,
+      arithmeticHint,
+      wordProblemIntent: sourceWordIntent,
+      conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
+      unitDomainLock
+    });
     const acceptedBeforeBatch = accepted.length;
     const batchRejectCounts: Record<string, number> = {};
     generationCalls += generated.calls;
@@ -1416,6 +1635,19 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           continue;
         }
       }
+      const difficultyReason = validateDifficultyPolicy({
+        prompt: workingDraft.prompt,
+        sourceCategory,
+        difficulty: difficultyLevel,
+        inputMode,
+        equationTrack,
+        gradeBandApplied
+      });
+      if (difficultyReason) {
+        reasons[difficultyReason] = (reasons[difficultyReason] ?? 0) + 1;
+        batchRejectCounts[difficultyReason] = (batchRejectCounts[difficultyReason] ?? 0) + 1;
+        continue;
+      }
 
       if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
         reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
@@ -1481,9 +1713,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         ocrText: ocrText,
         count: fillTarget,
         gradeBand: grade_band ?? "g1_g3",
+        difficulty: difficultyLevel,
         language,
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
+        sourceCategory,
         equationTrack,
         arithmeticHint,
         wordProblemIntent: sourceWordIntent,
@@ -1565,6 +1799,19 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             fillRejectCounts.unit_domain_mismatch = (fillRejectCounts.unit_domain_mismatch ?? 0) + 1;
             continue;
           }
+        }
+        const difficultyReason = validateDifficultyPolicy({
+          prompt: workingDraft.prompt,
+          sourceCategory,
+          difficulty: difficultyLevel,
+          inputMode,
+          equationTrack,
+          gradeBandApplied
+        });
+        if (difficultyReason) {
+          reasons[difficultyReason] = (reasons[difficultyReason] ?? 0) + 1;
+          fillRejectCounts[difficultyReason] = (fillRejectCounts[difficultyReason] ?? 0) + 1;
+          continue;
         }
 
         if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
@@ -1700,6 +1947,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       note,
       seed: seedText,
       grade_band_applied: gradeBandApplied,
+      difficulty_applied: difficultyLevel,
       count_policy: "server_enforced",
       max_count: maxCount,
       target_count: targetCount,
@@ -1715,6 +1963,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       solver_status: solverStatus,
       language,
       grade_band,
+      difficulty,
+      difficulty_applied: difficultyLevel,
       input_mode: inputMode,
       source_category: sourceCategory,
       source_word_intent: sourceWordIntent,
@@ -1763,6 +2013,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       source_blank_confusion_applied: sourceBlankConfusionApplied,
       source_blank_confusion_reason: sourceBlankConfusionReason,
       source_word_intent: sourceWordIntent,
+      difficulty: difficultyLevel,
       requested_count: count,
       target_count: targetCount,
       applied_count: appliedCount,
