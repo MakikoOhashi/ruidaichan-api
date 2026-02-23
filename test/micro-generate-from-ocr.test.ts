@@ -1002,7 +1002,7 @@ test("/micro/generate_from_ocr keeps clear sentence as word_problem mode", async
   });
 });
 
-test("/micro/generate_from_ocr applies easy difficulty policy for simple_calc", async () => {
+test("/micro/generate_from_ocr keeps difficulty fields and does not force strict reject in easy mode", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
   await withMockFetch(async (original, input, init) => {
@@ -1053,11 +1053,8 @@ test("/micro/generate_from_ocr applies easy difficulty policy for simple_calc", 
       assert.equal(body.detected_mode, "equation");
       assert.equal(body.debug.difficulty, "easy");
       assert.equal(body.debug.difficulty_applied, "easy");
-      assert.equal((body.reasons.difficulty_policy_miss ?? 0) > 0, true);
-      assert.equal(
-        body.problems.every((p) => (((p.prompt.normalize("NFKC").match(/[+\-×÷]/g) ?? []).length <= 1))),
-        true
-      );
+      assert.equal((body.reasons.difficulty_policy_miss ?? 0) === 0, true);
+      assert.equal(body.problems.length > 0, true);
     });
   });
 });

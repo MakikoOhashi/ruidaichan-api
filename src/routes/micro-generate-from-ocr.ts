@@ -584,182 +584,22 @@ function normalizeDifficultyLevel(input: DifficultyInput): DifficultyLevel {
   return input === "same" ? "standard" : input;
 }
 
-function countEquationOperators(prompt: string): number {
-  const normalized = normalizeEquationPrompt(prompt);
-  return (normalized.match(/[+\-×÷]/g) ?? []).length;
-}
-
-function extractNumbersFromPrompt(prompt: string): number[] {
-  const normalized = prompt.normalize("NFKC");
-  return [...normalized.matchAll(/\d+(?:\.\d+)?/g)].map((m) => Number(m[0])).filter((v) => Number.isFinite(v));
-}
-
-function detectBlankPosition(prompt: string): "lhs" | "rhs" | "none" {
-  const normalized = normalizeEquationPrompt(prompt);
-  if (!/□|口|ロ|_|\[\]/.test(normalized)) return "none";
-  const [lhsRaw, rhsRaw = ""] = normalized.split("=");
-  const lhs = lhsRaw ?? "";
-  const rhs = rhsRaw ?? "";
-  if (/□|口|ロ|_|\[\]/.test(lhs)) return "lhs";
-  if (/□|口|ロ|_|\[\]/.test(rhs)) return "rhs";
-  return "none";
-}
-
-function buildDifficultyPolicyHints(input: {
+function buildDifficultyHints(input: {
   difficulty: DifficultyLevel;
-  sourceCategory: SolveCategory;
-  inputMode: InputMode;
-  equationTrack: EquationTrack | null;
-  gradeBand: string;
 }): string[] {
-  const out: string[] = [`- Difficulty profile: ${input.difficulty}.`];
-  const isG1 = input.gradeBand === "g1";
-  if (input.sourceCategory === "simple_calc") {
-    if (input.difficulty === "easy") {
-      out.push("- Use 1-step arithmetic only.");
-      out.push("- Keep add/sub operands mostly single-digit and avoid carry/borrow.");
-      out.push("- For multiplication, focus on 2-5 tables.");
-    } else if (input.difficulty === "hard") {
-      out.push("- Allow 2-step arithmetic such as a+b-c.");
-      out.push("- Increase numeric range within grade limits.");
-      if (!isG1) out.push("- Multiplication may include 6-9 tables.");
-    } else {
-      out.push("- Keep mostly 1-step arithmetic and allow a small amount of 2-step.");
-    }
+  if (input.difficulty === "easy") {
+    return [
+      "問題の意味や解き方は変えず、例題より少しやさしくしてください。",
+      "数字を小さくする、考える手順を減らす程度にしてください。"
+    ];
   }
-  if (input.sourceCategory === "reverse_blank") {
-    if (input.difficulty === "easy") out.push("- Blank should be the result side only (a+b=□).");
-    if (input.difficulty === "hard") out.push("- Allow reverse blanks on lhs (□+a=b, a×□=b).");
+  if (input.difficulty === "hard") {
+    return [
+      "問題の意味や解き方は変えず、例題より少しだけ難しくしてください。",
+      "考える手順を1つ増やす、数字を少し大きくする程度にしてください。"
+    ];
   }
-  if (input.sourceCategory === "unit_conversion") {
-    if (input.equationTrack === "unit_conversion_pure") {
-      if (input.difficulty === "easy") out.push("- Use pure unit conversion only, no arithmetic operators.");
-      if (input.difficulty === "hard") out.push("- Pure conversion may use larger values, but avoid 3-unit chains.");
-    }
-    if (input.equationTrack === "unit_conversion_calc") {
-      if (input.difficulty === "easy") out.push("- Use addition only for conversion+calculation.");
-      if (input.difficulty === "hard" && !isG1) out.push("- Conversion+calculation may include subtraction.");
-    }
-  }
-  if (input.sourceCategory === "split_equal") {
-    out.push("- Keep division exact (no remainder).");
-  }
-  if (input.sourceCategory === "repeat_multiply") {
-    if (input.difficulty === "easy") out.push("- Keep days/rates small and 1-step total questions.");
-    if (input.difficulty === "hard") out.push("- Use larger days/rates within grade limits.");
-  }
-  if (input.sourceCategory === "scale_times") {
-    if (input.difficulty === "easy") out.push("- Use multipliers 2 or 3 only.");
-    if (input.difficulty === "hard") out.push("- Multipliers may go up to 9.");
-  }
-  if (input.sourceCategory === "compare_diff") {
-    if (input.difficulty === "easy") out.push("- Prefer direct comparison without combining both sides.");
-    if (input.difficulty === "hard") out.push("- Prefer combine both sides then compare difference.");
-  }
-  return out;
-}
-
-function validateDifficultyPolicy(input: {
-  prompt: string;
-  sourceCategory: SolveCategory;
-  difficulty: DifficultyLevel;
-  inputMode: InputMode;
-  equationTrack: EquationTrack | null;
-  gradeBandApplied: GradeBandApplied;
-}): string | null {
-  const normalized = normalizeEquationPrompt(input.prompt);
-  const numbers = extractNumbersFromPrompt(normalized);
-  const opCount = countEquationOperators(normalized);
-  const blankPosition = detectBlankPosition(normalized);
-  const hasMul = /×/.test(normalized);
-  const hasDiv = /÷/.test(normalized);
-  const hasSub = /\-/.test(normalized);
-  const maxNumber = numbers.length > 0 ? Math.max(...numbers) : 0;
-
-  if (input.sourceCategory === "simple_calc") {
-    if (input.difficulty === "easy") {
-      if (opCount > 1) return "difficulty_policy_miss";
-      if (maxNumber > 20) return "difficulty_policy_miss";
-      if (hasMul) {
-        const nums = numbers.slice(0, 2);
-        if (nums.length >= 2) {
-          const [a, b] = nums;
-          if (a < 2 || b < 2 || a > 9 || b > 9 || (a > 5 && b > 5)) return "difficulty_policy_miss";
-        }
-      }
-      const nums = numbers.slice(0, 2);
-      if (nums.length >= 2 && !hasMul && !hasDiv) {
-        const [a, b] = nums;
-        if (a > 9 || b > 9) return "difficulty_policy_miss";
-        if (/\+/.test(normalized) && a % 10 + b % 10 >= 10) return "difficulty_policy_miss";
-        if (hasSub && a % 10 < b % 10) return "difficulty_policy_miss";
-      }
-      return null;
-    }
-    if (input.difficulty === "standard") {
-      if (opCount > 2) return "difficulty_policy_miss";
-      if (maxNumber > 99) return "difficulty_policy_miss";
-      return null;
-    }
-    if (opCount > 2) return "difficulty_policy_miss";
-    if (maxNumber > 120) return "difficulty_policy_miss";
-    return null;
-  }
-
-  if (input.sourceCategory === "reverse_blank") {
-    if (input.difficulty === "easy") {
-      if (opCount > 1 || blankPosition !== "rhs" || hasMul || hasDiv) return "difficulty_policy_miss";
-      if (maxNumber > 30) return "difficulty_policy_miss";
-      return null;
-    }
-    if (input.difficulty === "standard") {
-      if (opCount > 2 || hasMul || hasDiv) return "difficulty_policy_miss";
-      if (maxNumber > 99) return "difficulty_policy_miss";
-      return null;
-    }
-    if (opCount > 2) return "difficulty_policy_miss";
-    if (maxNumber > 120) return "difficulty_policy_miss";
-    return null;
-  }
-
-  if (input.sourceCategory === "unit_conversion") {
-    if (input.equationTrack === "unit_conversion_pure" || !/[+\-×÷]/.test(normalized)) {
-      if (input.difficulty === "easy" && /[+\-×÷]/.test(normalized)) return "difficulty_policy_miss";
-      if (input.difficulty === "easy" && parseCompositeUnitConversion(normalized) !== null) return "difficulty_policy_miss";
-      if (maxNumber > (input.difficulty === "hard" ? 999 : input.difficulty === "standard" ? 300 : 120)) return "difficulty_policy_miss";
-      return null;
-    }
-    if (input.equationTrack === "unit_conversion_calc" || /[+\-×÷]/.test(normalized)) {
-      if (input.difficulty === "easy" && (hasSub || hasMul || hasDiv)) return "difficulty_policy_miss";
-      if (input.difficulty !== "hard" && (hasMul || hasDiv)) return "difficulty_policy_miss";
-      if (input.difficulty === "hard" && input.gradeBandApplied === "g1" && hasSub) return "difficulty_policy_miss";
-      return null;
-    }
-  }
-
-  if (input.sourceCategory === "split_equal") {
-    if (input.difficulty === "easy" && maxNumber > 30) return "difficulty_policy_miss";
-    if (input.difficulty === "standard" && maxNumber > 70) return "difficulty_policy_miss";
-    if (input.difficulty === "hard" && maxNumber > 120) return "difficulty_policy_miss";
-    return null;
-  }
-
-  if (input.sourceCategory === "repeat_multiply" || input.sourceCategory === "scale_times" || input.sourceCategory === "compare_diff") {
-    if (numbers.length === 0) return null;
-    const maxAllowed = input.difficulty === "easy" ? 40 : input.difficulty === "standard" ? 80 : 140;
-    if (maxNumber > maxAllowed) return "difficulty_policy_miss";
-    if (input.sourceCategory === "scale_times") {
-      const multiplierMatches = [...normalized.matchAll(/(\d+)\s*(?:倍|ばい|×)/g)].map((m) => Number(m[1]));
-      if (multiplierMatches.length > 0) {
-        const kMax = Math.max(...multiplierMatches);
-        if (input.difficulty === "easy" && kMax > 3) return "difficulty_policy_miss";
-        if (input.difficulty === "standard" && kMax > 5) return "difficulty_policy_miss";
-        if (input.difficulty === "hard" && kMax > 9) return "difficulty_policy_miss";
-      }
-    }
-  }
-
-  return null;
+  return ["問題の意味や解き方を保ったまま、同じくらいの難しさで類題を作ってください。"];
 }
 
 function repairGenerationPrompt(language: string, raw: unknown): string {
@@ -937,12 +777,8 @@ function generationPrompt(input: {
     '{"problems":[{"prompt":"..."}]}',
     "Rules:",
     "- Keep difficulty around grade 1-3.",
-    ...buildDifficultyPolicyHints({
-      difficulty: input.difficulty,
-      sourceCategory: input.sourceCategory,
-      inputMode: input.inputMode,
-      equationTrack: input.equationTrack,
-      gradeBand: input.gradeBand
+    ...buildDifficultyHints({
+      difficulty: input.difficulty
     }),
     "- Do not generate answer choices.",
     "- Do not include option labels like ①②③.",
@@ -1635,20 +1471,6 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           continue;
         }
       }
-      const difficultyReason = validateDifficultyPolicy({
-        prompt: workingDraft.prompt,
-        sourceCategory,
-        difficulty: difficultyLevel,
-        inputMode,
-        equationTrack,
-        gradeBandApplied
-      });
-      if (difficultyReason) {
-        reasons[difficultyReason] = (reasons[difficultyReason] ?? 0) + 1;
-        batchRejectCounts[difficultyReason] = (batchRejectCounts[difficultyReason] ?? 0) + 1;
-        continue;
-      }
-
       if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
         reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
         batchRejectCounts.prompt_too_short = (batchRejectCounts.prompt_too_short ?? 0) + 1;
@@ -1800,20 +1622,6 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
             continue;
           }
         }
-        const difficultyReason = validateDifficultyPolicy({
-          prompt: workingDraft.prompt,
-          sourceCategory,
-          difficulty: difficultyLevel,
-          inputMode,
-          equationTrack,
-          gradeBandApplied
-        });
-        if (difficultyReason) {
-          reasons[difficultyReason] = (reasons[difficultyReason] ?? 0) + 1;
-          fillRejectCounts[difficultyReason] = (fillRejectCounts[difficultyReason] ?? 0) + 1;
-          continue;
-        }
-
         if (!workingDraft.prompt || normalizeSpaces(workingDraft.prompt).length < 3) {
           reasons.prompt_too_short = (reasons.prompt_too_short ?? 0) + 1;
           fillRejectCounts.prompt_too_short = (fillRejectCounts.prompt_too_short ?? 0) + 1;

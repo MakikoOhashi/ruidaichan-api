@@ -102,8 +102,9 @@ Response (shape):
 - `unit_conversion_calc`
 
 4. difficulty適用  
-- 共通 difficulty（`easy` / `same` / `hard`）を内部 policy に写像
+- 共通 difficulty（`easy` / `same` / `hard`）を内部に正規化
 - `same` は内部的に `standard` として扱う
+- 難易度は生成プロンプトの指示差分で調整（厳格な数値レバーは使わない）
 
 5. 生成（AI）  
 - promptのみ生成（選択肢なし）
@@ -113,7 +114,6 @@ Response (shape):
 - カテゴリ整合
 - 演算子ヒント整合（例: 掛け算入力は掛け算問題を優先）
 - 単位ドメイン整合（length / volume / weight）
-- 難易度policy整合（range / steps / blank位置 / unit変換段数）
 
 7. 返却  
 - 取り切れなければ `partial_success`
