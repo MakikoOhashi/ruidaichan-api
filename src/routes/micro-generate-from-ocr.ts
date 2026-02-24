@@ -32,6 +32,15 @@ type EquationTrackAnalysis = {
   ambiguous: boolean;
   reason: string | null;
 };
+type FailureCode =
+  | "none"
+  | "ocr_input_unreadable"
+  | "upstream_rate_limited"
+  | "upstream_timeout"
+  | "upstream_unavailable"
+  | "server_misconfigured"
+  | "generation_failed"
+  | "unknown";
 
 const requestSchema = z
   .object({
@@ -582,6 +591,23 @@ function salvageGenerationPayload(raw: unknown): GenerationDraft[] {
 
 function normalizeDifficultyLevel(input: DifficultyInput): DifficultyLevel {
   return input === "same" ? "standard" : input;
+}
+
+function classifyFailureCode(input: {
+  reasons: Record<string, number>;
+  ocrSource: "request_text" | "image_ocr" | "none";
+  aiOcrError: string | null;
+}): FailureCode {
+  const has = (k: string) => (input.reasons[k] ?? 0) > 0;
+  if (has("gemini_http_429")) return "upstream_rate_limited";
+  if (has("gemini_timeout")) return "upstream_timeout";
+  if (has("gemini_http_500") || has("gemini_http_503") || has("gemini_http_502")) return "upstream_unavailable";
+  if (has("gemini_api_key_missing")) return "server_misconfigured";
+  if (has("ocr_text_missing") || has("ai_ocr_failed") || has("ocr_empty_after_fallback") || input.ocrSource === "none" || input.aiOcrError) {
+    return "ocr_input_unreadable";
+  }
+  if (has("generation_failed") || has("generation_schema_invalid") || has("fill_retry_empty")) return "generation_failed";
+  return "unknown";
 }
 
 function buildDifficultyHints(input: {
@@ -1260,6 +1286,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: seedText,
         grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
         difficulty_applied: difficultyLevel,
+        failure_code: "ocr_input_unreadable" as const,
+        retryable: true,
         count_policy: "server_enforced",
         max_count: 10,
         target_count: Math.min(count, 10),
@@ -1722,6 +1750,15 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   }
 
   const appliedCount = accepted.length;
+  const failureCode: FailureCode =
+    appliedCount === 0
+      ? classifyFailureCode({
+          reasons,
+          ocrSource,
+          aiOcrError
+        })
+      : "none";
+  const retryable = failureCode === "upstream_rate_limited" || failureCode === "upstream_timeout" || failureCode === "upstream_unavailable";
   const topItems = accepted[0]?.items ?? [];
   const needConfirm = appliedCount === 0 || (equationTrackAnalysis?.ambiguous ?? false);
   const note =
@@ -1756,6 +1793,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       seed: seedText,
       grade_band_applied: gradeBandApplied,
       difficulty_applied: difficultyLevel,
+      failure_code: failureCode,
+      retryable,
       count_policy: "server_enforced",
       max_count: maxCount,
       target_count: targetCount,

@@ -1106,6 +1106,51 @@ test("/micro/generate_from_ocr keeps sentence OCR with trailing underscore as wo
   });
 });
 
+test("/micro/generate_from_ocr sets failure_code for upstream 429", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+    if (prompt.includes("ROLE: generator_v1")) {
+      return new Response(JSON.stringify({ error: { code: 429, message: "rate limit" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return geminiResponse({ answer_value: 0, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "8+5-3=□",
+          count: 4,
+          difficulty: "same",
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "429-failure-code"
+        })
+      });
+      const body = (await res.json()) as {
+        applied_count: number;
+        meta: { failure_code: string; retryable: boolean };
+        reasons: Record<string, number>;
+      };
+      assert.equal(res.status, 200);
+      assert.equal(body.applied_count, 0);
+      assert.equal((body.reasons.gemini_http_429 ?? 0) > 0, true);
+      assert.equal(body.meta.failure_code, "upstream_rate_limited");
+      assert.equal(body.meta.retryable, true);
+    });
+  });
+});
+
 test("/micro/generate_from_ocr narrative unit sentence with stray '=' avoids unit_conversion_pure track", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 

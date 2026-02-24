@@ -72,6 +72,8 @@ Response (shape):
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
     "difficulty_applied": "easy|standard|hard",
+    "failure_code": "none|ocr_input_unreadable|upstream_rate_limited|upstream_timeout|upstream_unavailable|server_misconfigured|generation_failed|unknown",
+    "retryable": true,
     "count_policy": "server_enforced",
     "max_count": 5,
     "target_count": 5
@@ -118,6 +120,7 @@ Response (shape):
 7. 返却  
 - 取り切れなければ `partial_success`
 - 候補ゼロなら `unknown` + `need_confirm=true`
+- 失敗時は `meta.failure_code` で原因分類（OCR失敗 / upstream 429 など）
 
 ## Count Policy
 
