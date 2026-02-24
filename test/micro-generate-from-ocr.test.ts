@@ -1055,6 +1055,51 @@ test("/micro/generate_from_ocr keeps difficulty fields and does not force strict
       assert.equal(body.debug.difficulty_applied, "easy");
       assert.equal((body.reasons.difficulty_policy_miss ?? 0) === 0, true);
       assert.equal(body.problems.length > 0, true);
+      assert.equal(
+        body.problems.every((p) => !/\s=\s(?:□|口|ロ|_|\[\])\s*$/.test(p.prompt.normalize("NFKC"))),
+        true
+      );
+    });
+  });
+});
+
+test("/micro/generate_from_ocr keeps middle blank symbol for reverse_blank equations", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      return geminiResponse({
+        problems: [{ prompt: "3 + □ = 5" }, { prompt: "7 + □ = 9" }, { prompt: "□ + 4 = 8" }, { prompt: "8 - □ = 3" }]
+      });
+    }
+    return geminiResponse({ answer_value: 2, correct_index: 0 });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        body: JSON.stringify({
+          ocr_text: "3+□=5",
+          count: 4,
+          difficulty: "same",
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: "keep-middle-blank"
+        })
+      });
+      const body = (await res.json()) as { problems: Array<{ prompt: string }>; detected_mode: string };
+      assert.equal(res.status, 200);
+      assert.equal(body.detected_mode, "equation");
+      assert.equal(body.problems.length > 0, true);
+      assert.equal(body.problems.some((p) => /□/.test(p.prompt)), true);
+      assert.equal(body.problems.some((p) => /\s=\s(?:□|口|ロ|_|\[\])\s*$/.test(p.prompt.normalize("NFKC"))), false);
     });
   });
 });

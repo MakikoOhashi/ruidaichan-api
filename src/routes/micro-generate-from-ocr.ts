@@ -346,6 +346,12 @@ function normalizeEquationPrompt(prompt: string): string {
   );
 }
 
+function normalizeArithmeticAnswerStyle(prompt: string): string {
+  const normalized = normalizeEquationPrompt(prompt);
+  if (hasUnitToken(normalized)) return normalized;
+  return normalizeSpaces(normalized.replace(/\s*=\s*(?:□|口|ロ|_|\[\])\s*$/u, " ="));
+}
+
 function hasUnitToken(text: string): boolean {
   const normalized = text.normalize("NFKC");
   return new RegExp(`${UNIT_TOKEN_PATTERN}|円`, "i").test(normalized);
@@ -823,9 +829,11 @@ function generationPrompt(input: {
                   "- Do NOT convert into story/word problems."
                 ]
               : [
-                  "- Return equation-style problems (e.g. 7 + 9 - 6 = □).",
+                  "- Return equation-style problems (e.g. 7 + 9 - 6 =).",
                   "- Do NOT convert equations into story/word problems.",
-                  "- Do NOT include unit-conversion constraints unless source clearly uses units."
+                  "- Do NOT include unit-conversion constraints unless source clearly uses units.",
+                  "- If the answer is on the right side, end with '=' (no blank symbol).",
+                  "- Use □ only when the blank is inside the equation (e.g. 3 + □ = 5)."
                 ]),
           ...(input.equationTrack === "arithmetic" && input.arithmeticHint === "multiply"
             ? ["- Use multiplication equations only (×). Do NOT use + or - or ÷."]
@@ -1442,6 +1450,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       let workingDraft = normalized.draft;
       if (inputMode === "equation") {
         workingDraft = { ...workingDraft, prompt: normalizeEquationPrompt(workingDraft.prompt) };
+        if (equationTrack === "arithmetic") {
+          workingDraft = { ...workingDraft, prompt: normalizeArithmeticAnswerStyle(workingDraft.prompt) };
+        }
       }
       const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
       violationsCount += guard.violations_count;
@@ -1593,6 +1604,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         let workingDraft = normalized.draft;
         if (inputMode === "equation") {
           workingDraft = { ...workingDraft, prompt: normalizeEquationPrompt(workingDraft.prompt) };
+          if (equationTrack === "arithmetic") {
+            workingDraft = { ...workingDraft, prompt: normalizeArithmeticAnswerStyle(workingDraft.prompt) };
+          }
         }
         const guard = checkKanjiGuard({ prompt: workingDraft.prompt, choices: [] }, gradeBandApplied);
         violationsCount += guard.violations_count;
