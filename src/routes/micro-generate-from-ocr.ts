@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { checkKanjiGuard, estimateGradeBand, normalizeRequestedGradeBand, type GradeBandApplied } from "../guards/kanji-guard.js";
+import { consumeMonthlyFreeQuota, validateInstallId } from "../lib/free-quota.js";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = 15000;
@@ -86,8 +87,16 @@ function sha(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
+function hashInstallId(installId: string): string {
+  return sha(installId).slice(0, 16);
+}
+
 function normalizeSpaces(s: string): string {
   return s.replace(/\s+/g, " ").trim();
+}
+
+function normalizeInstallId(s: string): string {
+  return s.trim();
 }
 
 function truncateForLog(s: string, max = 120): string {
@@ -1244,9 +1253,54 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   }
 
   const { ocr_text: request_ocr_text, image_base64, image_mime_type, count, difficulty, grade_band, language, seed } = parsed.data;
+  const installIdRaw = normalizeInstallId(req.header("x-install-id") ?? "");
+  if (!installIdRaw || !validateInstallId(installIdRaw)) {
+    return res.status(400).json({
+      error: "invalid_install_id",
+      request_id: requestId,
+      message: "x-install-id header is required"
+    });
+  }
+
+  const quotaDecision = await consumeMonthlyFreeQuota({ installId: installIdRaw });
+  if (!quotaDecision.allowed) {
+    console.warn(
+      JSON.stringify({
+        event: "quota_exceeded",
+        request_id: requestId,
+        install_id_hash: hashInstallId(installIdRaw),
+        limit: quotaDecision.limit,
+        used: quotaDecision.used,
+        reset_at: quotaDecision.reset_at
+      })
+    );
+    return res.status(429).json({
+      error: "free_quota_exceeded",
+      request_id: requestId,
+      limit: quotaDecision.limit,
+      used: quotaDecision.used,
+      reset_at: quotaDecision.reset_at
+    });
+  }
+
   const seedText = String(seed);
   const difficultyLevel = normalizeDifficultyLevel(difficulty);
   const start = Date.now();
+  const quotaCheckFailed = quotaDecision.check_failed;
+  const quotaLimit = quotaDecision.limit;
+  const quotaUsedAfter = quotaDecision.used_after;
+  const quotaResetAt = quotaDecision.reset_at;
+  if (quotaCheckFailed) {
+    console.warn(
+      JSON.stringify({
+        event: "quota_check_failed",
+        request_id: requestId,
+        install_id_hash: hashInstallId(installIdRaw),
+        error: quotaDecision.error ?? "unknown",
+        fail_open: true
+      })
+    );
+  }
   let ocrText = normalizeSpaces(request_ocr_text ?? "");
   let ocrSource: "request_text" | "image_ocr" | "none" = ocrText ? "request_text" : "none";
   let aiOcrFallbackUsed = false;
@@ -1290,12 +1344,15 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         ...(ocrSource === "none" ? { ocr_text_missing: 1 } : {})
       },
       meta: {
-        note: "unknown_no_viable_candidate",
+        note: quotaCheckFailed ? "quota_check_failed" : "unknown_no_viable_candidate",
         seed: seedText,
         grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
         difficulty_applied: difficultyLevel,
         failure_code: "ocr_input_unreadable" as const,
         retryable: true,
+        quota_limit: quotaLimit,
+        quota_used_after: quotaUsedAfter,
+        quota_reset_at: quotaResetAt,
         count_policy: "server_enforced",
         max_count: 10,
         target_count: Math.min(count, 10),
@@ -1330,6 +1387,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         ai_ocr_status: aiOcrStatus,
         ai_ocr_error: aiOcrError,
         ai_ocr_text_length: 0,
+        quota_check_failed: quotaCheckFailed,
+        quota_error: quotaDecision.error ?? null,
         choices_disabled: true,
         choice_generation_via_ai: false,
         kanji_guard: {
@@ -1367,6 +1426,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
 
   const accepted: GeneratedProblem[] = [];
   const reasons: Record<string, number> = {};
+  if (quotaCheckFailed) {
+    reasons.quota_check_failed = 1;
+  }
   if (sourceBlankConfusionApplied) {
     reasons.source_blank_confusion_rewritten = 1;
   }
@@ -1775,8 +1837,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const retryable = failureCode === "upstream_rate_limited" || failureCode === "upstream_timeout" || failureCode === "upstream_unavailable";
   const topItems = accepted[0]?.items ?? [];
   const needConfirm = appliedCount === 0 || (equationTrackAnalysis?.ambiguous ?? false);
-  const note =
-    appliedCount === 0
+  const note = quotaCheckFailed
+    ? "quota_check_failed"
+    : appliedCount === 0
       ? "unknown_no_viable_candidate"
       : hitTimeBudget
         ? "partial_success_timeout"
@@ -1809,6 +1872,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       difficulty_applied: difficultyLevel,
       failure_code: failureCode,
       retryable,
+      quota_limit: quotaLimit,
+      quota_used_after: quotaUsedAfter,
+      quota_reset_at: quotaResetAt,
       count_policy: "server_enforced",
       max_count: maxCount,
       target_count: targetCount,
@@ -1842,6 +1908,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
       source_blank_confusion_applied: sourceBlankConfusionApplied,
       source_blank_confusion_reason: sourceBlankConfusionReason,
+      quota_check_failed: quotaCheckFailed,
+      quota_error: quotaDecision.error ?? null,
       generation_timeline: generationTimeline,
       equation_style_miss_samples: equationStyleMissSamples,
       unit_domain_lock: unitDomainLock,
@@ -1875,6 +1943,11 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       source_blank_confusion_reason: sourceBlankConfusionReason,
       source_word_intent: sourceWordIntent,
       difficulty: difficultyLevel,
+      quota_limit: quotaLimit,
+      quota_used_after: quotaUsedAfter,
+      quota_reset_at: quotaResetAt,
+      quota_check_failed: quotaCheckFailed,
+      quota_error: quotaDecision.error ?? null,
       requested_count: count,
       target_count: targetCount,
       applied_count: appliedCount,

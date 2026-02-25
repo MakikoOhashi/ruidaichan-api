@@ -28,6 +28,7 @@
 Header:
 
 - `x-api-key: <API_KEY>`
+- `x-install-id: <install_id>`（iOS Keychain 永続ID）
 
 Request:
 
@@ -68,17 +69,32 @@ Response (shape):
   "need_confirm": false,
   "reasons": {},
   "meta": {
-    "note": "ok|partial_success|partial_success_timeout|unknown_no_viable_candidate|ok_ambiguous_unit_conversion|ok_count_capped_by_policy",
+    "note": "ok|partial_success|partial_success_timeout|unknown_no_viable_candidate|ok_ambiguous_unit_conversion|ok_count_capped_by_policy|quota_check_failed",
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
     "difficulty_applied": "easy|standard|hard",
     "failure_code": "none|ocr_input_unreadable|upstream_rate_limited|upstream_timeout|upstream_unavailable|server_misconfigured|generation_failed|unknown",
     "retryable": true,
+    "quota_limit": 10,
+    "quota_used_after": 3,
+    "quota_reset_at": "2026-03-01T00:00:00.000Z",
     "count_policy": "server_enforced",
     "max_count": 5,
     "target_count": 5
   },
   "debug": {}
+}
+```
+
+Quota exceeded response:
+
+```json
+{
+  "error": "free_quota_exceeded",
+  "request_id": "...",
+  "limit": 5,
+  "used": 5,
+  "reset_at": "2026-03-01T00:00:00.000Z"
 }
 ```
 
@@ -92,6 +108,9 @@ Response (shape):
 ## Decision Flow (`/micro/generate_from_ocr`)
 
 1. 入力受付  
+- `x-install-id` を検証（不正/欠落は 400）
+- Redis 月次無料枠を先に消費（初月10 / 以降5）
+- 上限超過は 429 `free_quota_exceeded`
 - `ocr_text` があれば先に使用
 - `ocr_text` が空/ノイジーで `image_base64` があれば AI OCR フォールバック
 
@@ -122,6 +141,17 @@ Response (shape):
 - 取り切れなければ `partial_success`
 - 候補ゼロなら `unknown` + `need_confirm=true`
 - 失敗時は `meta.failure_code` で原因分類（OCR失敗 / upstream 429 など）
+
+## Redis Key Policy (Upstash)
+
+- `ruidaichan:free:count:{install_id}:{yyyyMM}`
+  - 値: integer（月内消費数）
+  - TTL: 次月UTC 00:00:00 まで
+- `ruidaichan:first_month:{install_id}`
+  - 値: string `yyyyMM`
+  - TTL: なし（初回利用月の固定）
+- `ruidaichan:rate:short:{install_id}`
+  - 将来用 prefix 予約（未実装）
 
 ## Count Policy
 
@@ -207,6 +237,7 @@ Required env vars:
 Optional env vars:
 
 - `GEMINI_MODEL` (default: `gemini-2.0-flash`)
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`（設定時に月次無料枠チェックを有効化）
 
 3. Run
 

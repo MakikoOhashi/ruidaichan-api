@@ -88,7 +88,7 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "けいさんのれんしゅうです。つぎから1つえらびなさい。どうなりますか。",
           count: 4,
@@ -160,7 +160,7 @@ test("/micro/generate_from_ocr returns partial_success when light checks reject 
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "毎日9こ。3日。",
           count: 4,
@@ -243,7 +243,7 @@ test("/micro/generate_from_ocr uses fill retry to avoid very low applied_count",
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "8 + 5 - 3 = □",
           count: 5,
@@ -294,7 +294,7 @@ test("/micro/generate_from_ocr caps word_problem count=10 to max 5", async () =>
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "けいさんのもんだいです。つぎから1つえらびなさい。どうなりますか。",
           count: 10,
@@ -348,7 +348,7 @@ test("/micro/generate_from_ocr keeps equation count=10", async () => {
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "7 + 9 - 6 = □",
           count: 10,
@@ -399,7 +399,7 @@ test("/micro/generate_from_ocr respects multiplication hint from noisy OCR", asy
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "== x (9)。",
           count: 4,
@@ -457,7 +457,7 @@ test("/micro/generate_from_ocr can fallback to image OCR when text OCR is noisy"
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "== x (9)。",
           image_base64: "ZmFrZS1pbWFnZS1ieXRlcw==",
@@ -511,7 +511,7 @@ test("/micro/generate_from_ocr rewrites impossible -0 equation to blank", async 
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "(10) 98-0=39。",
           count: 4,
@@ -567,7 +567,7 @@ test("/micro/generate_from_ocr supports unit conversion mm->cm in equation mode"
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "4 mm = □ cm",
           count: 4,
@@ -614,7 +614,7 @@ test("/micro/generate_from_ocr supports noisy OCR unit conversion text", async (
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "③ 4 mm =。cm。",
           count: 4,
@@ -662,7 +662,7 @@ test("/micro/generate_from_ocr recovers loose unit-conversion prose into equatio
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "4 mm = □ cm",
           count: 4,
@@ -717,7 +717,7 @@ test("/micro/generate_from_ocr rejects category mismatch after free generation",
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "4 mm = □ cm",
           count: 4,
@@ -765,7 +765,7 @@ test("/micro/generate_from_ocr supports unit conversion L->dL in equation mode",
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "3L=□dL",
           count: 4,
@@ -816,7 +816,7 @@ test("/micro/generate_from_ocr keeps unit-conversion domain locked by source exa
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "4 mm = □ cm",
           count: 4,
@@ -883,7 +883,7 @@ test("/micro/generate_from_ocr length conversion includes meter in mixed set for
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "4 mm = □ cm",
           count: 10,
@@ -939,7 +939,7 @@ test("/micro/generate_from_ocr defaults ambiguous short text to equation mode", 
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "8+5-3",
           count: 4,
@@ -985,7 +985,7 @@ test("/micro/generate_from_ocr keeps clear sentence as word_problem mode", async
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "えんぴつが7本あります。友だちに3本あげました。のこりは何本ですか。つぎから1つえらびなさい。",
           count: 4,
@@ -1033,7 +1033,7 @@ test("/micro/generate_from_ocr keeps difficulty fields and does not force strict
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "7+2=□",
           count: 4,
@@ -1084,7 +1084,7 @@ test("/micro/generate_from_ocr keeps middle blank symbol for reverse_blank equat
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "3+□=5",
           count: 4,
@@ -1133,7 +1133,7 @@ test("/micro/generate_from_ocr keeps sentence OCR with trailing underscore as wo
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "大きいバケツには3.45L。小さいバケツには2.13_。の水が入っています。水はあわせて何Lですか。式。答え。",
           count: 4,
@@ -1172,7 +1172,7 @@ test("/micro/generate_from_ocr sets failure_code for upstream 429", async () => 
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "8+5-3=□",
           count: 4,
@@ -1225,7 +1225,7 @@ test("/micro/generate_from_ocr narrative unit sentence with stray '=' avoids uni
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "大きいバケツには3.45L、小さいバケツには2.13Lの水が入っています。水はあわせて何Lですか。式 = 。答え。",
           count: 4,
@@ -1277,7 +1277,7 @@ test("/micro/generate_from_ocr rejects word-problemized output for equation inpu
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "8+5-3=□",
           count: 4,
@@ -1328,7 +1328,7 @@ test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () 
     await withServer(async (baseUrl) => {
       const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
         body: JSON.stringify({
           ocr_text: "れんしゅうもんだいです。つぎから1つえらびなさい。どうなりますか。",
           count: 4,
@@ -1352,4 +1352,67 @@ test("/micro/generate_from_ocr applies local kanji dictionary for g1", async () 
       assert.equal(body.problems[0].prompt.includes("練"), false);
     });
   });
+});
+
+test("/micro/generate_from_ocr requires x-install-id header", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withServer(async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": "test-key" },
+      body: JSON.stringify({
+        ocr_text: "7+2=□",
+        count: 4,
+        grade_band: "g1_g3",
+        language: "ja",
+        seed: 11
+      })
+    });
+
+    const body = (await res.json()) as { error: string };
+    assert.equal(res.status, 400);
+    assert.equal(body.error, "invalid_install_id");
+  });
+});
+
+test("/micro/generate_from_ocr returns 429 when free quota exceeded", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (url.includes("example.upstash.io")) {
+      return new Response(JSON.stringify({ result: [0, 5, 5, "202601", 3600] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    return geminiResponse({ problems: [{ prompt: "7 + 2 =" }] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "install-0001" },
+        body: JSON.stringify({
+          ocr_text: "7+2=□",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: 11
+        })
+      });
+
+      const body = (await res.json()) as { error: string; limit: number; used: number };
+      assert.equal(res.status, 429);
+      assert.equal(body.error, "free_quota_exceeded");
+      assert.equal(body.limit, 5);
+      assert.equal(body.used, 5);
+    });
+  });
+
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
 });
