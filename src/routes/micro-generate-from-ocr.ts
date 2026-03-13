@@ -27,6 +27,14 @@ type ArithmeticOperatorHint = "multiply" | "divide" | "add_sub" | "mixed" | "unk
 type EquationTrackDecision = "explicit_pure" | "explicit_calc" | "heuristic_pure" | "default_arithmetic" | "narrative_guard";
 type DifficultyInput = "easy" | "same" | "hard";
 type DifficultyLevel = "easy" | "standard" | "hard";
+type ProblemLanguage = "ja" | "en";
+type ProblemLanguageSource = "ocr" | "image" | "heuristic" | "fallback";
+type ProblemLanguageDetection = {
+  language: ProblemLanguage;
+  source: ProblemLanguageSource;
+  confidence: number;
+  usedFallback: boolean;
+};
 type EquationTrackAnalysis = {
   track: EquationTrack;
   decision: EquationTrackDecision;
@@ -97,6 +105,75 @@ function normalizeSpaces(s: string): string {
 
 function normalizeInstallId(s: string): string {
   return s.trim();
+}
+
+function countMatches(text: string, re: RegExp): number {
+  return text.match(re)?.length ?? 0;
+}
+
+function detectProblemLanguageFromText(text: string): ProblemLanguageDetection {
+  const normalized = text.normalize("NFKC");
+  const japaneseChars = countMatches(normalized, /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu);
+  const englishLetters = countMatches(normalized, /[A-Za-z]/g);
+  const englishWords = countMatches(
+    normalized,
+    /\b(what|how|many|add|sum|more|less|than|total|equals|solve|write|answer|cm|mm|m|km|ml|dl|l|kg|g|inch|meter|liters?)\b/gi
+  );
+  const asciiWords = countMatches(normalized, /\b[A-Za-z]{2,}\b/g);
+  const digitCount = countMatches(normalized, /\d/g);
+
+  if (japaneseChars >= 3 && japaneseChars >= englishLetters) {
+    return {
+      language: "ja",
+      source: "ocr",
+      confidence: Math.min(0.99, 0.7 + japaneseChars / Math.max(normalized.length, 12)),
+      usedFallback: false
+    };
+  }
+
+  if (englishLetters >= 6 && asciiWords >= 2 && japaneseChars === 0) {
+    const signal = englishLetters + englishWords * 3;
+    return {
+      language: "en",
+      source: "ocr",
+      confidence: Math.min(0.98, 0.68 + signal / Math.max(normalized.length, 20)),
+      usedFallback: false
+    };
+  }
+
+  if (englishWords >= 2 && englishLetters > japaneseChars) {
+    return {
+      language: "en",
+      source: "heuristic",
+      confidence: 0.66,
+      usedFallback: false
+    };
+  }
+
+  if (japaneseChars >= 1 && japaneseChars >= englishWords) {
+    return {
+      language: "ja",
+      source: "heuristic",
+      confidence: 0.64,
+      usedFallback: false
+    };
+  }
+
+  if (digitCount > 0 && englishLetters > 0 && japaneseChars === 0) {
+    return {
+      language: "en",
+      source: "heuristic",
+      confidence: 0.56,
+      usedFallback: false
+    };
+  }
+
+  return {
+    language: "ja",
+    source: "fallback",
+    confidence: 0.35,
+    usedFallback: true
+  };
 }
 
 function truncateForLog(s: string, max = 120): string {
@@ -707,7 +784,6 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
 async function callGeminiImageOcr(input: {
   imageBase64: string;
   imageMimeType: string;
-  language: string;
 }): Promise<{ ok: boolean; status: number | null; text?: string; error?: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -730,8 +806,8 @@ async function callGeminiImageOcr(input: {
                 {
                   text: [
                     "ROLE: image_ocr_v1",
-                    `Language: ${input.language}`,
-                    "Extract OCR text for a Japanese elementary math worksheet image.",
+                    "Extract OCR text from the worksheet image.",
+                    "Preserve the original worksheet language exactly as seen in the image.",
                     "Return ONLY plain text, no JSON, no markdown.",
                     "Preserve math symbols when possible: + - × ÷ = □ and units."
                   ].join("\n")
@@ -773,12 +849,85 @@ async function callGeminiImageOcr(input: {
   }
 }
 
+async function callGeminiImageLanguage(input: {
+  imageBase64: string;
+  imageMimeType: string;
+}): Promise<{ ok: boolean; status: number | null; language?: ProblemLanguage; confidence?: number; error?: string }> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, status: null, error: "gemini_api_key_missing" };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: [
+                    "ROLE: image_language_detector_v1",
+                    'Return STRICT JSON only: {"language":"ja|en|unknown","confidence":0.0}',
+                    "Decide the worksheet problem language from the image.",
+                    "Supported languages: ja or en only."
+                  ].join("\n")
+                },
+                {
+                  inline_data: {
+                    mime_type: input.imageMimeType,
+                    data: input.imageBase64
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: { temperature: 0.0, responseMimeType: "application/json" }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    if (!response.ok) {
+      return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
+    }
+
+    const json = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) {
+      return { ok: false, status: response.status, error: "gemini_empty_text" };
+    }
+    const parsed = parseJsonLoose(text) as { language?: string; confidence?: number } | null;
+    const language = parsed?.language === "ja" || parsed?.language === "en" ? parsed.language : undefined;
+    const confidence = typeof parsed?.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : undefined;
+    if (!language) {
+      return { ok: false, status: response.status, error: "gemini_language_invalid" };
+    }
+    return { ok: true, status: response.status, language, confidence };
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { ok: false, status: null, error: "gemini_timeout" };
+    }
+    return { ok: false, status: null, error: "gemini_transport_error" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function generationPrompt(input: {
   ocrText: string;
   count: number;
   gradeBand: string;
   difficulty: DifficultyLevel;
-  language: string;
+  problemLanguage: ProblemLanguage;
   seed: string;
   inputMode: InputMode;
   sourceCategory: SolveCategory;
@@ -789,7 +938,18 @@ function generationPrompt(input: {
   unitDomainLock: UnitDomainLock | null;
 }): string {
   const gradeInstructions =
-    input.gradeBand === "g1"
+    input.problemLanguage === "en"
+      ? input.gradeBand === "g1"
+        ? [
+            "Target grade: elementary grade 1.",
+            "Use short, simple English suitable for young children.",
+            "Keep reading load low."
+          ]
+        : [
+            "Target grade: elementary grades 2 to 3.",
+            "Use plain English suitable for children."
+          ]
+      : input.gradeBand === "g1"
       ? [
           "小学1年生向けです。",
           "漢字はできるだけ使わず、数字以外はひらがなを基本にしてください。",
@@ -802,7 +962,7 @@ function generationPrompt(input: {
 
   return [
     "ROLE: generator_v1",
-    `Language: ${input.language}`,
+    `Language: ${input.problemLanguage}`,
     `Grade band: ${input.gradeBand}`,
     `Difficulty: ${input.difficulty}`,
     `Input mode: ${input.inputMode}`,
@@ -810,14 +970,27 @@ function generationPrompt(input: {
     ...(input.inputMode === "equation" && input.equationTrack !== null ? [`Equation track: ${input.equationTrack}`] : []),
     `Requested count: ${input.count}`,
     `Seed: ${input.seed}`,
-    "Target learners: Japanese elementary school students (grades 1 to 3).",
-    "Subject scope: Japanese elementary mathematics only (up to grade 3 curriculum).",
-    "Use natural Japanese suitable for Japanese children and parents.",
-    "Task: Read the source problem and generate similar elementary math problems.",
-    "Output STRICT JSON only:",
-    '{"problems":[{"prompt":"..."}]}',
-    "Rules:",
-    "- Keep difficulty around grade 1-3.",
+    ...(input.problemLanguage === "en"
+      ? [
+          "Target learners: elementary school students (grades 1 to 3).",
+          "Subject scope: elementary mathematics only (up to grade 3 curriculum).",
+          "Use natural English suitable for children and parents.",
+          "Task: Read the source problem and generate similar elementary math problems.",
+          "Output STRICT JSON only:",
+          '{"problems":[{"prompt":"..."}]}',
+          "Rules:",
+          "- Keep difficulty around grade 1-3."
+        ]
+      : [
+          "Target learners: Japanese elementary school students (grades 1 to 3).",
+          "Subject scope: Japanese elementary mathematics only (up to grade 3 curriculum).",
+          "Use natural Japanese suitable for Japanese children and parents.",
+          "Task: Read the source problem and generate similar elementary math problems.",
+          "Output STRICT JSON only:",
+          '{"problems":[{"prompt":"..."}]}',
+          "Rules:",
+          "- Keep difficulty around grade 1-3."
+        ]),
     ...buildDifficultyHints({
       difficulty: input.difficulty
     }),
@@ -1045,7 +1218,7 @@ async function fetchGenerationDrafts(input: {
   count: number;
   gradeBand: string;
   difficulty: DifficultyLevel;
-  language: string;
+  problemLanguage: ProblemLanguage;
   seed: string;
   inputMode: InputMode;
   sourceCategory: SolveCategory;
@@ -1068,7 +1241,7 @@ async function fetchGenerationDrafts(input: {
         count: input.count,
         gradeBand: input.gradeBand,
         difficulty: input.difficulty,
-        language: input.language,
+        problemLanguage: input.problemLanguage,
         seed: `${input.seed}:a${attempt}`,
         inputMode: input.inputMode,
         sourceCategory: input.sourceCategory,
@@ -1094,7 +1267,7 @@ async function fetchGenerationDrafts(input: {
     } else {
       drafts = salvageGenerationPayload(genResp.data);
       if (drafts.length === 0) {
-        const repaired = await callGeminiJson(repairGenerationPrompt(input.language, genResp.data));
+        const repaired = await callGeminiJson(repairGenerationPrompt(input.problemLanguage, genResp.data));
         if (repaired.ok && repaired.data) {
           const repairedStrict = llmGenSchema.safeParse(repaired.data);
           if (repairedStrict.success) {
@@ -1306,14 +1479,15 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   let aiOcrFallbackUsed = false;
   let aiOcrStatus: number | null = null;
   let aiOcrError: string | null = null;
+  let imageLanguageStatus: number | null = null;
+  let imageLanguageError: string | null = null;
   let sourceBlankConfusionApplied = false;
   let sourceBlankConfusionReason: string | null = null;
 
   if (image_base64 && (ocrText.length === 0 || shouldPreferImageOcrFallback(ocrText))) {
     const aiOcr = await callGeminiImageOcr({
       imageBase64: image_base64,
-      imageMimeType: image_mime_type,
-      language
+      imageMimeType: image_mime_type
     });
     aiOcrStatus = aiOcr.status;
     if (aiOcr.ok && aiOcr.text) {
@@ -1326,6 +1500,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   }
 
   if (!ocrText) {
+    const fallbackLanguage = "ja" as const;
     return res.status(200).json({
       spec_version: "micro_problem_render_v1",
       request_id: requestId,
@@ -1348,6 +1523,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: seedText,
         grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
         difficulty_applied: difficultyLevel,
+        problem_language: fallbackLanguage,
+        problem_language_source: "fallback" as const,
+        problem_language_confidence: 0.35,
         failure_code: "ocr_input_unreadable" as const,
         retryable: true,
         quota_limit: quotaLimit,
@@ -1386,6 +1564,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         ai_ocr_fallback_used: aiOcrFallbackUsed,
         ai_ocr_status: aiOcrStatus,
         ai_ocr_error: aiOcrError,
+        image_language_status: imageLanguageStatus,
+        image_language_error: imageLanguageError,
         ai_ocr_text_length: 0,
         quota_check_failed: quotaCheckFailed,
         quota_error: quotaDecision.error ?? null,
@@ -1405,6 +1585,28 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     ocrText = sourceCorrection.text;
     sourceBlankConfusionApplied = true;
     sourceBlankConfusionReason = sourceCorrection.reason;
+  }
+  let problemLanguageDetection = detectProblemLanguageFromText(ocrText);
+  if (
+    image_base64 &&
+    (problemLanguageDetection.source === "fallback" ||
+      (problemLanguageDetection.source === "heuristic" && problemLanguageDetection.confidence < 0.65))
+  ) {
+    const imageLanguage = await callGeminiImageLanguage({
+      imageBase64: image_base64,
+      imageMimeType: image_mime_type
+    });
+    imageLanguageStatus = imageLanguage.status;
+    if (imageLanguage.ok && imageLanguage.language) {
+      problemLanguageDetection = {
+        language: imageLanguage.language,
+        source: "image",
+        confidence: imageLanguage.confidence ?? 0.72,
+        usedFallback: false
+      };
+    } else {
+      imageLanguageError = imageLanguage.error ?? "image_language_failed";
+    }
   }
   const requestedGradeBand = normalizeRequestedGradeBand(grade_band);
   const inputMode = detectInputMode(ocrText);
@@ -1469,7 +1671,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       count: draftTarget,
       gradeBand: grade_band ?? "g1_g3",
       difficulty: difficultyLevel,
-      language,
+      problemLanguage: problemLanguageDetection.language,
       seed: `${seedText}:b${batchIndex}`,
       inputMode,
       sourceCategory,
@@ -1637,7 +1839,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         count: fillTarget,
         gradeBand: grade_band ?? "g1_g3",
         difficulty: difficultyLevel,
-        language,
+        problemLanguage: problemLanguageDetection.language,
         seed: `${seedText}:fill:${fillTry}`,
         inputMode,
         sourceCategory,
@@ -1839,6 +2041,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   const needConfirm = appliedCount === 0 || (equationTrackAnalysis?.ambiguous ?? false);
   const note = quotaCheckFailed
     ? "quota_check_failed"
+    : problemLanguageDetection.usedFallback
+      ? "problem_language_fallback"
     : appliedCount === 0
       ? "unknown_no_viable_candidate"
       : hitTimeBudget
@@ -1870,6 +2074,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       seed: seedText,
       grade_band_applied: gradeBandApplied,
       difficulty_applied: difficultyLevel,
+      problem_language: problemLanguageDetection.language,
+      problem_language_source: problemLanguageDetection.source,
+      problem_language_confidence: problemLanguageDetection.confidence,
       failure_code: failureCode,
       retryable,
       quota_limit: quotaLimit,
@@ -1889,6 +2096,9 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       generation_status: generationStatus,
       solver_status: solverStatus,
       language,
+      problem_language: problemLanguageDetection.language,
+      problem_language_source: problemLanguageDetection.source,
+      problem_language_confidence: problemLanguageDetection.confidence,
       grade_band,
       difficulty,
       difficulty_applied: difficultyLevel,
@@ -1905,6 +2115,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ai_ocr_fallback_used: aiOcrFallbackUsed,
       ai_ocr_status: aiOcrStatus,
       ai_ocr_error: aiOcrError,
+      image_language_status: imageLanguageStatus,
+      image_language_error: imageLanguageError,
       ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
       source_blank_confusion_applied: sourceBlankConfusionApplied,
       source_blank_confusion_reason: sourceBlankConfusionReason,
@@ -1938,7 +2150,12 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       ai_ocr_fallback_used: aiOcrFallbackUsed,
       ai_ocr_status: aiOcrStatus,
       ai_ocr_error: aiOcrError,
+      image_language_status: imageLanguageStatus,
+      image_language_error: imageLanguageError,
       ai_ocr_text_length: ocrSource === "image_ocr" ? ocrText.length : 0,
+      problem_language: problemLanguageDetection.language,
+      problem_language_source: problemLanguageDetection.source,
+      problem_language_confidence: problemLanguageDetection.confidence,
       source_blank_confusion_applied: sourceBlankConfusionApplied,
       source_blank_confusion_reason: sourceBlankConfusionReason,
       source_word_intent: sourceWordIntent,

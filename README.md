@@ -69,10 +69,13 @@ Response (shape):
   "need_confirm": false,
   "reasons": {},
   "meta": {
-    "note": "ok|partial_success|partial_success_timeout|unknown_no_viable_candidate|ok_ambiguous_unit_conversion|ok_count_capped_by_policy|quota_check_failed",
+    "note": "ok|partial_success|partial_success_timeout|unknown_no_viable_candidate|ok_ambiguous_unit_conversion|ok_count_capped_by_policy|quota_check_failed|problem_language_fallback",
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
     "difficulty_applied": "easy|standard|hard",
+    "problem_language": "ja|en",
+    "problem_language_source": "ocr|image|heuristic|fallback",
+    "problem_language_confidence": 0.92,
     "failure_code": "none|ocr_input_unreadable|upstream_rate_limited|upstream_timeout|upstream_unavailable|server_misconfigured|generation_failed|unknown",
     "retryable": true,
     "quota_limit": 10,
@@ -117,27 +120,34 @@ Quota exceeded response:
 2. モード判定  
 - `input_mode`: `equation` / `word_problem`
 
-3. 式トラック判定（equation時）  
+3. 問題言語判定  
+- UI language ではなく、`ocr_text` / `image_base64` から `problem_language` を推定
+- v1 は `ja` / `en` のみ
+- OCRが弱いときだけ画像補助判定を実行
+- 判定不能時は `ja` fallback + `meta.note=problem_language_fallback`
+
+4. 式トラック判定（equation時）  
 - `arithmetic`
 - `unit_conversion_pure`
 - `unit_conversion_calc`
 
-4. difficulty適用  
+5. difficulty適用  
 - 共通 difficulty（`easy` / `same` / `hard`）を内部に正規化
 - `same` は内部的に `standard` として扱う
 - 難易度は生成プロンプトの指示差分で調整（厳格な数値レバーは使わない）
 
-5. 生成（AI）  
+6. 生成（AI）  
 - promptのみ生成（選択肢なし）
+- 生成言語は `meta.problem_language` に従う
 
-6. 軽量フィルタ  
+7. 軽量フィルタ  
 - モード整合
 - カテゴリ整合
 - 演算子ヒント整合（例: 掛け算入力は掛け算問題を優先）
 - 単位ドメイン整合（length / volume / weight）
 - 式表記整合（右辺回答は `=` 終端、式中未知数のみ `□`）
 
-7. 返却  
+8. 返却  
 - 取り切れなければ `partial_success`
 - 候補ゼロなら `unknown` + `need_confirm=true`
 - 失敗時は `meta.failure_code` で原因分類（OCR失敗 / upstream 429 など）

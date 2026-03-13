@@ -258,7 +258,10 @@ test("/micro/generate_from_ocr uses fill retry to avoid very low applied_count",
       assert.equal(generationCallCount >= 2, true);
       assert.equal(body.applied_count >= 3, true);
       assert.equal(
-        body.meta.note === "partial_success_filled" || body.meta.note === "partial_success" || body.meta.note === "ok",
+        body.meta.note === "partial_success_filled" ||
+          body.meta.note === "partial_success" ||
+          body.meta.note === "ok" ||
+          body.meta.note === "problem_language_fallback",
         true
       );
     });
@@ -1415,4 +1418,150 @@ test("/micro/generate_from_ocr returns 429 when free quota exceeded", async () =
 
   delete process.env.UPSTASH_REDIS_REST_URL;
   delete process.env.UPSTASH_REDIS_REST_TOKEN;
+});
+
+test("/micro/generate_from_ocr detects Japanese problem language from OCR text", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      assert.equal(prompt.includes("Language: ja"), true);
+      return geminiResponse({ problems: [{ prompt: "3 + 4 =" }] });
+    }
+
+    return geminiResponse({ problems: [{ prompt: "3 + 4 =" }] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
+        body: JSON.stringify({
+          ocr_text: "りんごが 3こ あります。2こ ふえると なんこですか。",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "en",
+          seed: 201
+        })
+      });
+
+      const body = (await res.json()) as {
+        meta: { problem_language: string; problem_language_source: string; problem_language_confidence: number };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.meta.problem_language, "ja");
+      assert.equal(body.meta.problem_language_source, "ocr");
+      assert.equal(body.meta.problem_language_confidence >= 0.7, true);
+    });
+  });
+});
+
+test("/micro/generate_from_ocr detects English problem language from OCR text", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = body.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: generator_v1")) {
+      assert.equal(prompt.includes("Language: en"), true);
+      return geminiResponse({ problems: [{ prompt: "How many are there in all?" }] });
+    }
+
+    return geminiResponse({ problems: [{ prompt: "How many are there in all?" }] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
+        body: JSON.stringify({
+          ocr_text: "Tom has 3 apples. He gets 2 more. How many apples does he have now?",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: 202
+        })
+      });
+
+      const body = (await res.json()) as {
+        meta: { problem_language: string; problem_language_source: string; problem_language_confidence: number };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.meta.problem_language, "en");
+      assert.equal(body.meta.problem_language_source, "ocr");
+      assert.equal(body.meta.problem_language_confidence >= 0.68, true);
+    });
+  });
+});
+
+test("/micro/generate_from_ocr falls back to image language detection when OCR is weak", async () => {
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+
+  await withMockFetch(async (original, input, init) => {
+    const url = String(input);
+    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+
+    const raw = JSON.parse(String(init?.body ?? "{}")) as {
+      contents?: Array<{ parts?: Array<{ text?: string }> }>;
+    };
+    const prompt = raw.contents?.[0]?.parts?.[0]?.text ?? "";
+
+    if (prompt.includes("ROLE: image_language_detector_v1")) {
+      return geminiResponse({ language: "en", confidence: 0.88 });
+    }
+    if (prompt.includes("ROLE: image_ocr_v1")) {
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: "123" }] } }]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (prompt.includes("ROLE: generator_v1")) {
+      assert.equal(prompt.includes("Language: en"), true);
+      return geminiResponse({ problems: [{ prompt: "5 + 2 =" }] });
+    }
+
+    return geminiResponse({ problems: [{ prompt: "5 + 2 =" }] });
+  }, async () => {
+    await withServer(async (baseUrl) => {
+      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
+        body: JSON.stringify({
+          ocr_text: "123",
+          image_base64: "ZmFrZQ==",
+          image_mime_type: "image/png",
+          count: 4,
+          grade_band: "g1_g3",
+          language: "ja",
+          seed: 203
+        })
+      });
+
+      const body = (await res.json()) as {
+        meta: { note: string; problem_language: string; problem_language_source: string; problem_language_confidence: number };
+      };
+
+      assert.equal(res.status, 200);
+      assert.equal(body.meta.problem_language, "en");
+      assert.equal(body.meta.problem_language_source, "image");
+      assert.equal(body.meta.problem_language_confidence, 0.88);
+      assert.notEqual(body.meta.note, "problem_language_fallback");
+    });
+  });
 });
