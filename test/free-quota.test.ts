@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { __freeQuotaInternals, consumeMonthlyFreeQuota } from "../src/lib/free-quota.js";
+import { __freeQuotaInternals, consumeMonthlyFreeQuota, resolvePlanId, syncSubscriptionPlan } from "../src/lib/free-quota.js";
 
 const ORIGINAL_FETCH = globalThis.fetch;
 const ORIGINAL_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -115,6 +115,88 @@ test("consumeMonthlyFreeQuota supports premium plan monthly limit", async () => 
   assert.equal(result.allowed, true);
   assert.equal(result.plan_id, "premium");
   assert.equal(result.limit, 300);
+});
+
+test("syncSubscriptionPlan stores supported light plan", async () => {
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  let capturedArgs: unknown[] | null = null;
+  globalThis.fetch = (async (_input, init) => {
+    capturedArgs = JSON.parse(String(init?.body ?? "[]")) as unknown[];
+    return new Response(JSON.stringify({ result: "OK" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }) as typeof fetch;
+
+  const result = await syncSubscriptionPlan({
+    installId: "install-0004",
+    productId: "ruidaichan.light.monthly",
+    expiresAt: "2026-05-10T00:00:00.000Z",
+    now: new Date("2026-04-10T00:00:00.000Z")
+  });
+
+  if (!result.ok) assert.fail(result.error);
+  assert.equal(result.plan_id, "light");
+  assert.deepEqual(capturedArgs?.slice(0, 3), [
+    "SET",
+    "ruidaichan:plan:install-0004",
+    JSON.stringify({
+      plan_id: "light",
+      product_id: "ruidaichan.light.monthly",
+      expires_at: "2026-05-10T00:00:00.000Z",
+      updated_at: "2026-04-10T00:00:00.000Z"
+    })
+  ]);
+});
+
+test("resolvePlanId returns stored premium plan before expiry", async () => {
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        result: JSON.stringify({
+          plan_id: "premium",
+          product_id: "ruidaichan.premium.monthly",
+          expires_at: "2026-05-10T00:00:00.000Z",
+          updated_at: "2026-04-10T00:00:00.000Z"
+        })
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }
+    )) as typeof fetch;
+
+  const result = await resolvePlanId("install-0005", new Date("2026-04-10T00:00:00.000Z"));
+  assert.equal(result, "premium");
+});
+
+test("resolvePlanId falls back to free after expiry", async () => {
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        result: JSON.stringify({
+          plan_id: "light",
+          product_id: "ruidaichan.light.monthly",
+          expires_at: "2026-04-01T00:00:00.000Z",
+          updated_at: "2026-03-10T00:00:00.000Z"
+        })
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }
+    )) as typeof fetch;
+
+  const result = await resolvePlanId("install-0006", new Date("2026-04-10T00:00:00.000Z"));
+  assert.equal(result, "free");
 });
 
 test("free quota ttl aligns to next month UTC", () => {

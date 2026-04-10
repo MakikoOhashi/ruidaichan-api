@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import { assertVersionSync } from "./config/version-sync.js";
+import { billingSubscriptionRouter } from "./routes/billing-subscription.js";
 import { extractRouter } from "./routes/extract.js";
 import { extractLayoutRouter } from "./routes/extract-layout.js";
 import { extractSkeletonLayoutRouter } from "./routes/extract-skeleton-layout.js";
@@ -56,9 +57,11 @@ export function createApp(): express.Express {
   app.use("/extract", extractLimiter, requireApiKey);
   app.use("/extract_layout", extractLimiter, requireApiKey);
   app.use("/extract_skeleton_layout", extractLimiter, requireApiKey);
+  app.use("/billing/sync_subscription", extractLimiter, requireApiKey);
   app.use("/micro/generate", extractLimiter, requireApiKey);
   app.use("/micro/generate_from_ocr", extractLimiter, requireApiKey);
 
+  app.use("/billing/sync_subscription", billingSubscriptionRouter);
   app.use("/extract", extractRouter);
   app.use("/extract_layout", extractLayoutRouter);
   app.use("/extract_skeleton_layout", extractSkeletonLayoutRouter);

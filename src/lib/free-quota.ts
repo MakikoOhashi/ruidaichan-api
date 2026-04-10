@@ -1,4 +1,5 @@
 export type PlanId = "free" | "light" | "premium";
+export type PlanProductId = "ruidaichan.light.monthly" | "ruidaichan.premium.monthly";
 
 export type FreeQuotaDecision = {
   plan_id: PlanId;
@@ -16,12 +17,20 @@ type RedisCommandResult = {
   error?: string;
 };
 
+type StoredPlanRecord = {
+  plan_id: PlanId;
+  product_id: PlanProductId;
+  expires_at: string;
+  updated_at: string;
+};
+
 const INSTALL_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const FREE_FIRST_MONTH_LIMIT = 10;
 const FREE_LATER_MONTH_LIMIT = 5;
 const LIGHT_MONTH_LIMIT = 50;
 const PREMIUM_MONTH_LIMIT = 300;
 const FREE_REQUEST_COST = 1;
+const PLAN_GRACE_SECONDS = 0;
 
 const CONSUME_SCRIPT = `
 local first = redis.call("GET", KEYS[1])
@@ -70,6 +79,12 @@ function quotaLimitForPlan(planId: PlanId, firstMonth: boolean): number {
   return firstMonth ? FREE_FIRST_MONTH_LIMIT : FREE_LATER_MONTH_LIMIT;
 }
 
+function planIdForProductId(productId: string): PlanId | null {
+  if (productId === "ruidaichan.light.monthly") return "light";
+  if (productId === "ruidaichan.premium.monthly") return "premium";
+  return null;
+}
+
 function resolveCountKey(installId: string, planId: PlanId, month: string): string {
   if (planId === "free") {
     return `ruidaichan:free:count:${installId}:${month}`;
@@ -77,8 +92,8 @@ function resolveCountKey(installId: string, planId: PlanId, month: string): stri
   return `ruidaichan:count:${installId}:${planId}:${month}`;
 }
 
-function resolvePlanId(_installId: string): PlanId {
-  return "free";
+function resolvePlanKey(installId: string): string {
+  return `ruidaichan:plan:${installId}`;
 }
 
 async function runUpstashCommand(args: Array<string | number>): Promise<RedisCommandResult> {
@@ -117,6 +132,84 @@ export function validateInstallId(installId: string): boolean {
   return INSTALL_ID_PATTERN.test(installId);
 }
 
+function decodeStoredPlanRecord(value: unknown): StoredPlanRecord | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredPlanRecord>;
+    if (
+      (parsed.plan_id === "light" || parsed.plan_id === "premium") &&
+      (parsed.product_id === "ruidaichan.light.monthly" || parsed.product_id === "ruidaichan.premium.monthly") &&
+      typeof parsed.expires_at === "string" &&
+      parsed.expires_at.length > 0 &&
+      typeof parsed.updated_at === "string" &&
+      parsed.updated_at.length > 0
+    ) {
+      return parsed as StoredPlanRecord;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export async function resolvePlanId(installId: string, now: Date = new Date()): Promise<PlanId> {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return "free";
+  }
+
+  try {
+    const result = await runUpstashCommand(["GET", resolvePlanKey(installId)]);
+    if (result.error) return "free";
+    const record = decodeStoredPlanRecord(result.result);
+    if (!record) return "free";
+    const expiresAtMs = Date.parse(record.expires_at);
+    if (!Number.isFinite(expiresAtMs)) return "free";
+    if (expiresAtMs <= now.getTime()) return "free";
+    return record.plan_id;
+  } catch {
+    return "free";
+  }
+}
+
+export async function syncSubscriptionPlan(params: {
+  installId: string;
+  productId: string;
+  expiresAt: string;
+  now?: Date;
+}): Promise<
+  | { ok: true; plan_id: PlanId; product_id: PlanProductId; expires_at: string }
+  | { ok: false; error: string }
+> {
+  const planId = planIdForProductId(params.productId);
+  if (!planId) return { ok: false, error: "unsupported_product_id" };
+
+  const expiresAtMs = Date.parse(params.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) return { ok: false, error: "invalid_expires_at" };
+
+  const now = params.now ?? new Date();
+  const ttlSeconds = Math.max(Math.floor((expiresAtMs - now.getTime()) / 1000) + PLAN_GRACE_SECONDS, 1);
+  const record: StoredPlanRecord = {
+    plan_id: planId,
+    product_id: params.productId as PlanProductId,
+    expires_at: new Date(expiresAtMs).toISOString(),
+    updated_at: now.toISOString()
+  };
+
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return { ok: false, error: "upstash_env_missing" };
+  }
+
+  const result = await runUpstashCommand([
+    "SET",
+    resolvePlanKey(params.installId),
+    JSON.stringify(record),
+    "EX",
+    String(ttlSeconds)
+  ]);
+  if (result.error) return { ok: false, error: result.error };
+  return { ok: true, plan_id: planId, product_id: record.product_id, expires_at: record.expires_at };
+}
+
 export async function consumeMonthlyFreeQuota(params: {
   installId: string;
   planId?: PlanId;
@@ -127,7 +220,7 @@ export async function consumeMonthlyFreeQuota(params: {
   const resetAtDate = nextMonthStartUtc(now);
   const resetAt = resetAtDate.toISOString();
   const ttlSeconds = ttlUntil(resetAtDate, now);
-  const planId = params.planId ?? resolvePlanId(params.installId);
+  const planId = params.planId ?? (await resolvePlanId(params.installId, now));
   const firstMonthLimit = quotaLimitForPlan(planId, true);
   const laterMonthLimit = quotaLimitForPlan(planId, false);
 
@@ -220,6 +313,9 @@ export const __freeQuotaInternals = {
   nextMonthStartUtc,
   ttlUntil,
   quotaLimitForPlan,
+  planIdForProductId,
   resolveCountKey,
-  resolvePlanId
+  resolvePlanId,
+  resolvePlanKey,
+  decodeStoredPlanRecord
 };

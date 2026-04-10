@@ -103,6 +103,33 @@ Quota exceeded response:
 }
 ```
 
+### POST `/billing/sync_subscription`
+
+Header:
+
+- `x-api-key: <API_KEY>`
+- `x-install-id: <install_id>`
+
+Request:
+
+```json
+{
+  "product_id": "ruidaichan.light.monthly",
+  "expires_at": "2026-05-11T00:00:00.000Z"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "plan_id": "light",
+  "product_id": "ruidaichan.light.monthly",
+  "expires_at": "2026-05-11T00:00:00.000Z"
+}
+```
+
 ### Other endpoints (legacy/aux)
 
 - `POST /extract`
@@ -114,7 +141,7 @@ Quota exceeded response:
 
 1. 入力受付  
 - `x-install-id` を検証（不正/欠落は 400）
-- Redis 月次無料枠を先に消費（初月10 / 以降5）
+- Redis から現在の `plan_id` を解決して、その月次枠を消費
 - 上限超過は 429 `free_quota_exceeded`
 - `ocr_text` があれば先に使用
 - `ocr_text` が空/ノイジーで `image_base64` があれば AI OCR フォールバック
@@ -166,14 +193,18 @@ Quota exceeded response:
 - `ruidaichan:first_month:{install_id}`
   - 値: string `yyyyMM`
   - TTL: なし（初回利用月の固定）
+- `ruidaichan:plan:{install_id}`
+  - 値: JSON `{ plan_id, product_id, expires_at, updated_at }`
+  - TTL: `expires_at` まで
+  - App Store 購入同期で更新
 - `ruidaichan:rate:short:{install_id}`
   - 将来用 prefix 予約（未実装）
 
 ## Plan Policy
 
 - `free`: 初月10回 / 以降5回
-- `light`: 毎月50回
-- `premium`: 毎月300回
+- `light`: 毎月50回 (`ruidaichan.light.monthly`)
+- `premium`: 毎月300回 (`ruidaichan.premium.monthly`)
 - 現状の backend 既定 plan は `free`
 
 ## Count Policy
