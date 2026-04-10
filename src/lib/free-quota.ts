@@ -1,4 +1,7 @@
+export type PlanId = "free" | "light" | "premium";
+
 export type FreeQuotaDecision = {
+  plan_id: PlanId;
   allowed: boolean;
   limit: number;
   used: number;
@@ -16,6 +19,8 @@ type RedisCommandResult = {
 const INSTALL_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const FREE_FIRST_MONTH_LIMIT = 10;
 const FREE_LATER_MONTH_LIMIT = 5;
+const LIGHT_MONTH_LIMIT = 50;
+const PREMIUM_MONTH_LIMIT = 300;
 const FREE_REQUEST_COST = 1;
 
 const CONSUME_SCRIPT = `
@@ -59,6 +64,23 @@ function ttlUntil(date: Date, now: Date): number {
   return Math.max(seconds, 1);
 }
 
+function quotaLimitForPlan(planId: PlanId, firstMonth: boolean): number {
+  if (planId === "light") return LIGHT_MONTH_LIMIT;
+  if (planId === "premium") return PREMIUM_MONTH_LIMIT;
+  return firstMonth ? FREE_FIRST_MONTH_LIMIT : FREE_LATER_MONTH_LIMIT;
+}
+
+function resolveCountKey(installId: string, planId: PlanId, month: string): string {
+  if (planId === "free") {
+    return `ruidaichan:free:count:${installId}:${month}`;
+  }
+  return `ruidaichan:count:${installId}:${planId}:${month}`;
+}
+
+function resolvePlanId(_installId: string): PlanId {
+  return "free";
+}
+
 async function runUpstashCommand(args: Array<string | number>): Promise<RedisCommandResult> {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -97,6 +119,7 @@ export function validateInstallId(installId: string): boolean {
 
 export async function consumeMonthlyFreeQuota(params: {
   installId: string;
+  planId?: PlanId;
   now?: Date;
 }): Promise<FreeQuotaDecision> {
   const now = params.now ?? new Date();
@@ -104,13 +127,17 @@ export async function consumeMonthlyFreeQuota(params: {
   const resetAtDate = nextMonthStartUtc(now);
   const resetAt = resetAtDate.toISOString();
   const ttlSeconds = ttlUntil(resetAtDate, now);
+  const planId = params.planId ?? resolvePlanId(params.installId);
+  const firstMonthLimit = quotaLimitForPlan(planId, true);
+  const laterMonthLimit = quotaLimitForPlan(planId, false);
 
   const firstMonthKey = `ruidaichan:first_month:${params.installId}`;
-  const countKey = `ruidaichan:free:count:${params.installId}:${month}`;
+  const countKey = resolveCountKey(params.installId, planId, month);
   if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
     return {
+      plan_id: planId,
       allowed: true,
-      limit: FREE_LATER_MONTH_LIMIT,
+      limit: laterMonthLimit,
       used: 0,
       used_after: 0,
       reset_at: resetAt,
@@ -126,16 +153,17 @@ export async function consumeMonthlyFreeQuota(params: {
       firstMonthKey,
       countKey,
       month,
-      String(FREE_FIRST_MONTH_LIMIT),
-      String(FREE_LATER_MONTH_LIMIT),
+      String(firstMonthLimit),
+      String(laterMonthLimit),
       String(FREE_REQUEST_COST),
       String(ttlSeconds)
     ]);
 
     if (result.error) {
       return {
+        plan_id: planId,
         allowed: true,
-        limit: FREE_LATER_MONTH_LIMIT,
+        limit: laterMonthLimit,
         used: 0,
         used_after: 0,
         reset_at: resetAt,
@@ -147,8 +175,9 @@ export async function consumeMonthlyFreeQuota(params: {
     const rows = Array.isArray(result.result) ? result.result : null;
     if (!rows || rows.length < 3) {
       return {
+        plan_id: planId,
         allowed: true,
-        limit: FREE_LATER_MONTH_LIMIT,
+        limit: laterMonthLimit,
         used: 0,
         used_after: 0,
         reset_at: resetAt,
@@ -164,8 +193,9 @@ export async function consumeMonthlyFreeQuota(params: {
     const used = allowed ? Math.max(usedAfter - FREE_REQUEST_COST, 0) : usedAfter;
 
     return {
+      plan_id: planId,
       allowed,
-      limit: Number.isFinite(limit) ? limit : FREE_LATER_MONTH_LIMIT,
+      limit: Number.isFinite(limit) ? limit : laterMonthLimit,
       used,
       used_after: usedAfter,
       reset_at: resetAt,
@@ -173,8 +203,9 @@ export async function consumeMonthlyFreeQuota(params: {
     };
   } catch (error) {
     return {
+      plan_id: planId,
       allowed: true,
-      limit: FREE_LATER_MONTH_LIMIT,
+      limit: laterMonthLimit,
       used: 0,
       used_after: 0,
       reset_at: resetAt,
@@ -187,5 +218,8 @@ export async function consumeMonthlyFreeQuota(params: {
 export const __freeQuotaInternals = {
   monthKeyUtc,
   nextMonthStartUtc,
-  ttlUntil
+  ttlUntil,
+  quotaLimitForPlan,
+  resolveCountKey,
+  resolvePlanId
 };

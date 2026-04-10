@@ -73,6 +73,7 @@ Response (shape):
     "seed": "...",
     "grade_band_applied": "g1|g2_g3",
     "difficulty_applied": "easy|standard|hard",
+    "plan_id": "free|light|premium",
     "problem_language": "ja|en",
     "problem_language_source": "ocr|image|heuristic|fallback",
     "problem_language_confidence": 0.92,
@@ -95,6 +96,7 @@ Quota exceeded response:
 {
   "error": "free_quota_exceeded",
   "request_id": "...",
+  "plan_id": "free",
   "limit": 5,
   "used": 5,
   "reset_at": "2026-03-01T00:00:00.000Z"
@@ -157,11 +159,22 @@ Quota exceeded response:
 - `ruidaichan:free:count:{install_id}:{yyyyMM}`
   - 値: integer（月内消費数）
   - TTL: 次月UTC 00:00:00 まで
+- `ruidaichan:count:{install_id}:{plan_id}:{yyyyMM}`
+  - 値: integer（月内消費数）
+  - TTL: 次月UTC 00:00:00 まで
+  - `light` / `premium` 用
 - `ruidaichan:first_month:{install_id}`
   - 値: string `yyyyMM`
   - TTL: なし（初回利用月の固定）
 - `ruidaichan:rate:short:{install_id}`
   - 将来用 prefix 予約（未実装）
+
+## Plan Policy
+
+- `free`: 初月10回 / 以降5回
+- `light`: 毎月50回
+- `premium`: 毎月300回
+- 現状の backend 既定 plan は `free`
 
 ## Count Policy
 

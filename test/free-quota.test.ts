@@ -21,6 +21,7 @@ test("consumeMonthlyFreeQuota is bypassed when upstash env is missing", async ()
   const result = await consumeMonthlyFreeQuota({ installId: "install-0001" });
   assert.equal(result.allowed, true);
   assert.equal(result.check_failed, false);
+  assert.equal(result.plan_id, "free");
   assert.equal(result.limit, 5);
 });
 
@@ -36,6 +37,7 @@ test("consumeMonthlyFreeQuota handles first-month limit=10", async () => {
 
   const result = await consumeMonthlyFreeQuota({ installId: "install-0001", now: new Date("2026-02-15T10:00:00Z") });
   assert.equal(result.allowed, true);
+  assert.equal(result.plan_id, "free");
   assert.equal(result.limit, 10);
   assert.equal(result.used_after, 1);
   assert.equal(result.used, 0);
@@ -54,6 +56,7 @@ test("consumeMonthlyFreeQuota blocks when exceeded", async () => {
 
   const result = await consumeMonthlyFreeQuota({ installId: "install-0001", now: new Date("2026-02-15T10:00:00Z") });
   assert.equal(result.allowed, false);
+  assert.equal(result.plan_id, "free");
   assert.equal(result.limit, 5);
   assert.equal(result.used, 5);
   assert.equal(result.used_after, 5);
@@ -70,7 +73,48 @@ test("consumeMonthlyFreeQuota fail-open when upstash request errors", async () =
   const result = await consumeMonthlyFreeQuota({ installId: "install-0001", now: new Date("2026-02-15T10:00:00Z") });
   assert.equal(result.allowed, true);
   assert.equal(result.check_failed, true);
+  assert.equal(result.plan_id, "free");
   assert.equal(result.error, "network_down");
+});
+
+test("consumeMonthlyFreeQuota supports light plan monthly limit", async () => {
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ result: [1, 1, 50, "202602", 123] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    })) as typeof fetch;
+
+  const result = await consumeMonthlyFreeQuota({
+    installId: "install-0002",
+    planId: "light",
+    now: new Date("2026-02-15T10:00:00Z")
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.plan_id, "light");
+  assert.equal(result.limit, 50);
+});
+
+test("consumeMonthlyFreeQuota supports premium plan monthly limit", async () => {
+  process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+  process.env.UPSTASH_REDIS_REST_TOKEN = "token";
+
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ result: [1, 1, 300, "202602", 123] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    })) as typeof fetch;
+
+  const result = await consumeMonthlyFreeQuota({
+    installId: "install-0003",
+    planId: "premium",
+    now: new Date("2026-02-15T10:00:00Z")
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.plan_id, "premium");
+  assert.equal(result.limit, 300);
 });
 
 test("free quota ttl aligns to next month UTC", () => {

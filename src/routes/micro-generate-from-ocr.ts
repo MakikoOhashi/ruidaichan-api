@@ -1436,12 +1436,14 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   }
 
   const quotaDecision = await consumeMonthlyFreeQuota({ installId: installIdRaw });
+  const planId = quotaDecision.plan_id;
   if (!quotaDecision.allowed) {
     console.warn(
       JSON.stringify({
         event: "quota_exceeded",
         request_id: requestId,
         install_id_hash: hashInstallId(installIdRaw),
+        plan_id: quotaDecision.plan_id,
         limit: quotaDecision.limit,
         used: quotaDecision.used,
         reset_at: quotaDecision.reset_at
@@ -1450,6 +1452,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     return res.status(429).json({
       error: "free_quota_exceeded",
       request_id: requestId,
+      plan_id: quotaDecision.plan_id,
       limit: quotaDecision.limit,
       used: quotaDecision.used,
       reset_at: quotaDecision.reset_at
@@ -1469,6 +1472,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         event: "quota_check_failed",
         request_id: requestId,
         install_id_hash: hashInstallId(installIdRaw),
+        plan_id: planId,
         error: quotaDecision.error ?? "unknown",
         fail_open: true
       })
@@ -1523,6 +1527,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         seed: seedText,
         grade_band_applied: normalizeRequestedGradeBand(grade_band) ?? "g1",
         difficulty_applied: difficultyLevel,
+        plan_id: planId,
         problem_language: fallbackLanguage,
         problem_language_source: "fallback" as const,
         problem_language_confidence: 0.35,
@@ -1567,6 +1572,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         image_language_status: imageLanguageStatus,
         image_language_error: imageLanguageError,
         ai_ocr_text_length: 0,
+        plan_id: planId,
         quota_check_failed: quotaCheckFailed,
         quota_error: quotaDecision.error ?? null,
         choices_disabled: true,
@@ -2074,6 +2080,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       seed: seedText,
       grade_band_applied: gradeBandApplied,
       difficulty_applied: difficultyLevel,
+      plan_id: planId,
       problem_language: problemLanguageDetection.language,
       problem_language_source: problemLanguageDetection.source,
       problem_language_confidence: problemLanguageDetection.confidence,
@@ -2096,6 +2103,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       generation_status: generationStatus,
       solver_status: solverStatus,
       language,
+      plan_id: planId,
       problem_language: problemLanguageDetection.language,
       problem_language_source: problemLanguageDetection.source,
       problem_language_confidence: problemLanguageDetection.confidence,
@@ -2140,6 +2148,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
     JSON.stringify({
       event: "micro_generate_from_ocr_observe",
       request_id: requestId,
+      plan_id: planId,
       input_mode: inputMode,
       equation_track: equationTrack,
       arithmetic_hint: arithmeticHint,

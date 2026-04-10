@@ -107,7 +107,7 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
         requested_count: number;
         need_confirm: boolean;
         problems: Array<{ prompt: string }>;
-        meta: { note: string; grade_band_applied: string };
+        meta: { note: string; grade_band_applied: string; plan_id: string };
         debug: { kanji_guard: { checked: boolean; violations_count: number; rewrite_attempts: number } };
       };
 
@@ -121,6 +121,7 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
       assert.equal(body.need_confirm, false);
       assert.equal(body.problems.length > 0, true);
       assert.equal(body.meta.grade_band_applied === "g1" || body.meta.grade_band_applied === "g2_g3", true);
+      assert.equal(body.meta.plan_id, "free");
       assert.equal(body.debug.kanji_guard.checked, true);
       assert.equal(body.meta.note === "ok" || body.meta.note === "partial_success", true);
     });
@@ -1408,9 +1409,10 @@ test("/micro/generate_from_ocr returns 429 when free quota exceeded", async () =
         })
       });
 
-      const body = (await res.json()) as { error: string; limit: number; used: number };
+      const body = (await res.json()) as { error: string; plan_id: string; limit: number; used: number };
       assert.equal(res.status, 429);
       assert.equal(body.error, "free_quota_exceeded");
+      assert.equal(body.plan_id, "free");
       assert.equal(body.limit, 5);
       assert.equal(body.used, 5);
     });
