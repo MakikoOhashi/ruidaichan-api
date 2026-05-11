@@ -1,23 +1,28 @@
 import assert from "node:assert/strict";
-import { once } from "node:events";
-import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { createApp } from "../src/app.js";
+import { createExpressFetch } from "./helpers/express-local-fetch.js";
+import { getFetchUrl } from "./helpers/fetch-utils.js";
 
 async function withServer(fn: (baseUrl: string) => Promise<void>) {
   process.env.API_KEY = "test-key";
 
   const app = createApp();
-  const server = app.listen(0);
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const baseUrl = "http://local.test";
+  const previousFetch = globalThis.fetch;
+  const localFetch = createExpressFetch(app, baseUrl);
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = getFetchUrl(input);
+    if (String(url).startsWith(baseUrl)) {
+      return localFetch(input, init);
+    }
+    return previousFetch(input, init);
+  }) as typeof fetch;
 
   try {
     await fn(baseUrl);
   } finally {
-    server.close();
-    await once(server, "close");
+    globalThis.fetch = previousFetch;
   }
 }
 
@@ -239,8 +244,8 @@ test("image/ocr equation fallback detects 7 + 9 - 6 = □ as equation", async ()
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) throw new Error(`Unhandled fetch mock: ${url}`);
     const payload = {
       candidates: [
         {
@@ -569,8 +574,8 @@ test("text mode does not run image detector and does not surface model_429", asy
   let modelCallCount = 0;
 
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) throw new Error(`Unhandled fetch mock: ${url}`);
     modelCallCount += 1;
     return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
   }, async () => {
@@ -1001,9 +1006,9 @@ test("image fixture is stable across two calls (detector path and mode)", async 
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) {
-      return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) {
+      throw new Error(`Unhandled fetch mock: ${url}`);
     }
     const payload = {
       candidates: [
@@ -1055,9 +1060,9 @@ test("image detector retries once and succeeds without unknown", async () => {
   let callCount = 0;
 
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) {
-      return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) {
+      throw new Error(`Unhandled fetch mock: ${url}`);
     }
     callCount += 1;
     if (callCount === 1) {
@@ -1117,8 +1122,8 @@ test("model_429 still returns equation when local OCR regex hits", async () => {
   process.env.LOCAL_OCR_STUB_TEXT = "7+9-6=□";
   try {
     await withMockFetch(async (original, input, init) => {
-      const url = String(input);
-      if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+      const url = getFetchUrl(input);
+      if (!url.includes("googleapis.com")) throw new Error(`Unhandled fetch mock: ${url}`);
       return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
     }, async () => {
       await withServer(async (baseUrl) => {
@@ -1153,8 +1158,8 @@ test("model_429 still returns equation when local OCR regex hits", async () => {
 test("text mode survives AI 429 by deterministic correction", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) throw new Error(`Unhandled fetch mock: ${url}`);
     return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
   }, async () => {
     await withServer(async (baseUrl) => {
@@ -1186,8 +1191,8 @@ test("text mode survives AI 429 by deterministic correction", async () => {
 test("text missing-blank recovery survives AI 429 via deterministic path", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) throw new Error(`Unhandled fetch mock: ${url}`);
     return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
   }, async () => {
     await withServer(async (baseUrl) => {
@@ -1217,9 +1222,9 @@ test("image detector fails twice then returns unknown with concrete note", async
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
   await withMockFetch(async (original, input, init) => {
-    const url = String(input);
-    if (!url.includes("generativelanguage.googleapis.com")) {
-      return original(input, init);
+    const url = getFetchUrl(input);
+    if (!url.includes("googleapis.com")) {
+      throw new Error(`Unhandled fetch mock: ${url}`);
     }
     return new Response(JSON.stringify({ error: "quota" }), { status: 429, headers: { "Content-Type": "application/json" } });
   }, async () => {

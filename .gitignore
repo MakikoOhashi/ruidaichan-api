@@ -21,3 +21,5 @@ pnpm-debug.log*
 # editor
 .vscode/
 .idea/
+
+Todo.md

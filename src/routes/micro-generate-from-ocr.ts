@@ -2,7 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { checkKanjiGuard, estimateGradeBand, normalizeRequestedGradeBand, type GradeBandApplied } from "../guards/kanji-guard.js";
-import { consumeMonthlyFreeQuota, validateInstallId } from "../lib/free-quota.js";
+import { consumeMonthlyFreeQuota, refundMonthlyFreeQuota, validateInstallId } from "../lib/free-quota.js";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = 15000;
@@ -184,6 +184,86 @@ function truncateForLog(s: string, max = 120): string {
 function hashInt(input: string): number {
   const hex = sha(input).slice(0, 8);
   return Number.parseInt(hex, 16);
+}
+
+type SimpleJaParsed =
+  | { kind: "add_change"; unit: string; a: number; b: number }
+  | { kind: "sub_change"; unit: string; a: number; b: number }
+  | { kind: "split_equal"; itemUnit: string; people: number; total: number };
+
+function extractJapaneseUnitNearNumber(text: string): string | null {
+  const normalized = normalizeOcrTextForNlp(text);
+  const m = normalized.match(/\d+\s*(わ|羽|本|人|こ|個|枚|まい|匹|ひき)/);
+  return m ? m[1] : null;
+}
+
+function parseSimpleJaWordProblem(text: string): SimpleJaParsed | null {
+  const normalized = normalizeOcrTextForNlp(text);
+  const nums = normalized.match(/\d+/g)?.map((v) => Number.parseInt(v, 10)).filter((v) => Number.isFinite(v)) ?? [];
+  if (nums.length < 2) return null;
+
+  const hasSplit = /(同じ数ずつ|同じ数|分け|わけ|配る|くばる|1人分|一人分)/.test(normalized);
+  if (hasSplit) {
+    const people = nums.find((n) => n > 0 && n <= 50) ?? nums[0];
+    const total = nums.find((n) => n > people && n <= 500) ?? nums[1];
+    if (people > 0 && total > 0) {
+      const itemUnit = extractJapaneseUnitNearNumber(normalized) ?? "本";
+      return { kind: "split_equal", itemUnit, people, total };
+    }
+  }
+
+  const addSignals = /(あとから|ふえ|増え|きた|来た|あわせて|合わせて|合計|ぜんぶ|全部|ぜんぶで)/.test(normalized);
+  const subSignals = /(のこり|残り|なくな|へっ|減っ|つかい|使い|たべ|食べ|うり|売り)/.test(normalized);
+  const unit = extractJapaneseUnitNearNumber(normalized) ?? "こ";
+
+  if (addSignals && !subSignals && !/(ずつ|日間|毎日)/.test(normalized)) {
+    const a = nums[0];
+    const b = nums[1];
+    if (a > 0 && b > 0) return { kind: "add_change", unit, a, b };
+  }
+
+  if (subSignals && !/(ずつ|日間|毎日)/.test(normalized)) {
+    const a = nums[0];
+    const b = nums[1];
+    if (a > 0 && b > 0) return { kind: "sub_change", unit, a, b };
+  }
+
+  return null;
+}
+
+function localGenerateJaWordProblemDrafts(input: {
+  parsed: SimpleJaParsed;
+  seedText: string;
+  count: number;
+}): GenerationDraft[] {
+  const drafts: GenerationDraft[] = [];
+  for (let i = 0; i < input.count; i += 1) {
+    const r = hashInt(`${input.seedText}:local:${i}`);
+    if (input.parsed.kind === "add_change") {
+      const a = (r % 9) + 1;
+      const b = ((Math.floor(r / 10) % 9) + 1);
+      drafts.push({
+        prompt: `こうえんにはとが${a}${input.parsed.unit}いました。あとから${b}${input.parsed.unit}とんできました。ぜんぶでなん${input.parsed.unit}になりましたか。`
+      });
+      continue;
+    }
+    if (input.parsed.kind === "sub_change") {
+      const a = (r % 9) + 6;
+      const b = ((Math.floor(r / 10) % Math.max(1, a - 1)) + 1);
+      drafts.push({
+        prompt: `${a}${input.parsed.unit}あります。${b}${input.parsed.unit}つかいました。のこりはいくつですか。`
+      });
+      continue;
+    }
+    const people = (r % 8) + 2;
+    const per = ((Math.floor(r / 10) % 9) + 2);
+    const total = people * per;
+    const itemUnit = input.parsed.itemUnit;
+    drafts.push({
+      prompt: `子どもが${people}人います。${total}${itemUnit}のペンを同じ数ずつ分けます。1人分は何${itemUnit}ですか。`
+    });
+  }
+  return drafts.map((d) => ({ prompt: normalizeSpaces(d.prompt) }));
 }
 
 function extractFirstNumber(s: string): number | null {
@@ -527,6 +607,8 @@ function isPromptCompatibleWithTrack(prompt: string, track: EquationTrack): bool
 type SolveCategory =
   | "simple_calc"
   | "reverse_blank"
+  | "add_change"
+  | "sub_change"
   | "repeat_multiply"
   | "scale_times"
   | "split_equal"
@@ -534,8 +616,29 @@ type SolveCategory =
   | "compare_diff"
   | "unknown";
 
+function normalizeOcrTextForNlp(text: string): string {
+  return normalizeSpaces(
+    text
+      .normalize("NFKC")
+      .replace(/[｡]/g, "。")
+      .replace(/[､]/g, "、")
+      .replace(/。{2,}/g, "。")
+      .replace(/、{2,}/g, "、")
+  );
+}
+
+function extractFirstTwoIntegers(text: string): { a: number; b: number } | null {
+  const normalized = normalizeOcrTextForNlp(text);
+  const matches = normalized.match(/\d+/g);
+  if (!matches || matches.length < 2) return null;
+  const a = Number.parseInt(matches[0], 10);
+  const b = Number.parseInt(matches[1], 10);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return { a, b };
+}
+
 function detectSolveCategory(text: string): SolveCategory {
-  const normalized = text.normalize("NFKC");
+  const normalized = normalizeOcrTextForNlp(text);
   if (
     parseUnitConversion(normalized) !== null ||
     parseUnitConversionLoose(normalized) !== null ||
@@ -552,11 +655,21 @@ function detectSolveCategory(text: string): SolveCategory {
   if (/(同じ数|分け|1人分|何人分|あまり|配る)/.test(normalized)) {
     return "split_equal";
   }
+  if (/(あとから|ふえ|増え|きた|来た|あわせて|合わせて|合計|ぜんぶ|全部|ぜんぶで)/.test(normalized)) {
+    if (extractFirstTwoIntegers(normalized) !== null && !/(ずつ|日間|毎日)/.test(normalized)) {
+      return "add_change";
+    }
+  }
+  if (/(のこり|残り|のこった|のこります|なくな|へっ|減っ|つかい|使い|たべ|食べ|うり|売り)/.test(normalized)) {
+    if (extractFirstTwoIntegers(normalized) !== null && !/(ずつ|日間|毎日)/.test(normalized)) {
+      return "sub_change";
+    }
+  }
   const isCompareDiff = /(どちら|より)/.test(normalized) && /(多い|少ない|差)/.test(normalized) && /(合計|合わせる|あわせる)/.test(normalized);
   if (isCompareDiff) {
     return "compare_diff";
   }
-  if (/(毎日|ずつ|日間|何日|何分|何本|何こ|なんこ|いくつ|全部|ぜんぶ|合計|合わせる|あわせる)/.test(normalized)) {
+  if (/(毎日|ずつ|日間|何日|何分|何本|何こ|なんこ|いくつ)/.test(normalized)) {
     return "repeat_multiply";
   }
   if (/(倍|ばい|何倍)/.test(normalized)) {
@@ -570,6 +683,8 @@ function isCategoryCompatible(source: SolveCategory, generated: SolveCategory): 
   if (source === "unit_conversion") return generated === "unit_conversion";
   if (source === "reverse_blank") return generated === "reverse_blank" || generated === "simple_calc";
   if (source === "simple_calc") return generated === "simple_calc" || generated === "reverse_blank";
+  if (source === "add_change") return generated === "add_change";
+  if (source === "sub_change") return generated === "sub_change";
   if (source === "repeat_multiply") return generated === "repeat_multiply" || generated === "scale_times";
   if (source === "scale_times") return generated === "scale_times" || generated === "repeat_multiply";
   if (source === "split_equal") return generated === "split_equal";
@@ -735,7 +850,10 @@ function repairGenerationPrompt(language: string, raw: unknown): string {
   ].join("\n");
 }
 
-async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; status: number | null; data?: unknown; error?: string }> {
+async function callGeminiJson(input: {
+  payloadText: string;
+  requestId: string;
+}): Promise<{ ok: boolean; status: number | null; data?: unknown; error?: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return { ok: false, status: null, error: "gemini_api_key_missing" };
@@ -744,33 +862,70 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
+    const baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const buildBody = (mode: "camel" | "snake") => {
+      const generationConfig =
+        mode === "camel"
+          ? { temperature: 0.6, responseMimeType: "application/json" }
+          : { temperature: 0.6, response_mime_type: "application/json" };
+      return {
+        contents: [{ role: "user", parts: [{ text: input.payloadText }] }],
+        generationConfig
+      };
+    };
+
+    const attemptOnce = async (mode: "camel" | "snake") => {
+      const response = await fetch(baseUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: payloadText }] }],
-          generationConfig: { temperature: 0.6, responseMimeType: "application/json" }
-        }),
+        body: JSON.stringify(buildBody(mode)),
         signal: controller.signal
+      });
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => "");
+        console.warn(
+          JSON.stringify({
+            event: "gemini_generation_error",
+            request_id: input.requestId,
+            status: response.status,
+            body: bodyText.slice(0, 2000)
+          })
+        );
+        return { ok: false as const, status: response.status, error: `gemini_http_${response.status}`, bodyText };
       }
-    );
+      return { ok: true as const, status: response.status, response };
+    };
 
-    if (!response.ok) {
-      return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
+    let first = await attemptOnce("camel");
+    if (!first.ok) {
+      const maybeUnknownField =
+        first.status === 400 && typeof first.bodyText === "string" && /responseMimeType|response_mime_type/i.test(first.bodyText);
+      if (maybeUnknownField) {
+        const second = await attemptOnce("snake");
+        if (!second.ok) return { ok: false, status: second.status, error: second.error };
+        const json = (await second.response.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          return { ok: false, status: second.status, error: "gemini_empty_text" };
+        }
+        const parsed = parseJsonLoose(text);
+        return { ok: true, status: second.status, data: parsed };
+      }
+      return { ok: false, status: first.status, error: first.error };
     }
 
-    const json = (await response.json()) as {
+    const json = (await first.response.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) {
-      return { ok: false, status: response.status, error: "gemini_empty_text" };
+      return { ok: false, status: first.status, error: "gemini_empty_text" };
     }
 
     const parsed = parseJsonLoose(text);
-    return { ok: true, status: response.status, data: parsed };
+    return { ok: true, status: first.status, data: parsed };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       return { ok: false, status: null, error: "gemini_timeout" };
@@ -784,6 +939,7 @@ async function callGeminiJson(payloadText: string): Promise<{ ok: boolean; statu
 async function callGeminiImageOcr(input: {
   imageBase64: string;
   imageMimeType: string;
+  requestId: string;
 }): Promise<{ ok: boolean; status: number | null; text?: string; error?: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -828,6 +984,15 @@ async function callGeminiImageOcr(input: {
     );
 
     if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      console.warn(
+        JSON.stringify({
+          event: "gemini_ocr_error",
+          request_id: input.requestId,
+          status: response.status,
+          body: bodyText.slice(0, 2000)
+        })
+      );
       return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
     }
 
@@ -852,6 +1017,7 @@ async function callGeminiImageOcr(input: {
 async function callGeminiImageLanguage(input: {
   imageBase64: string;
   imageMimeType: string;
+  requestId: string;
 }): Promise<{ ok: boolean; status: number | null; language?: ProblemLanguage; confidence?: number; error?: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -895,6 +1061,15 @@ async function callGeminiImageLanguage(input: {
     );
 
     if (!response.ok) {
+      const bodyText = await response.text().catch(() => "");
+      console.warn(
+        JSON.stringify({
+          event: "gemini_language_error",
+          request_id: input.requestId,
+          status: response.status,
+          body: bodyText.slice(0, 2000)
+        })
+      );
       return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
     }
 
@@ -1227,16 +1402,31 @@ async function fetchGenerationDrafts(input: {
   wordProblemIntent: WordProblemIntent;
   conversionHint: boolean;
   unitDomainLock: UnitDomainLock | null;
+  requestId: string;
 }): Promise<DraftFetchResult> {
   let calls = 0;
   let status: number | null = null;
   const errors: string[] = [];
   let drafts: GenerationDraft[] = [];
 
+  if (input.inputMode === "word_problem" && input.problemLanguage === "ja") {
+    const parsed = parseSimpleJaWordProblem(input.ocrText);
+    if (
+      parsed !== null &&
+      ((parsed.kind === "add_change" && input.sourceCategory === "add_change") ||
+        (parsed.kind === "sub_change" && input.sourceCategory === "sub_change") ||
+        (parsed.kind === "split_equal" && input.sourceCategory === "split_equal"))
+    ) {
+      drafts = localGenerateJaWordProblemDrafts({ parsed, seedText: input.seed, count: input.count });
+      return { drafts, calls: 0, status: null, errors: [] };
+    }
+  }
+
   for (let attempt = 0; attempt < MAX_GENERATION_RETRIES && drafts.length === 0; attempt += 1) {
     calls += 1;
-    const genResp = await callGeminiJson(
-      generationPrompt({
+    const genResp = await callGeminiJson({
+      requestId: input.requestId,
+      payloadText: generationPrompt({
         ocrText: input.ocrText,
         count: input.count,
         gradeBand: input.gradeBand,
@@ -1251,7 +1441,7 @@ async function fetchGenerationDrafts(input: {
         conversionHint: input.conversionHint,
         unitDomainLock: input.unitDomainLock
       })
-    );
+    });
     status = genResp.status;
     if (!genResp.ok || !genResp.data) {
       errors.push(genResp.error ?? "generation_failed");
@@ -1267,7 +1457,10 @@ async function fetchGenerationDrafts(input: {
     } else {
       drafts = salvageGenerationPayload(genResp.data);
       if (drafts.length === 0) {
-        const repaired = await callGeminiJson(repairGenerationPrompt(input.problemLanguage, genResp.data));
+        const repaired = await callGeminiJson({
+          requestId: input.requestId,
+          payloadText: repairGenerationPrompt(input.problemLanguage, genResp.data)
+        });
         if (repaired.ok && repaired.data) {
           const repairedStrict = llmGenSchema.safeParse(repaired.data);
           if (repairedStrict.success) {
@@ -1478,7 +1671,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       })
     );
   }
-  let ocrText = normalizeSpaces(request_ocr_text ?? "");
+  let ocrText = normalizeOcrTextForNlp(request_ocr_text ?? "");
   let ocrSource: "request_text" | "image_ocr" | "none" = ocrText ? "request_text" : "none";
   let aiOcrFallbackUsed = false;
   let aiOcrStatus: number | null = null;
@@ -1491,7 +1684,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   if (image_base64 && (ocrText.length === 0 || shouldPreferImageOcrFallback(ocrText))) {
     const aiOcr = await callGeminiImageOcr({
       imageBase64: image_base64,
-      imageMimeType: image_mime_type
+      imageMimeType: image_mime_type,
+      requestId
     });
     aiOcrStatus = aiOcr.status;
     if (aiOcr.ok && aiOcr.text) {
@@ -1504,6 +1698,13 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   }
 
   if (!ocrText) {
+    let quotaUsedAfterFinal = quotaUsedAfter;
+    if (!quotaCheckFailed) {
+      const refund = await refundMonthlyFreeQuota({ installId: installIdRaw, planId: planId });
+      if (refund.ok) {
+        quotaUsedAfterFinal = refund.used_after;
+      }
+    }
     const fallbackLanguage = "ja" as const;
     return res.status(200).json({
       spec_version: "micro_problem_render_v1",
@@ -1534,7 +1735,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         failure_code: "ocr_input_unreadable" as const,
         retryable: true,
         quota_limit: quotaLimit,
-        quota_used_after: quotaUsedAfter,
+        quota_used_after: quotaUsedAfterFinal,
         quota_reset_at: quotaResetAt,
         count_policy: "server_enforced",
         max_count: 10,
@@ -1600,7 +1801,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
   ) {
     const imageLanguage = await callGeminiImageLanguage({
       imageBase64: image_base64,
-      imageMimeType: image_mime_type
+      imageMimeType: image_mime_type,
+      requestId
     });
     imageLanguageStatus = imageLanguage.status;
     if (imageLanguage.ok && imageLanguage.language) {
@@ -1685,7 +1887,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       arithmeticHint,
       wordProblemIntent: sourceWordIntent,
       conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
-      unitDomainLock
+      unitDomainLock,
+      requestId
     });
     const acceptedBeforeBatch = accepted.length;
     const batchRejectCounts: Record<string, number> = {};
@@ -1853,7 +2056,8 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
         arithmeticHint,
         wordProblemIntent: sourceWordIntent,
         conversionHint: equationTrack === "unit_conversion_pure" || equationTrack === "unit_conversion_calc",
-        unitDomainLock
+        unitDomainLock,
+        requestId
       });
       const acceptedBeforeFill = accepted.length;
       const fillRejectCounts: Record<string, number> = {};
@@ -2042,6 +2246,32 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
           aiOcrError
         })
       : "none";
+  let quotaUsedAfterFinal = quotaUsedAfter;
+  if (!quotaCheckFailed && appliedCount === 0 && failureCode !== "none") {
+    const refund = await refundMonthlyFreeQuota({ installId: installIdRaw, planId: planId });
+    if (refund.ok) {
+      quotaUsedAfterFinal = refund.used_after;
+      console.warn(
+        JSON.stringify({
+          event: "quota_refunded_on_generation_failure",
+          request_id: requestId,
+          install_id_hash: hashInstallId(installIdRaw),
+          plan_id: planId,
+          used_after: quotaUsedAfterFinal
+        })
+      );
+    } else {
+      console.warn(
+        JSON.stringify({
+          event: "quota_refund_failed",
+          request_id: requestId,
+          install_id_hash: hashInstallId(installIdRaw),
+          plan_id: planId,
+          error: refund.error
+        })
+      );
+    }
+  }
   const retryable = failureCode === "upstream_rate_limited" || failureCode === "upstream_timeout" || failureCode === "upstream_unavailable";
   const topItems = accepted[0]?.items ?? [];
   const needConfirm = appliedCount === 0 || (equationTrackAnalysis?.ambiguous ?? false);
@@ -2087,7 +2317,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       failure_code: failureCode,
       retryable,
       quota_limit: quotaLimit,
-      quota_used_after: quotaUsedAfter,
+      quota_used_after: quotaUsedAfterFinal,
       quota_reset_at: quotaResetAt,
       count_policy: "server_enforced",
       max_count: maxCount,
@@ -2170,7 +2400,7 @@ microGenerateFromOcrRouter.post("/", async (req, res) => {
       source_word_intent: sourceWordIntent,
       difficulty: difficultyLevel,
       quota_limit: quotaLimit,
-      quota_used_after: quotaUsedAfter,
+      quota_used_after: quotaUsedAfterFinal,
       quota_reset_at: quotaResetAt,
       quota_check_failed: quotaCheckFailed,
       quota_error: quotaDecision.error ?? null,

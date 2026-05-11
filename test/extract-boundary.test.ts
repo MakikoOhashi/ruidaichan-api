@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import test from "node:test";
-import type { AddressInfo } from "node:net";
 import { createApp } from "../src/app.js";
+import { createExpressFetch } from "./helpers/express-local-fetch.js";
+import { getFetchUrl } from "./helpers/fetch-utils.js";
 
 async function startServer() {
   const app = createApp();
-  const server = app.listen(0);
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
+  const baseUrl = "http://local.test";
+  const previousFetch = globalThis.fetch;
+  const localFetch = createExpressFetch(app, baseUrl);
+  globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = getFetchUrl(input);
+    if (String(url).startsWith(baseUrl)) {
+      return localFetch(input, init);
+    }
+    return previousFetch(input, init);
+  }) as typeof fetch;
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
+    baseUrl,
     close: async () => {
-      server.close();
-      await once(server, "close");
+      globalThis.fetch = previousFetch;
     }
   };
 }

@@ -12,6 +12,10 @@ export type FreeQuotaDecision = {
   error?: string;
 };
 
+export type FreeQuotaRefundDecision =
+  | { ok: true; used_after: number }
+  | { ok: false; error: string };
+
 type RedisCommandResult = {
   result?: unknown;
   error?: string;
@@ -56,6 +60,20 @@ end
 local updated = redis.call("INCRBY", KEYS[2], cost)
 redis.call("EXPIRE", KEYS[2], ttl_seconds)
 return {1, updated, limit, first, redis.call("TTL", KEYS[2])}
+`;
+
+const REFUND_SCRIPT = `
+local cost = tonumber(ARGV[1])
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+if current <= 0 then
+  return 0
+end
+local next = current - cost
+if next < 0 then
+  next = 0
+end
+redis.call("SET", KEYS[1], next)
+return next
 `;
 
 function monthKeyUtc(now: Date): string {
@@ -305,6 +323,32 @@ export async function consumeMonthlyFreeQuota(params: {
       check_failed: true,
       error: error instanceof Error ? error.message : "quota_unknown_error"
     };
+  }
+}
+
+export async function refundMonthlyFreeQuota(params: {
+  installId: string;
+  planId?: PlanId;
+  now?: Date;
+  cost?: number;
+}): Promise<FreeQuotaRefundDecision> {
+  const now = params.now ?? new Date();
+  const month = monthKeyUtc(now);
+  const planId = params.planId ?? (await resolvePlanId(params.installId, now));
+  const countKey = resolveCountKey(params.installId, planId, month);
+  const cost = params.cost ?? FREE_REQUEST_COST;
+
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return { ok: true, used_after: 0 };
+  }
+
+  try {
+    const result = await runUpstashCommand(["EVAL", REFUND_SCRIPT, "1", countKey, String(cost)]);
+    if (result.error) return { ok: false, error: result.error };
+    const usedAfter = Number(result.result);
+    return { ok: true, used_after: Number.isFinite(usedAfter) ? Math.max(0, usedAfter) : 0 };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "refund_unknown_error" };
   }
 }
 
