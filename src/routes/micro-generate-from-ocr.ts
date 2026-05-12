@@ -855,7 +855,76 @@ function repairGenerationPrompt(language: string, raw: unknown): string {
 async function callGeminiJson(input: {
   payloadText: string;
   requestId: string;
+  role: "generator_v1" | "json_repair_v1";
 }): Promise<{ ok: boolean; status: number | null; data?: unknown; error?: string }> {
+  const commonAiApiUrl = process.env.COMMON_AI_API_URL?.trim() || "";
+  const gatewaySecret = process.env.RUIDAICHAN_AI_GATEWAY_SECRET?.trim() || "";
+  const shouldUseGateway = input.role === "generator_v1" && commonAiApiUrl !== "" && gatewaySecret !== "";
+
+  if (shouldUseGateway) {
+    const url = `${commonAiApiUrl.replace(/\/+$/, "")}/ruidaichan/generate`;
+
+    console.log(
+      JSON.stringify({
+        event: "ai_gateway_call",
+        request_id: input.requestId,
+        role: input.role
+      })
+    );
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-App-Id": "ruidaichan",
+          "X-AI-Gateway-Secret": gatewaySecret
+        },
+        body: JSON.stringify({
+          request_id: input.requestId,
+          role: input.role,
+          payloadText: input.payloadText
+        }),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => "");
+        console.log(
+          JSON.stringify({
+            event: "ai_gateway_error",
+            request_id: input.requestId,
+            status: response.status,
+            body: truncateForLog(bodyText, 240)
+          })
+        );
+        return { ok: false, status: response.status, error: `ai_gateway_http_${response.status}` };
+      }
+
+      const json = (await response.json().catch(() => null)) as unknown;
+      const extracted = extractGatewayJsonData(json);
+      if (extracted === null) {
+        return { ok: false, status: response.status, error: "ai_gateway_invalid_json" };
+      }
+      return { ok: true, status: response.status, data: extracted };
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === "AbortError";
+      console.log(
+        JSON.stringify({
+          event: "ai_gateway_error",
+          request_id: input.requestId,
+          status: 500,
+          body: isTimeout ? "timeout" : "transport_error"
+        })
+      );
+      return { ok: false, status: null, error: isTimeout ? "ai_gateway_timeout" : "ai_gateway_transport_error" };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return { ok: false, status: null, error: "gemini_api_key_missing" };
@@ -932,6 +1001,32 @@ async function callGeminiJson(input: {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function extractGatewayJsonData(raw: unknown): unknown | null {
+  if (raw === null || raw === undefined) return null;
+
+  if (typeof raw === "string") {
+    return parseJsonLoose(raw);
+  }
+
+  if (typeof raw !== "object") return null;
+
+  const outer = raw as Record<string, unknown>;
+  const firstData = "data" in outer ? outer.data : undefined;
+  if (firstData === undefined) return outer;
+
+  if (typeof firstData === "string") return parseJsonLoose(firstData);
+  if (firstData === null || firstData === undefined) return null;
+  if (typeof firstData !== "object") return null;
+
+  const inner = firstData as Record<string, unknown>;
+  const secondData = "data" in inner ? inner.data : undefined;
+  if (typeof secondData === "string") return parseJsonLoose(secondData);
+  if (secondData === null || secondData === undefined) return firstData;
+  if (typeof secondData === "object") return secondData;
+
+  return firstData;
 }
 
 async function callGeminiImageOcr(input: {
@@ -1448,6 +1543,7 @@ async function fetchGenerationDrafts(input: {
     calls += 1;
     const genResp = await callGeminiJson({
       requestId: input.requestId,
+      role: "generator_v1",
       payloadText: generationPrompt({
         ocrText: input.ocrText,
         count: input.count,
@@ -1481,6 +1577,7 @@ async function fetchGenerationDrafts(input: {
       if (drafts.length === 0) {
         const repaired = await callGeminiJson({
           requestId: input.requestId,
+          role: "json_repair_v1",
           payloadText: repairGenerationPrompt(input.problemLanguage, genResp.data)
         });
         if (repaired.ok && repaired.data) {
