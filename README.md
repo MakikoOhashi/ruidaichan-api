@@ -11,6 +11,58 @@
 - 出力は `micro_problem_render_v1` 契約
 - 選択肢は生成しない（`prompt`のみ返す）
 
+## AI Gateway architecture
+
+Ruidaichan API は現在、一部の Gemini 呼び出しを Cloudflare Workers 上の `common-ai-api` 経由で実行します。
+これは Render 環境から Gemini API へ直接アクセスすると、まれに以下が返るケースがあったためです。
+
+`User location is not supported for the API use`
+
+Current gateway-routed role:
+
+- `generator_v1`
+
+直 Gemini が残っている可能性がある role（完全移行済みとは書かない）:
+
+- `image_ocr_v1`
+- `image_language_detector_v1`
+- `json_repair_v1`
+
+```text
+iOS App
+→ ruidaichan-api (Render)
+→ common-ai-api (Cloudflare Workers)
+→ Gemini API
+
+責務分離
+
+ruidaichan-api 側:
+
+* quota
+* install_id validation
+* OCR orchestration
+* business rules
+* response assembly
+
+common-ai-api 側:
+
+* AI gateway
+* Gemini transport
+* provider retry / timeout
+* provider abstraction
+```
+
+### Environment variables
+
+- `COMMON_AI_API_URL=`（例: `https://...`）
+- `RUIDAICHAN_AI_GATEWAY_SECRET=`（実値はリポジトリに書かない）
+
+### Security notes
+
+- secret を iOS へ入れない
+- browser/client から gateway を直接叩かない
+- OCR 画像や base64 をログ出力しない
+
 ## Endpoints
 
 ### GET `/health`
