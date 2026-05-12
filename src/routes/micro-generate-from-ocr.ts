@@ -3,6 +3,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { checkKanjiGuard, estimateGradeBand, normalizeRequestedGradeBand, type GradeBandApplied } from "../guards/kanji-guard.js";
 import { consumeMonthlyFreeQuota, refundMonthlyFreeQuota, validateInstallId } from "../lib/free-quota.js";
+import { buildGeminiGenerateContentUrls } from "../providers/gemini-endpoints.js";
+import { logGeminiError, logGeminiTransportException } from "../providers/gemini-log.js";
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash";
 const GEMINI_TIMEOUT_MS = 15000;
@@ -862,20 +864,22 @@ async function callGeminiJson(input: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const buildBody = (mode: "camel" | "snake") => {
+    const urls = buildGeminiGenerateContentUrls({ model: GEMINI_MODEL, apiKey });
+    const buildBody = (mode: "camel" | "snake" | "no_mime") => {
       const generationConfig =
         mode === "camel"
           ? { temperature: 0.6, responseMimeType: "application/json" }
-          : { temperature: 0.6, response_mime_type: "application/json" };
+          : mode === "snake"
+          ? { temperature: 0.6, response_mime_type: "application/json" }
+          : { temperature: 0.6 };
       return {
         contents: [{ role: "user", parts: [{ text: input.payloadText }] }],
         generationConfig
       };
     };
 
-    const attemptOnce = async (mode: "camel" | "snake") => {
-      const response = await fetch(baseUrl, {
+    const attemptOnce = async (url: string, mode: "camel" | "snake" | "no_mime") => {
+      const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(buildBody(mode)),
@@ -883,53 +887,47 @@ async function callGeminiJson(input: {
       });
       if (!response.ok) {
         const bodyText = await response.text().catch(() => "");
-        console.warn(
-          JSON.stringify({
-            event: "gemini_generation_error",
-            request_id: input.requestId,
-            status: response.status,
-            body: bodyText.slice(0, 2000)
-          })
-        );
+        logGeminiError({
+          event: "gemini_generation_error",
+          requestId: input.requestId,
+          status: response.status,
+          bodyText,
+          url,
+          mode
+        });
         return { ok: false as const, status: response.status, error: `gemini_http_${response.status}`, bodyText };
       }
       return { ok: true as const, status: response.status, response };
     };
 
-    let first = await attemptOnce("camel");
-    if (!first.ok) {
-      const maybeUnknownField =
-        first.status === 400 && typeof first.bodyText === "string" && /responseMimeType|response_mime_type/i.test(first.bodyText);
-      if (maybeUnknownField) {
-        const second = await attemptOnce("snake");
-        if (!second.ok) return { ok: false, status: second.status, error: second.error };
-        const json = (await second.response.json()) as {
+    const modes: Array<"camel" | "snake" | "no_mime"> = ["camel", "snake", "no_mime"];
+    for (const url of urls) {
+      for (const mode of modes) {
+        const attempt = await attemptOnce(url, mode);
+        if (!attempt.ok) {
+          // Keep trying other payload variants / API versions on 400 only.
+          if (attempt.status === 400) continue;
+          return { ok: false, status: attempt.status, error: attempt.error };
+        }
+
+        const json = (await attempt.response.json()) as {
           candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
         };
         const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!text) {
-          return { ok: false, status: second.status, error: "gemini_empty_text" };
+          return { ok: false, status: attempt.status, error: "gemini_empty_text" };
         }
         const parsed = parseJsonLoose(text);
-        return { ok: true, status: second.status, data: parsed };
+        return { ok: true, status: attempt.status, data: parsed };
       }
-      return { ok: false, status: first.status, error: first.error };
     }
 
-    const json = (await first.response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
-      return { ok: false, status: first.status, error: "gemini_empty_text" };
-    }
-
-    const parsed = parseJsonLoose(text);
-    return { ok: true, status: first.status, data: parsed };
+    return { ok: false, status: 400, error: "gemini_http_400" };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       return { ok: false, status: null, error: "gemini_timeout" };
     }
+    logGeminiTransportException({ event: "gemini_generation_transport_error", requestId: input.requestId, error: err });
     return { ok: false, status: null, error: "gemini_transport_error" };
   } finally {
     clearTimeout(timeout);
@@ -949,50 +947,58 @@ async function callGeminiImageOcr(input: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
+    const urls = buildGeminiGenerateContentUrls({ model: GEMINI_MODEL, apiKey });
+    const body = JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: [
+                "ROLE: image_ocr_v1",
+                "Extract OCR text from the worksheet image.",
+                "Preserve the original worksheet language exactly as seen in the image.",
+                "Return ONLY plain text, no JSON, no markdown.",
+                "Preserve math symbols when possible: + - × ÷ = □ and units."
+              ].join("\n")
+            },
+            {
+              inline_data: {
+                mime_type: input.imageMimeType,
+                data: input.imageBase64
+              }
+            }
+          ]
+        }
+      ],
+      generationConfig: { temperature: 0.0 }
+    });
+
+    let response: Response | null = null;
+    let urlUsed: string | null = null;
+    for (const url of urls) {
+      urlUsed = url;
+      response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: [
-                    "ROLE: image_ocr_v1",
-                    "Extract OCR text from the worksheet image.",
-                    "Preserve the original worksheet language exactly as seen in the image.",
-                    "Return ONLY plain text, no JSON, no markdown.",
-                    "Preserve math symbols when possible: + - × ÷ = □ and units."
-                  ].join("\n")
-                },
-                {
-                  inline_data: {
-                    mime_type: input.imageMimeType,
-                    data: input.imageBase64
-                  }
-                }
-              ]
-            }
-          ],
-          generationConfig: { temperature: 0.0 }
-        }),
+        body,
         signal: controller.signal
-      }
-    );
+      });
+      if (response.ok) break;
+    }
+    if (!response || !urlUsed) {
+      return { ok: false, status: null, error: "gemini_transport_error" };
+    }
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => "");
-      console.warn(
-        JSON.stringify({
-          event: "gemini_ocr_error",
-          request_id: input.requestId,
-          status: response.status,
-          body: bodyText.slice(0, 2000)
-        })
-      );
+      logGeminiError({
+        event: "gemini_ocr_error",
+        requestId: input.requestId,
+        status: response.status,
+        bodyText,
+        url: urlUsed
+      });
       return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
     }
 
@@ -1008,6 +1014,7 @@ async function callGeminiImageOcr(input: {
     if (err instanceof Error && err.name === "AbortError") {
       return { ok: false, status: null, error: "gemini_timeout" };
     }
+    logGeminiTransportException({ event: "gemini_ocr_transport_error", requestId: input.requestId, error: err });
     return { ok: false, status: null, error: "gemini_transport_error" };
   } finally {
     clearTimeout(timeout);
@@ -1027,70 +1034,85 @@ async function callGeminiImageLanguage(input: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: [
-                    "ROLE: image_language_detector_v1",
-                    'Return STRICT JSON only: {"language":"ja|en|unknown","confidence":0.0}',
-                    "Decide the worksheet problem language from the image.",
-                    "Supported languages: ja or en only."
-                  ].join("\n")
-                },
-                {
-                  inline_data: {
-                    mime_type: input.imageMimeType,
-                    data: input.imageBase64
-                  }
+    const urls = buildGeminiGenerateContentUrls({ model: GEMINI_MODEL, apiKey });
+    const buildBody = (mode: "camel" | "no_mime") => {
+      const generationConfig =
+        mode === "camel" ? { temperature: 0.0, responseMimeType: "application/json" } : { temperature: 0.0 };
+      return {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: [
+                  "ROLE: image_language_detector_v1",
+                  'Return STRICT JSON only: {"language":"ja|en|unknown","confidence":0.0}',
+                  "Decide the worksheet problem language from the image.",
+                  "Supported languages: ja or en only."
+                ].join("\n")
+              },
+              {
+                inline_data: {
+                  mime_type: input.imageMimeType,
+                  data: input.imageBase64
                 }
-              ]
-            }
-          ],
-          generationConfig: { temperature: 0.0, responseMimeType: "application/json" }
-        }),
-        signal: controller.signal
-      }
-    );
-
-    if (!response.ok) {
-      const bodyText = await response.text().catch(() => "");
-      console.warn(
-        JSON.stringify({
-          event: "gemini_language_error",
-          request_id: input.requestId,
-          status: response.status,
-          body: bodyText.slice(0, 2000)
-        })
-      );
-      return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
-    }
-
-    const json = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+              }
+            ]
+          }
+        ],
+        generationConfig
+      };
     };
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
-      return { ok: false, status: response.status, error: "gemini_empty_text" };
+
+    let lastStatus: number | null = null;
+    for (const url of urls) {
+      for (const mode of ["camel", "no_mime"] as const) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildBody(mode)),
+          signal: controller.signal
+        });
+
+        if (!response.ok) {
+          lastStatus = response.status;
+          const bodyText = await response.text().catch(() => "");
+          logGeminiError({
+            event: "gemini_language_error",
+            requestId: input.requestId,
+            status: response.status,
+            bodyText,
+            url,
+            mode
+          });
+          if (response.status === 400) continue;
+          return { ok: false, status: response.status, error: `gemini_http_${response.status}` };
+        }
+
+        const json = (await response.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          return { ok: false, status: response.status, error: "gemini_empty_text" };
+        }
+        const parsed = parseJsonLoose(text) as { language?: string; confidence?: number } | null;
+        const language = parsed?.language === "ja" || parsed?.language === "en" ? parsed.language : undefined;
+        const confidence =
+          typeof parsed?.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : undefined;
+        if (!language) {
+          return { ok: false, status: response.status, error: "gemini_language_invalid" };
+        }
+        return { ok: true, status: response.status, language, confidence };
+      }
     }
-    const parsed = parseJsonLoose(text) as { language?: string; confidence?: number } | null;
-    const language = parsed?.language === "ja" || parsed?.language === "en" ? parsed.language : undefined;
-    const confidence = typeof parsed?.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : undefined;
-    if (!language) {
-      return { ok: false, status: response.status, error: "gemini_language_invalid" };
-    }
-    return { ok: true, status: response.status, language, confidence };
+
+    return { ok: false, status: lastStatus ?? 400, error: "gemini_http_400" };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       return { ok: false, status: null, error: "gemini_timeout" };
     }
+    logGeminiTransportException({ event: "gemini_language_transport_error", requestId: input.requestId, error: err });
     return { ok: false, status: null, error: "gemini_transport_error" };
   } finally {
     clearTimeout(timeout);

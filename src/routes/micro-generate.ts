@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { Router } from "express";
+import { buildGeminiGenerateContentUrls } from "../providers/gemini-endpoints.js";
+import { logGeminiError } from "../providers/gemini-log.js";
 import {
   microGenerateRequestSchema,
   microGenerateResponseSchema,
@@ -673,24 +675,43 @@ async function proposeEquationCorrectionWithAi(inputText: string, deterministicC
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.min(GEMINI_TIMEOUT_MS, 4000));
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: `${prompt}\ninput:${inputText}\ndeterministic:${deterministicCandidate}\nchoices:${choicesText}` }]
-            }
-          ],
-          generationConfig: { temperature: 0, responseMimeType: "application/json" }
-        }),
-        signal: controller.signal
+    const urls = buildGeminiGenerateContentUrls({ model: GEMINI_MODEL, apiKey });
+    const payloadText = `${prompt}\ninput:${inputText}\ndeterministic:${deterministicCandidate}\nchoices:${choicesText}`;
+    const buildBody = (mode: "camel" | "no_mime") => ({
+      contents: [{ role: "user", parts: [{ text: payloadText }] }],
+      generationConfig: mode === "camel" ? { temperature: 0, responseMimeType: "application/json" } : { temperature: 0 }
+    });
+
+    let lastStatus: number | null = null;
+    let response: Response | null = null;
+    for (const url of urls) {
+      for (const mode of ["camel", "no_mime"] as const) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildBody(mode)),
+          signal: controller.signal
+        });
+        if (res.ok) {
+          response = res;
+          break;
+        }
+        lastStatus = res.status;
+        const bodyText = await res.text().catch(() => "");
+        logGeminiError({
+          event: "gemini_equation_error",
+          requestId: "micro_generate_equation",
+          status: res.status,
+          bodyText,
+          url,
+          mode
+        });
+        if (res.status === 400) continue;
+        return null;
       }
-    );
-    if (!response.ok) return null;
+      if (response) break;
+    }
+    if (!response) return null;
     const json = (await response.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };

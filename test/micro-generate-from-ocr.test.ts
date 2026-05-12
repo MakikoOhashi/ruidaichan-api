@@ -162,7 +162,6 @@ test("/micro/generate_from_ocr returns renderable items with light checks", asyn
     });
   });
 });
-
 test("Case A: Japanese addition word problem is classified as add_change (not repeat_multiply) and generates locally", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
 
@@ -236,71 +235,84 @@ test("Case B: Japanese equal sharing division is classified as split_equal and g
 
 test("Case C: Gemini 400 returns failure payload and quota is refunded", async () => {
   process.env.GEMINI_API_KEY = "test-gemini-key";
+  const previousUpstashUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const previousUpstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
   process.env.UPSTASH_REDIS_REST_URL = "https://upstash.test";
   process.env.UPSTASH_REDIS_REST_TOKEN = "upstash-token";
 
   let consumeCalls = 0;
   let refundCalls = 0;
 
-  await withMockFetch(async (original, input, init) => {
-    const url = getFetchUrl(input);
-    if (url === "https://upstash.test") {
-      const args = await parseJsonBody<unknown[]>(input, init, "[]");
-      const cmd = String(args[0] ?? "");
-      if (cmd === "EVAL") {
-        const script = String(args[1] ?? "");
-        if (script.includes("INCRBY")) {
-          consumeCalls += 1;
-          return new Response(JSON.stringify({ result: [1, 1, 5, "202605", 1000] }), {
+  try {
+    await withMockFetch(async (original, input, init) => {
+      const url = getFetchUrl(input);
+      if (url === "https://upstash.test") {
+        const args = await parseJsonBody<unknown[]>(input, init, "[]");
+        const cmd = String(args[0] ?? "");
+        if (cmd === "EVAL") {
+          const script = String(args[1] ?? "");
+          if (script.includes("INCRBY")) {
+            consumeCalls += 1;
+            return new Response(JSON.stringify({ result: [1, 1, 5, "202605", 1000] }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+          refundCalls += 1;
+          return new Response(JSON.stringify({ result: 0 }), {
             status: 200,
             headers: { "Content-Type": "application/json" }
           });
         }
-        refundCalls += 1;
-        return new Response(JSON.stringify({ result: 0 }), { status: 200, headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ result: null }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
       }
-      return new Response(JSON.stringify({ result: null }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
 
-    if (url.includes("googleapis.com")) {
-      return new Response(JSON.stringify({ error: { message: "schema invalid" } }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" }
+      if (url.includes("googleapis.com")) {
+        return new Response(JSON.stringify({ error: { message: "schema invalid" } }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      throw new Error(`Unhandled fetch mock: ${url}`);
+    }, async () => {
+      await withServer(async (baseUrl) => {
+        const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
+          body: JSON.stringify({
+            ocr_text: "これはテストです。",
+            count: 4,
+            grade_band: "g1_g3",
+            language: "ja",
+            seed: "case-c"
+          })
+        });
+
+        const body = (await res.json()) as {
+          applied_count: number;
+          reasons: Record<string, number>;
+          meta: { failure_code: string; quota_used_after: number };
+        };
+
+        assert.equal(res.status, 200);
+        assert.equal(body.applied_count, 0);
+        assert.equal(body.meta.failure_code, "generation_failed");
+        assert.equal((body.reasons.gemini_http_400 ?? 0) > 0, true);
+        assert.equal(consumeCalls >= 1, true);
+        assert.equal(refundCalls >= 1, true);
+        assert.equal(body.meta.quota_used_after, 0);
       });
-    }
-
-    throw new Error(`Unhandled fetch mock: ${url}`);
-  }, async () => {
-    await withServer(async (baseUrl) => {
-      const res = await fetch(`${baseUrl}/micro/generate_from_ocr`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": "test-key", "x-install-id": "test-install-id" },
-        body: JSON.stringify({
-          ocr_text: "これはテストです。",
-          count: 4,
-          grade_band: "g1_g3",
-          language: "ja",
-          seed: "case-c"
-        })
-      });
-
-      const body = (await res.json()) as {
-        applied_count: number;
-        reasons: Record<string, number>;
-        meta: { failure_code: string; quota_used_after: number };
-      };
-
-      assert.equal(res.status, 200);
-      assert.equal(body.applied_count, 0);
-      assert.equal(body.meta.failure_code, "generation_failed");
-      assert.equal((body.reasons.gemini_http_400 ?? 0) > 0, true);
-      assert.equal(consumeCalls >= 1, true);
-      assert.equal(refundCalls >= 1, true);
-      assert.equal(body.meta.quota_used_after, 0);
     });
-  });
-});
-
+  } finally {
+    if (previousUpstashUrl) process.env.UPSTASH_REDIS_REST_URL = previousUpstashUrl;
+    else delete process.env.UPSTASH_REDIS_REST_URL;
+    if (previousUpstashToken) process.env.UPSTASH_REDIS_REST_TOKEN = previousUpstashToken;
+    else delete process.env.UPSTASH_REDIS_REST_TOKEN;
+  }
 });
 
 test("/micro/generate_from_ocr returns partial_success when light checks reject invalid outputs", async () => {
@@ -1741,4 +1753,6 @@ test("/micro/generate_from_ocr falls back to image language detection when OCR i
       assert.notEqual(body.meta.note, "problem_language_fallback");
     });
   });
+});
+
 });
